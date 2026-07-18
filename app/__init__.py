@@ -1,0 +1,1 @@
+# Smart Scanner Backend Application

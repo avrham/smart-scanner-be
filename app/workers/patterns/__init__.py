@@ -1,0 +1,1 @@
+# Pattern Detection Algorithms
