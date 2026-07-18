@@ -15,6 +15,7 @@ from app.workers.scan_runner import run_scan_batch
 from app.workers.fmp_client import FMPClient
 from app.workers.tickers import refresh_tickers_cache
 from app.workers.maintenance import cleanup_daily_seen, clear_daily_seen
+from app.workers.outcomes.service import calculate_outcomes_for_signals
 from app.config import settings
 from app.utils.events import event_bus
 
@@ -169,6 +170,49 @@ async def clear_daily_seen_endpoint(
     count = await clear_daily_seen(db)
     
     return {"message": f"Cleared {count} daily seen records for today"}
+
+
+@router.post("/outcomes/calculate")
+async def calculate_outcomes(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+    limit: int = Body(50),
+    pattern_code: Optional[str] = Body(None),
+    include_recalc: bool = Body(False),
+    run_in_background: bool = Body(True),
+):
+    """Compute outcomes for signals that need them (Phase 2).
+
+    Bounded by `limit`. Protected by the worker token. This fetches historical
+    OHLCV from FMP for the affected symbols plus SPY/QQQ, so it should be run
+    deliberately (it is NOT scheduled and not enabled automatically).
+    """
+    logger = logging.getLogger(__name__)
+
+    async def _run() -> dict:
+        fmp = FMPClient(
+            api_key=settings.FMP_API_KEY,
+            max_concurrent=settings.FMP_MAX_CONCURRENT,
+        )
+        logger.info(
+            "[ADMIN] outcome calc start: limit=%s, pattern=%s, recalc=%s",
+            limit, pattern_code, include_recalc,
+        )
+        summary = await calculate_outcomes_for_signals(
+            fmp,
+            limit=limit,
+            pattern_code=pattern_code,
+            include_recalc=include_recalc,
+        )
+        logger.info("[ADMIN] outcome calc finished: %s", summary)
+        return summary
+
+    if run_in_background:
+        background_tasks.add_task(_run)
+        return {"message": "Outcome calculation enqueued", "limit": limit}
+
+    summary = await _run()
+    return {"message": "Outcome calculation completed", **summary}
 
 
 @router.get("/status")

@@ -393,11 +393,12 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - [ ] (Deferred to Phase 2/3) `signals` schema enrichment, `scan_rejects` table + `DEBUG_SAVE_REJECTS`, feature flags
 
 ### Phase 2 — Evidence & outcome tracking
-- [ ] `signal_outcomes` + `market_regime` tables
-- [ ] Outcome tracker job (1/3/5/10/20D, MFE/MAE, R)
-- [ ] Baselines implemented (SPY/QQQ B&H, ticker B&H, momentum, mean-reversion, random-sector, sma150)
-- [ ] Backtest harness + metrics (expectancy, avg R, profit factor, drawdown, sample size)
-- [ ] Comparison endpoints + tests
+- [x] `signal_outcomes` table (migration `003_phase2_signal_outcomes.sql`). `market_regime` deferred.
+- [x] Outcome tracker service (1/3/5/10/20D returns, MFE/MAE, stop/target hits, simplified R)
+- [x] Baselines implemented: same-ticker B&H, SPY B&H, QQQ B&H (momentum/mean-reversion/random-sector deferred)
+- [x] Metrics: sample size, win rate, avg/median return, avg R, profit factor, avg MFE/MAE, baseline deltas
+- [x] Comparison endpoints (`GET /api/outcomes`, `GET /api/outcomes/metrics`, `POST /api/admin/outcomes/calculate`) + tests
+- [ ] Full backtest harness over historical universe (deferred; outcome tracking of live signals first)
 
 ### Phase 3 — Funnel scanner
 - [ ] Liquid universe builder (real volume)
@@ -531,3 +532,37 @@ Phase 1 (foundation & correctness) is implemented. Full details in
 
 Not done (by design, deferred to later phases): funnel scanner, outcome
 tracking, backtests/baselines, strategy interface, Wyckoff, LLM, UI redesign.
+
+---
+
+## 19. Phase 2 implementation notes (DONE)
+
+Phase 2 (outcome tracking + baseline comparison) is implemented. Full details in
+`docs/phase-2-outcome-tracking-summary.md`. Summary:
+
+- New `signal_outcomes` table (migration `003_phase2_signal_outcomes.sql`): one
+  row per signal, side-adjusted per-window returns as explicit columns
+  (`ret_1d..ret_20d`), baseline breakdowns as JSONB, MFE/MAE, stop/target hits,
+  simplified R, and an `outcome_status` lifecycle.
+- Pure, unit-tested numeric core in `app/workers/outcomes/`:
+  `calculator.py` (returns, MFE/MAE, stop/target, R), `baselines.py`
+  (buy&hold + deltas), `metrics.py` (aggregation).
+- I/O layers: `persistence.py` (CRUD, load-signals-needing-outcomes) and
+  `service.py` (fetch OHLCV + SPY/QQQ, build records, persist; never aborts on a
+  single-symbol failure).
+- Endpoints: read-only `GET /api/outcomes`, `GET /api/outcomes/metrics`; admin
+  `POST /api/admin/outcomes/calculate` (worker-token protected, bounded by
+  `limit`, NOT scheduled).
+- 33 new tests (56 total) covering forward returns (LONG/SHORT), MFE/MAE,
+  stop/target, simplified R, baselines, aggregation metrics, missing/insufficient
+  data, and route registration.
+
+Deferred by design: `market_regime` table, full historical backtest harness,
+extra baselines (momentum/mean-reversion/random-sector), any UI, and any change
+to signal-generation logic.
+
+Known validation debt (carried from Phase 1): the controlled single-symbol scan
+smoke was intentionally skipped before Phase 2. Outcome tracking has been proven
+on synthetic data via unit tests, but has NOT yet been run end-to-end against
+real generated signals + live FMP data. This remains open and should be closed
+before drawing any conclusions about signal value.
