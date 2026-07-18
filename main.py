@@ -61,11 +61,9 @@ async def root():
     return {"message": "Smart Scanner API v1.1", "status": "healthy"}
 
 
-@app.get("/health")
-async def health_check(db=Depends(get_db)):
-    """Detailed health check with database connectivity"""
+async def _health_payload(db) -> JSONResponse | dict:
+    """Shared health logic: verify DB connectivity."""
     try:
-        # Test database connection
         await db.execute("SELECT 1")
         return {
             "status": "healthy",
@@ -76,11 +74,28 @@ async def health_check(db=Depends(get_db)):
         return JSONResponse(
             status_code=503,
             content={
-                "status": "unhealthy", 
+                "status": "unhealthy",
                 "database": "disconnected",
                 "error": str(e)
             }
         )
+
+
+@app.get("/health")
+async def health_check(db=Depends(get_db)):
+    """Detailed health check with database connectivity (infra/liveness path)."""
+    return await _health_payload(db)
+
+
+@app.get("/api/health")
+async def api_health_check(db=Depends(get_db)):
+    """Alias of /health under the /api prefix.
+
+    Fixes B8: the UI api client prepends `/api`, so it calls `/api/health`.
+    Exposing this alias keeps the frontend unchanged while making the Settings
+    health check report correctly.
+    """
+    return await _health_payload(db)
 
 
 if __name__ == "__main__":

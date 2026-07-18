@@ -14,3 +14,14 @@ venv/
 *.log
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
+# Node / frontend (in case of colocated tooling)
+node_modules/
+.next/
+
+# Build / cache artifacts
+build/
+dist/
+*.egg
+.cache/

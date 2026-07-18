@@ -1,353 +1,329 @@
 """
 SMA-150 Bounce Pattern Detection Algorithm
-Identifies stocks that respect their 150-day moving average and show bounce potential
+Identifies stocks that respect their 150-day moving average and show bounce potential.
+
+Phase 1 (Evidence Engine) notes:
+- Thresholds are conservative-by-default and fully config-driven (B12). A DB
+  `pattern_configs` entry overrides any default via resolve_pattern_config().
+- score_components hold RAW MEASURED values only, never score*weight (B2).
+- Historical bounce counting is deduplicated: a contiguous run of in-band days
+  is a single touch event, not one bounce per day.
 """
 
 import logging
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
-from app.workers.indicators import sma, atr, add_basic_indicators, validate_dataframe
-from app.config import settings
+from app.workers.indicators import sma, add_basic_indicators, validate_dataframe
 
 
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_CONFIG = {
+# Version stamp persisted alongside score_components so downstream analysis
+# knows which measurement/formula produced them.
+SCORE_VERSION = "sma150.v2"
+
+
+# Conservative Phase 1 defaults. These are intentionally STRICTER than the
+# previous permissive values (which produced noisy signals). They are the
+# fallback when no DB config exists; DB `pattern_configs` overrides them.
+DEFAULT_CONFIG: Dict[str, Any] = {
     "sma_window": 150,
-    "touch_tolerance_pct": 15.0,       # Increased from 8.0% to 15.0% - much more lenient proximity
+    "touch_tolerance_pct": 3.0,        # within 3% of SMA counts as a touch
     "lookback_days_for_history": 365,
-    "min_bounces": 1,                  # Reduced from 2 to 1 - only need 1 historical bounce
-    "min_avg_rebound_pct": 2.0,        # Reduced from 3.0% to 2.0% - very small rebounds acceptable
+    "min_bounces": 2,                  # need >=2 DISTINCT historical bounces
+    "min_avg_rebound_pct": 5.0,        # meaningful rebounds only
     "rebound_window_days": 10,
-    "min_volume_sma_ratio": 0.5,       # Reduced from 0.8 to 0.5 - very low volume requirement
+    "min_volume_sma_ratio": 1.0,       # volume at/above its 20d average
+    "min_price": 5.0,                  # avoid low-priced names
+    "score_threshold": 0.5,            # composite score gate for ENTER
     "min_liquidity_filters": {
-        "min_market_cap": 50000000,    # Reduced from $100M to $50M - much smaller companies
-        "min_daily_volume": 50000      # Reduced from 100k to 50k shares - very low volume
-    }
+        "min_market_cap": 200000000,
+        "min_daily_volume": 200000,
+    },
 }
 
 
 def find_historical_bounces(
-    df: pd.DataFrame, 
-    sma_col: str, 
+    df: pd.DataFrame,
+    sma_col: str,
     tolerance_pct: float,
     rebound_window: int,
-    min_rebound_pct: float
+    min_rebound_pct: float,
 ) -> List[Dict[str, Any]]:
-    """Find historical bounce points where price touched SMA and rebounded"""
-    
-    bounces = []
-    
-    # Calculate distance from SMA as percentage
-    df = df.copy()  # Create a copy to avoid SettingWithCopyWarning
-    df['sma_distance_pct'] = np.abs(df['close'] - df[sma_col]) / df[sma_col] * 100
-    
-    # Find touch points (within tolerance)
-    touch_mask = df['sma_distance_pct'] <= tolerance_pct
-    touch_indices = df.index[touch_mask].tolist()
-    
-    for touch_idx in touch_indices:
-        # Skip if we don't have enough data after this point
-        if touch_idx + rebound_window >= len(df):
+    """Find DISTINCT historical bounce events near the SMA.
+
+    A "touch" is a contiguous run of days where price is within `tolerance_pct`
+    of the SMA. Consecutive in-band days collapse into ONE event (dedup). The
+    touch bar is the minimum-distance bar inside the run. It qualifies as a
+    bounce when the maximum high in the following `rebound_window` days is at
+    least `min_rebound_pct` above the touch price.
+    """
+    bounces: List[Dict[str, Any]] = []
+
+    if df.empty or sma_col not in df.columns:
+        return bounces
+
+    df = df.reset_index(drop=True)
+    sma_values = df[sma_col]
+    distance_pct = (np.abs(df["close"] - sma_values) / sma_values * 100)
+    in_band = (distance_pct <= tolerance_pct).to_numpy()
+
+    n = len(df)
+    i = 0
+    while i < n:
+        if not in_band[i]:
+            i += 1
             continue
-        
-        touch_row = df.iloc[touch_idx]
-        touch_date = touch_row['date']
-        touch_price = touch_row['close']
-        
-        # Look at the next N days for rebound
-        rebound_window_data = df.iloc[touch_idx + 1:touch_idx + 1 + rebound_window]
-        
-        if rebound_window_data.empty:
+
+        # Contiguous in-band run => a single touch event.
+        run_start = i
+        while i < n and in_band[i]:
+            i += 1
+        run_end = i - 1  # inclusive
+
+        run_distance = distance_pct.iloc[run_start:run_end + 1]
+        touch_idx = int(run_distance.idxmin())
+        touch_price = float(df.iloc[touch_idx]["close"])
+
+        # Rebound is measured strictly AFTER the touch bar.
+        window = df.iloc[touch_idx + 1:touch_idx + 1 + rebound_window]
+        if window.empty:
             continue
-        
-        # Calculate maximum gain in the rebound window
-        max_high = rebound_window_data['high'].max()
+
+        max_high = float(window["high"].max())
         max_gain_pct = (max_high - touch_price) / touch_price * 100
-        
-        # Check if this qualifies as a bounce
+
         if max_gain_pct >= min_rebound_pct:
-            # Determine trend direction before touch
-            lookback_days = min(5, touch_idx)
-            if lookback_days > 0:
-                pre_touch_data = df.iloc[touch_idx - lookback_days:touch_idx]
-                trend_slope = np.polyfit(range(len(pre_touch_data)), pre_touch_data['close'], 1)[0]
-            else:
-                trend_slope = 0
-            
-            bounce_info = {
-                "date": touch_date,
+            bounces.append({
+                "touch_index": touch_idx,
+                "date": df.iloc[touch_idx]["date"],
                 "touch_price": touch_price,
-                "sma_value": touch_row[sma_col],
-                "distance_pct": touch_row['sma_distance_pct'],
+                "sma_value": float(df.iloc[touch_idx][sma_col]),
+                "distance_pct": float(run_distance.min()),
                 "max_gain_pct": max_gain_pct,
-                "rebound_days": len(rebound_window_data),
-                "trend_before": "down" if trend_slope < 0 else "up",
-                "volume_ratio": touch_row.get('vol_ratio', 1.0)
-            }
-            
-            bounces.append(bounce_info)
-    
+                "run_length": run_end - run_start + 1,
+            })
+
     return bounces
 
 
-def analyze_current_setup(
-    df: pd.DataFrame, 
-    sma_col: str, 
-    tolerance_pct: float,
-    min_volume_ratio: float
-) -> Dict[str, Any]:
-    """Analyze current bar for entry setup"""
-    
-    if df.empty:
-        return {"valid": False, "reason": "No data"}
-    
-    current = df.iloc[-1]
-    
-    # Check if current price is near SMA
-    if pd.isna(current[sma_col]):
-        return {"valid": False, "reason": "SMA not available"}
-    
-    distance_pct = abs(current['close'] - current[sma_col]) / current[sma_col] * 100
-    near_sma = distance_pct <= tolerance_pct
-    
-    # Check volume confirmation
-    volume_ratio = current.get('vol_ratio', 0)
-    volume_confirmed = volume_ratio >= min_volume_ratio
-    
-    # Additional technical checks
-    checks = {
-        "near_sma": near_sma,
-        "distance_pct": distance_pct,
-        "volume_confirmed": volume_confirmed,
-        "volume_ratio": volume_ratio,
-        "price": current['close'],
-        "sma_value": current[sma_col],
-        "atr": current.get('atr_14', 0)
-    }
-    
-    # Check for potential reversal patterns (simple)
-    if len(df) >= 3:
-        last_3 = df.tail(3)
-        
-        # Look for hammer-like pattern or bullish engulfing
-        current_body = abs(current['close'] - current['open'])
-        current_range = current['high'] - current['low']
-        
-        # Hammer: small body, long lower wick
-        lower_wick = current['open'] - current['low'] if current['close'] > current['open'] else current['close'] - current['low']
-        upper_wick = current['high'] - max(current['open'], current['close'])
-        
-        hammer_like = (current_body < current_range * 0.3) and (lower_wick > current_body * 2)
-        
-        checks["hammer_pattern"] = hammer_like
-        checks["reversal_signal"] = hammer_like  # Can add more patterns here
-    else:
-        checks["hammer_pattern"] = False
-        checks["reversal_signal"] = False
-    
-    checks["valid"] = near_sma  # Only require proximity to SMA, volume is optional
-    
-    return checks
+def _trend_context(closes: pd.Series, window: int = 20) -> str:
+    """Classify recent trend as up/down/flat from the slope of recent closes."""
+    recent = closes.dropna().tail(window)
+    if len(recent) < 2:
+        return "flat"
+    slope = np.polyfit(range(len(recent)), recent.to_numpy(), 1)[0]
+    if slope > 0:
+        return "up"
+    if slope < 0:
+        return "down"
+    return "flat"
 
 
 def calculate_score(
-    current_setup: Dict[str, Any],
+    distance_pct: float,
+    tolerance_pct: float,
     bounces: List[Dict[str, Any]],
-    config: Dict[str, Any]
+    min_bounces: int,
+    avg_rebound_pct: float,
+    min_avg_rebound_pct: float,
+    volume_ratio: float,
+    min_volume_ratio: float,
 ) -> float:
-    """Calculate composite score (0-1) for the signal strength"""
-    
-    if not current_setup.get("valid", False):
-        return 0.0
-    
-    scores = {}
-    
-    # 1. Proximity to SMA (35% weight)
-    distance_pct = current_setup["distance_pct"]
-    tolerance = config["touch_tolerance_pct"]
-    proximity_score = max(0, 1 - (distance_pct / tolerance))
-    scores["proximity"] = proximity_score
-    
-    # 2. Historical bounce count (30% weight)
-    bounce_count = len(bounces)
-    min_bounces = config["min_bounces"]
-    bounce_score = min(1.0, bounce_count / max(min_bounces, 1))
-    scores["bounce_count"] = bounce_score
-    
-    # 3. Average rebound strength (25% weight)
-    if bounces:
-        avg_rebound = np.mean([b["max_gain_pct"] for b in bounces])
-        min_avg_rebound = config["min_avg_rebound_pct"]
-        rebound_score = min(1.0, max(0.0, avg_rebound) / min_avg_rebound)
-    else:
-        avg_rebound = 0
-        rebound_score = 0
-    scores["rebound_strength"] = rebound_score
-    
-    # 4. Volume confirmation (10% weight)
-    volume_ratio = current_setup["volume_ratio"]
-    min_volume_ratio = config["min_volume_sma_ratio"]
-    volume_score = 1.0 if volume_ratio >= min_volume_ratio else 0.0
-    scores["volume"] = volume_score
-    
-    # Weighted composite score
-    composite_score = (
-        0.35 * proximity_score +
-        0.30 * bounce_score +
-        0.25 * rebound_score +
-        0.10 * volume_score
+    """Composite 0..1 score. Weights live here ONLY; the persisted
+    score_components store the raw measured inputs, never these weighted terms.
+    """
+    proximity_score = max(0.0, 1 - (distance_pct / tolerance_pct)) if tolerance_pct else 0.0
+    bounce_score = min(1.0, len(bounces) / max(min_bounces, 1))
+    rebound_score = (
+        min(1.0, max(0.0, avg_rebound_pct) / min_avg_rebound_pct)
+        if min_avg_rebound_pct else 0.0
     )
-    
-    return composite_score
+    volume_score = 1.0 if volume_ratio >= min_volume_ratio else 0.0
+
+    return (
+        0.35 * proximity_score
+        + 0.30 * bounce_score
+        + 0.25 * rebound_score
+        + 0.10 * volume_score
+    )
+
+
+def _avoid(symbol: str, reason: str, extra: Dict[str, Any] = None) -> Dict[str, Any]:
+    details = {
+        "symbol": symbol,
+        "snapshot_date": str(datetime.now().date()),
+        "score_version": SCORE_VERSION,
+        "rejection_reason": reason,
+    }
+    if extra:
+        details.update(extra)
+    return {"verdict": "AVOID", "score": 0.0, "reason": reason, "details": details}
 
 
 def evaluate_sma150_bounce(
-    symbol: str, 
-    df: pd.DataFrame, 
-    config: Dict[str, Any] = None
+    symbol: str,
+    df: pd.DataFrame,
+    config: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
+    """Evaluate the SMA-150 bounce pattern for a symbol.
+
+    Args:
+        symbol: ticker
+        df: OHLCV dataframe (oldest first)
+        config: resolved config dict; falls back to DEFAULT_CONFIG when None.
+
+    Returns dict with keys: verdict ('ENTER'|'AVOID'), score, reason, details.
+    `details.score_components` contains RAW measured values only.
     """
-    Main evaluation function for SMA-150 bounce pattern
-    
-    Returns:
-        dict: {
-            "verdict": "ENTER" | "AVOID",
-            "score": float (0-1),
-            "reason": str,
-            "details": dict
-        }
-    """
-    
-    # Use default config if none provided
     if config is None:
         config = DEFAULT_CONFIG.copy()
-    
-    # Validate input data
-    if not validate_dataframe(df, min_bars=config["sma_window"] + 50):
-        return {
-            "verdict": "AVOID",
-            "score": 0.0,
-            "reason": "Insufficient historical data",
-            "details": {
-                "symbol": symbol,
+
+    sma_window = int(config["sma_window"])
+    tolerance_pct = float(config["touch_tolerance_pct"])
+    min_bounces = int(config["min_bounces"])
+    min_avg_rebound_pct = float(config["min_avg_rebound_pct"])
+    rebound_window_days = int(config["rebound_window_days"])
+    min_volume_ratio = float(config["min_volume_sma_ratio"])
+    min_price = float(config.get("min_price", 0.0))
+    score_threshold = float(config["score_threshold"])
+    lookback_days = int(config["lookback_days_for_history"])
+
+    thresholds_used = {
+        "sma_window": sma_window,
+        "touch_tolerance_pct": tolerance_pct,
+        "min_bounces": min_bounces,
+        "min_avg_rebound_pct": min_avg_rebound_pct,
+        "rebound_window_days": rebound_window_days,
+        "min_volume_sma_ratio": min_volume_ratio,
+        "min_price": min_price,
+        "score_threshold": score_threshold,
+    }
+
+    if not validate_dataframe(df, min_bars=sma_window + 50):
+        return _avoid(
+            symbol,
+            "insufficient_data",
+            {
                 "bars_available": len(df),
-                "bars_required": config["sma_window"] + 50,
-                "snapshot_date": str(datetime.now().date())
-            }
-        }
-    
+                "bars_required": sma_window + 50,
+                "thresholds_used": thresholds_used,
+            },
+        )
+
     try:
-        # Add technical indicators
-        df_with_indicators = add_basic_indicators(df)
-        
-        # Use appropriate SMA column
-        sma_col = f'sma_{config["sma_window"]}'
-        if sma_col not in df_with_indicators.columns:
-            df_with_indicators[sma_col] = sma(df_with_indicators['close'], config["sma_window"])
-        
-        # Remove rows with NaN SMA values
-        df_clean = df_with_indicators.dropna(subset=[sma_col]).copy()
-        
-        if len(df_clean) < config["sma_window"]:
-            return {
-                "verdict": "AVOID",
-                "score": 0.0,
-                "reason": "Insufficient data after SMA calculation",
-                "details": {
-                    "symbol": symbol,
-                    "snapshot_date": str(datetime.now().date())
-                }
-            }
-        
-        # Define historical analysis period
-        lookback_days = config["lookback_days_for_history"]
+        df_ind = add_basic_indicators(df)
+        sma_col = f"sma_{sma_window}"
+        if sma_col not in df_ind.columns:
+            df_ind[sma_col] = sma(df_ind["close"], sma_window)
+
+        df_clean = df_ind.dropna(subset=[sma_col]).copy()
+        if len(df_clean) < sma_window:
+            return _avoid(
+                symbol,
+                "insufficient_data_after_sma",
+                {"thresholds_used": thresholds_used},
+            )
+
+        # Historical window excludes the current (most recent) bar.
         history_start_idx = max(0, len(df_clean) - 1 - lookback_days)
-        historical_df = df_clean.iloc[history_start_idx:-1]  # Exclude current day
-        
-        # Find historical bounces
+        historical_df = df_clean.iloc[history_start_idx:-1]
+
         bounces = find_historical_bounces(
             historical_df,
             sma_col,
-            config["touch_tolerance_pct"],
-            config["rebound_window_days"],
-            config["min_avg_rebound_pct"]
+            tolerance_pct,
+            rebound_window_days,
+            min_avg_rebound_pct,
         )
-        
-        # Analyze current setup
-        current_setup = analyze_current_setup(
-            df_clean,
-            sma_col,
-            config["touch_tolerance_pct"],
-            config["min_volume_sma_ratio"]
-        )
-        
-        # Calculate score
-        score = calculate_score(current_setup, bounces, config)
-        
-        # Make verdict decision
-        min_bounces = config["min_bounces"]
-        score_threshold = 0.1  # Reduced from 0.2 to 0.1 - extremely easy to get ENTER signals
-        
-        verdict = "ENTER" if (score >= score_threshold and len(bounces) >= min_bounces) else "AVOID"
-        
-        # Create reason string
+
+        current = df_clean.iloc[-1]
+        current_price = float(current["close"])
+        sma_value = float(current[sma_col])
+        distance_pct = abs(current_price - sma_value) / sma_value * 100
+        price_vs_sma_pct = (current_price - sma_value) / sma_value * 100
+        volume_ratio = float(current.get("vol_ratio", 0.0) or 0.0)
+        avg_rebound = float(np.mean([b["max_gain_pct"] for b in bounces])) if bounces else 0.0
         bounce_count = len(bounces)
-        avg_rebound = np.mean([b["max_gain_pct"] for b in bounces]) if bounces else 0
-        
-        reason = (
-            f"proximity {current_setup['distance_pct']:.1f}%, "
-            f"bounces {bounce_count}, "
-            f"avg_rebound {avg_rebound:.1f}%, "
-            f"vol_ratio {current_setup['volume_ratio']:.2f}"
+        trend_context = _trend_context(df_clean["close"])
+
+        # RAW measured values only. No score*weight derivatives here (B2).
+        score_components = {
+            "proximity_to_sma150_pct": round(distance_pct, 4),
+            "price_vs_sma150_pct": round(price_vs_sma_pct, 4),
+            "bounce_count_deduped": float(bounce_count),
+            "avg_rebound_pct": round(avg_rebound, 4),
+            "volume_ratio": round(volume_ratio, 4),
+        }
+
+        near_sma = distance_pct <= tolerance_pct
+        score = calculate_score(
+            distance_pct,
+            tolerance_pct,
+            bounces,
+            min_bounces,
+            avg_rebound,
+            min_avg_rebound_pct,
+            volume_ratio,
+            min_volume_ratio,
+        ) if near_sma else 0.0
+
+        current_date = current["date"]
+        snapshot_date = (
+            current_date.date()
+            if isinstance(current_date, pd.Timestamp)
+            else pd.to_datetime(current_date).date()
         )
-        
-        # Get current date
-        current_date = df_clean.iloc[-1]['date']
-        if isinstance(current_date, pd.Timestamp):
-            snapshot_date = current_date.date()
-        else:
-            snapshot_date = pd.to_datetime(current_date).date()
-        
-        # Detailed results
+
+        # Determine verdict + explicit rejection reason.
+        rejection_reason = None
+        if current_price < min_price:
+            rejection_reason = "price_below_min"
+        elif not near_sma:
+            rejection_reason = "not_near_sma"
+        elif bounce_count < min_bounces:
+            rejection_reason = "insufficient_bounces"
+        elif score < score_threshold:
+            rejection_reason = "score_below_threshold"
+
+        verdict = "ENTER" if rejection_reason is None else "AVOID"
+
+        reason = (
+            f"proximity {distance_pct:.1f}%, bounces {bounce_count}, "
+            f"avg_rebound {avg_rebound:.1f}%, vol_ratio {volume_ratio:.2f}"
+        )
+        if rejection_reason:
+            reason = f"{rejection_reason}: {reason}"
+
         details = {
             "symbol": symbol,
             "snapshot_date": str(snapshot_date),
-            "proximity_pct": current_setup["distance_pct"],
+            "score_version": SCORE_VERSION,
+            "trend_context": trend_context,
+            "thresholds_used": thresholds_used,
+            "rejection_reason": rejection_reason,
+            "score_components": score_components,
+            # Back-compat keys consumed by the existing UI drawer.
+            "proximity_pct": round(distance_pct, 4),
             "bounce_count": bounce_count,
-            "avg_rebound_pct": avg_rebound,
-            "vol_ratio": current_setup["volume_ratio"],
-            "score_components": {
-                "proximity": score * 0.35,
-                "bounce_count": score * 0.30,
-                "rebound_strength": score * 0.25,
-                "volume": score * 0.10
-            },
-            "current_price": float(current_setup["price"]),
-            "sma_value": float(current_setup["sma_value"]),
-            "bounces_detail": bounces[-5:] if len(bounces) > 5 else bounces  # Last 5 bounces
+            "avg_rebound_pct": round(avg_rebound, 4),
+            "vol_ratio": round(volume_ratio, 4),
+            "current_price": current_price,
+            "sma_value": sma_value,
+            "bounces_detail": bounces[-5:] if len(bounces) > 5 else bounces,
         }
-        
+
         return {
             "verdict": verdict,
             "score": round(float(score), 3),
             "reason": reason,
-            "details": details
+            "details": details,
         }
-        
+
     except Exception as e:
         logger.error(f"Error evaluating SMA-150 bounce for {symbol}: {e}")
-        return {
-            "verdict": "AVOID",
-            "score": 0.0,
-            "reason": f"Analysis error: {str(e)}",
-            "details": {
-                "symbol": symbol,
-                "error": str(e),
-                "snapshot_date": str(datetime.now().date())
-            }
-        }
+        return _avoid(symbol, f"analysis_error: {str(e)}", {"error": str(e)})

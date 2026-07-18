@@ -4,19 +4,35 @@ Main worker logic for running pattern scans
 """
 
 import asyncio
+import json
 import logging
 import random
+from collections import Counter
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional
 
 from app.workers.fmp_client import FMPClient
 from app.workers.persistence import was_seen_today, mark_seen_today, save_signal, log_pattern_run
-from app.workers.patterns.sma150 import evaluate_sma150_bounce
+from app.workers.patterns.sma150 import evaluate_sma150_bounce, DEFAULT_CONFIG
+from app.workers.patterns.config import resolve_pattern_config
 from app.workers.indicators import to_dataframe, validate_dataframe
 from app.workers.tickers import load_candidate_pool, select_random_batch, filter_by_liquidity
 from app.config import settings
 from app.utils.events import event_bus
 import pandas as pd
+
+
+def _resolve_default_config(pattern_code: str) -> Dict[str, Any]:
+    """Safe defaults per pattern (Phase 1 only supports sma150_bounce)."""
+    return DEFAULT_CONFIG.copy()
+
+
+def _liquidity_params(config: Dict[str, Any]) -> Dict[str, float]:
+    filters = config.get("min_liquidity_filters", {}) or {}
+    return {
+        "min_avg_volume": float(filters.get("min_daily_volume", 200_000)),
+        "min_price": float(config.get("min_price", 1.0)),
+    }
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +43,8 @@ async def process_single_symbol(
     symbol: str,
     pattern_code: str = "sma150_bounce",
     scan_date: date = None,
-    ignore_seen: bool = False
+    ignore_seen: bool = False,
+    config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Process a single symbol for pattern detection
@@ -43,6 +60,9 @@ async def process_single_symbol(
     
     if scan_date is None:
         scan_date = date.today()
+
+    if config is None:
+        config = _resolve_default_config(pattern_code)
     
     logger.debug(f"Processing {symbol}")
     
@@ -105,22 +125,23 @@ async def process_single_symbol(
                 "error": "Invalid data"
             }
         
-        # Check liquidity filters
-        if not filter_by_liquidity(fmp_data):
-            logger.info(f"💧 {symbol} failed liquidity check (market cap or volume too low)")
+        # Check liquidity filters (real volume + price; reason captured for telemetry)
+        liq_passed, liq_reason = filter_by_liquidity(fmp_data, **_liquidity_params(config))
+        if not liq_passed:
+            logger.info(f"💧 {symbol} failed liquidity check ({liq_reason})")
             await mark_seen_today(symbol, scan_date)
             return {
                 "symbol": symbol,
                 "processed": False,
                 "result": None,
-                "error": "Failed liquidity check"
+                "error": f"Failed liquidity check: {liq_reason}"
             }
         
         # Run pattern detection
         try:
             logger.info(f"🔍 Running pattern detection for {symbol}...")
             if pattern_code == "sma150_bounce":
-                result = evaluate_sma150_bounce(symbol, df)
+                result = evaluate_sma150_bounce(symbol, df, config)
                 logger.info(f"🔍 {symbol}: {result['verdict']} (score: {result.get('score', 'N/A'):.3f}, reason: {result.get('reason', 'N/A')})")
             else:
                 raise ValueError(f"Unknown pattern code: {pattern_code}")
@@ -197,7 +218,8 @@ async def process_single_symbol_with_data(
     fmp_data: Dict[str, Any],
     pattern_code: str = "sma150_bounce",
     scan_date: date = None,
-    ignore_seen: bool = False
+    ignore_seen: bool = False,
+    config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
     Process a single symbol for pattern detection using pre-fetched data
@@ -213,6 +235,9 @@ async def process_single_symbol_with_data(
     
     if scan_date is None:
         scan_date = date.today()
+
+    if config is None:
+        config = _resolve_default_config(pattern_code)
     
     logger.debug(f"Processing {symbol} with pre-fetched data")
     
@@ -260,22 +285,23 @@ async def process_single_symbol_with_data(
                 "error": "Invalid data"
             }
         
-        # Check liquidity filters
-        if not filter_by_liquidity(fmp_data):
-            logger.info(f"💧 {symbol} failed liquidity check (market cap or volume too low)")
+        # Check liquidity filters (real volume + price; reason captured for telemetry)
+        liq_passed, liq_reason = filter_by_liquidity(fmp_data, **_liquidity_params(config))
+        if not liq_passed:
+            logger.info(f"💧 {symbol} failed liquidity check ({liq_reason})")
             await mark_seen_today(symbol, scan_date)
             return {
                 "symbol": symbol,
                 "processed": False,
                 "result": None,
-                "error": "Failed liquidity check"
+                "error": f"Failed liquidity check: {liq_reason}"
             }
         
         # Run pattern detection
         try:
             logger.info(f"🔍 Running pattern detection for {symbol}...")
             if pattern_code == "sma150_bounce":
-                result = evaluate_sma150_bounce(symbol, df)
+                result = evaluate_sma150_bounce(symbol, df, config)
                 logger.info(f"🔍 {symbol}: {result['verdict']} (score: {result.get('score', 'N/A'):.3f}, reason: {result.get('reason', 'N/A')})")
             else:
                 raise ValueError(f"Unknown pattern code: {pattern_code}")
@@ -365,7 +391,10 @@ async def run_scan_batch(
     
     run_start = datetime.utcnow()
     logger.info(f"Starting scan batch: size={batch_size}, pattern={pattern_code}")
-    
+
+    # Resolve config once per run (B1): DB config overrides safe defaults.
+    config = await resolve_pattern_config(pattern_code, _resolve_default_config(pattern_code))
+
     try:
         # Determine symbols to scan
         if scan_id:
@@ -419,7 +448,8 @@ async def run_scan_batch(
                     symbol,
                     historical_data_batch.get(symbol, {}),
                     pattern_code,
-                    ignore_seen=ignore_seen
+                    ignore_seen=ignore_seen,
+                    config=config
                 )
         
         # Create tasks for all symbols
@@ -441,11 +471,13 @@ async def run_scan_batch(
         rejected_count = 0
         error_count = 0
         enter_signals = []
+        rejection_reasons: Counter = Counter()
         
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Task failed for {selected_symbols[i]}: {result}")
                 error_count += 1
+                rejection_reasons["task_exception"] += 1
                 continue
             
             if result["processed"]:
@@ -461,11 +493,18 @@ async def run_scan_batch(
                         })
                     else:
                         rejected_count += 1
+                        # Prefer the structured rejection_reason over free text.
+                        details = (result["result"].get("details") or {})
+                        reason = details.get("rejection_reason") or "avoided"
+                        rejection_reasons[reason] += 1
             else:
                 error_count += 1
                 # Log detailed error information
                 symbol = result.get("symbol", f"symbol_{i}")
                 error_msg = result.get("error", "Unknown error")
+                # Normalize to a compact reason key for telemetry.
+                reason_key = error_msg.split(":")[0].strip().lower().replace(" ", "_") or "error"
+                rejection_reasons[reason_key] += 1
                 if "FMP API error" in error_msg:
                     logger.error(f"FMP API error for {symbol}: {error_msg}")
                 elif "DataFrame error" in error_msg:
@@ -475,6 +514,30 @@ async def run_scan_batch(
                 else:
                     logger.error(f"Other error for {symbol}: {error_msg}")
         
+        run_duration = (datetime.utcnow() - run_start).total_seconds()
+
+        # Minimal reject-telemetry foundation (persisted in pattern_runs.notes
+        # as JSON). This is the lightweight precursor to the Phase 3 funnel; it
+        # does not add a new schema.
+        telemetry = {
+            "pattern": pattern_code,
+            "total_evaluated": len(selected_symbols),
+            "scanned": scanned_count,
+            "entered": enter_count,
+            "avoided": rejected_count,
+            "errors": error_count,
+            "top_rejection_reasons": dict(rejection_reasons.most_common(10)),
+            "config_used": {
+                k: config.get(k)
+                for k in (
+                    "touch_tolerance_pct", "min_bounces", "min_avg_rebound_pct",
+                    "min_volume_sma_ratio", "min_price", "score_threshold",
+                )
+            },
+            "score_version": "sma150.v2",
+            "runtime_seconds": round(run_duration, 2),
+        }
+
         # Log pattern run telemetry
         try:
             await log_pattern_run(
@@ -482,18 +545,17 @@ async def run_scan_batch(
                 scanned_count=scanned_count,
                 enter_count=enter_count,
                 rejected_count=rejected_count,
-                notes=f"Batch size: {batch_size}, Errors: {error_count}",
+                notes=json.dumps(telemetry),
                 run_started_at=run_start
             )
         except Exception as e:
             logger.error(f"Failed to log pattern run: {e}")
         
-        run_duration = (datetime.utcnow() - run_start).total_seconds()
-        
         # Summary
         summary = {
             "success": True,
             "run_duration_seconds": run_duration,
+            "telemetry": telemetry,
             "scanned_count": scanned_count,
             "enter_count": enter_count,
             "rejected_count": rejected_count,
@@ -546,21 +608,27 @@ async def run_scan_batch(
 
 
 async def run_maintenance_tasks():
-    """Run periodic maintenance tasks"""
+    """Run periodic maintenance tasks.
+
+    Fixes B7: previously used `async with get_db()`, but get_db() is an async
+    generator (a FastAPI dependency), not an async context manager, so the
+    scheduled maintenance job always raised. We acquire a pooled connection
+    directly and release it back to the pool.
+    """
     logger.info("Running maintenance tasks")
-    
+
+    from app.workers.maintenance import cleanup_daily_seen
+    from app.workers.persistence import get_db_connection, release_db_connection
+
+    conn = None
     try:
-        from app.workers.maintenance import cleanup_daily_seen
-        from app.deps import get_db
-        
-        # Cleanup old daily_seen entries
-        async with get_db() as db:
-            await cleanup_daily_seen(db)
-        
+        conn = await get_db_connection()
+        await cleanup_daily_seen(conn)
         logger.info("Maintenance tasks completed")
-        
     except Exception as e:
         logger.error(f"Maintenance tasks failed: {e}")
+    finally:
+        await release_db_connection(conn)
 
 
 if __name__ == "__main__":

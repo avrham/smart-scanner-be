@@ -1,4 +1,10 @@
 
+# Scheduling (B6): the in-process APScheduler inside the API service is the
+# single authoritative scheduler. It is controlled by the ENABLE_SCHEDULER env
+# var (default true) and runs scans at SCAN_TIMES. The previous external
+# `scheduler` curl-loop service was removed because it ran scans in parallel
+# with APScheduler, causing duplicate runs. Do NOT reintroduce an external
+# trigger without first setting ENABLE_SCHEDULER=false.
 services:
   api:
     build: .
@@ -13,43 +19,14 @@ services:
     environment:
       - PYTHONPATH=/app
       - ENVIRONMENT=development
+      # ENABLE_SCHEDULER controls the single authoritative in-process scheduler.
+      - ENABLE_SCHEDULER=true
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
-    restart: unless-stopped
-
-  scheduler:
-    image: curlimages/curl:8.8.0
-    env_file: .env
-    depends_on:
-      api:
-        condition: service_healthy
-    command: >
-      /bin/sh -c "
-      echo 'Smart Scanner Scheduler started - monitoring at hours 10, 14, 18 UTC';
-      while true; do
-        HH=$$(date -u +%H);
-        MM=$$(date -u +%M);
-        echo \"Current time: $$(date -u) (Hour: $$HH, Minute: $$MM)\";
-        
-        if [ \"$$HH\" = \"10\" ] || [ \"$$HH\" = \"14\" ] || [ \"$$HH\" = \"18\" ]; then
-          if [ \"$$MM\" = \"00\" ]; then
-            echo \"Triggering scan at hour $$HH\";
-            curl -s -X POST -H \"X-Worker-Token: $${WORKER_TOKEN}\" http://api:8000/api/admin/scan/start;
-            echo \"Scan triggered, sleeping for 1 hour 5 minutes to avoid duplicate triggers\";
-            sleep 3905;
-          else
-            echo \"Waiting for minute 00 (currently $$MM)\";
-            sleep 60;
-          fi
-        else
-          echo \"Outside scan hours, checking again in 5 minutes\";
-          sleep 300;
-        fi
-      done"
     restart: unless-stopped
 
   # Optional: Database for future use when asyncpg becomes Python 3.13 compatible

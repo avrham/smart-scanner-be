@@ -18,6 +18,36 @@ from app.deps import init_db_pool
 logger = logging.getLogger(__name__)
 
 
+async def get_db_connection() -> asyncpg.Connection:
+    """Acquire a pooled connection.
+
+    IMPORTANT: callers MUST return it via release_db_connection() (not
+    conn.close()). See B11 fix below.
+    """
+    pool = await init_db_pool()
+    return await pool.acquire()
+
+
+async def release_db_connection(conn: asyncpg.Connection) -> None:
+    """Release a pooled connection back to the pool.
+
+    Fixes B11: callers previously called conn.close() on pooled connections,
+    which destroyed them instead of returning them, degrading/exhausting the
+    pool over time. pool.release() returns the connection to the pool.
+    """
+    if conn is None:
+        return
+    try:
+        pool = await init_db_pool()
+        await pool.release(conn)
+    except Exception as exc:  # last-resort: don't leak on release failure
+        logger.warning("Failed to release DB connection cleanly: %s", exc)
+        try:
+            await conn.close()
+        except Exception:
+            pass
+
+
 def serialize_for_json(obj):
     """Custom JSON serializer for pandas/numpy objects"""
     if isinstance(obj, pd.Timestamp):
@@ -33,12 +63,6 @@ def serialize_for_json(obj):
     elif isinstance(obj, list):
         return [serialize_for_json(item) for item in obj]
     return obj
-
-
-async def get_db_connection():
-    """Get database connection from pool"""
-    pool = await init_db_pool()
-    return await pool.acquire()
 
 
 async def save_signal(
@@ -101,7 +125,7 @@ async def save_signal(
         logger.error(f"Failed to save signal for {symbol}: {e}")
         raise
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def was_seen_today(symbol: str, check_date: date = None) -> bool:
@@ -124,7 +148,7 @@ async def was_seen_today(symbol: str, check_date: date = None) -> bool:
         logger.error(f"Failed to check if {symbol} was seen: {e}")
         return False
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def mark_seen_today(symbol: str, check_date: date = None) -> None:
@@ -148,7 +172,7 @@ async def mark_seen_today(symbol: str, check_date: date = None) -> None:
         logger.error(f"Failed to mark {symbol} as seen: {e}")
         raise
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def log_pattern_run(
@@ -199,7 +223,7 @@ async def log_pattern_run(
         logger.error(f"Failed to log pattern run: {e}")
         raise
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def get_pattern_config(pattern_code: str) -> Dict[str, Any]:
@@ -225,7 +249,7 @@ async def get_pattern_config(pattern_code: str) -> Dict[str, Any]:
         logger.error(f"Failed to get config for {pattern_code}: {e}")
         return {}
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def batch_upsert_tickers(tickers_data: List[Dict]) -> None:
@@ -282,7 +306,7 @@ async def batch_upsert_tickers(tickers_data: List[Dict]) -> None:
         logger.error(f"Failed to batch upsert tickers: {e}")
         raise
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def upsert_ticker(
@@ -324,7 +348,7 @@ async def upsert_ticker(
         logger.error(f"Failed to upsert ticker {symbol}: {e}")
         raise
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def get_candidate_tickers(
@@ -356,7 +380,7 @@ async def get_candidate_tickers(
         logger.error(f"Failed to get candidate tickers: {e}")
         return []
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def cleanup_old_daily_seen(days_to_keep: int = 7) -> int:
@@ -381,7 +405,7 @@ async def cleanup_old_daily_seen(days_to_keep: int = 7) -> int:
         logger.error(f"Failed to cleanup daily_seen: {e}")
         return 0
     finally:
-        await conn.close()
+        await release_db_connection(conn)
 
 
 async def get_signals_count_today(pattern_code: str = None) -> Dict[str, int]:
@@ -414,4 +438,4 @@ async def get_signals_count_today(pattern_code: str = None) -> Dict[str, int]:
         logger.error(f"Failed to get signals count: {e}")
         return {"ENTER": 0, "AVOID": 0}
     finally:
-        await conn.close()
+        await release_db_connection(conn)

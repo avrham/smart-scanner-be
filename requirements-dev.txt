@@ -1,0 +1,7 @@
+# Dev/test-only dependencies (not required to run the service).
+# Install into a venv with system site-packages so pandas/numpy are available:
+#   python3 -m venv --system-site-packages .venv
+#   .venv/bin/pip install -r requirements-dev.txt
+#   .venv/bin/python -m pytest
+-r requirements.txt
+pytest>=8.0.0

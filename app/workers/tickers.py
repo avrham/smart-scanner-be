@@ -5,7 +5,7 @@ Handles FMP stock list updates and candidate pool generation
 
 import logging
 import random
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
 from app.workers.fmp_client import FMPClient
@@ -22,139 +22,75 @@ EXCLUDED_SECTORS = ["ETF", "FUND", "REIT"]
 
 async def refresh_tickers_cache(fmp: FMPClient) -> int:
     """
-    Refresh ticker cache from FMP stock list
-    Returns number of tickers processed
+    Refresh ticker cache from the FMP stock screener.
+
+    Uses the screener as the source because it returns REAL market cap AND REAL
+    traded volume (B10 fix). The previous implementation fabricated volume from
+    market_cap / price, which corrupted downstream liquidity filtering. We never
+    fabricate volume: when it is unavailable we store NULL (unknown) so the
+    universe filter can reject/downgrade the symbol per config.
+
+    Returns number of tickers saved.
     """
-    logger.info("Starting ticker cache refresh")
-    
+    logger.info("Starting ticker cache refresh (real market cap + volume via screener)")
+
     try:
-        # Get stock list from FMP
-        stock_list = await fmp.list_stocks()
-        
-        if not stock_list:
-            logger.warning("No stocks returned from FMP")
+        screener_stocks = await fmp.get_stock_screener(
+            market_cap_more_than=50_000_000,
+            volume_more_than=100_000,
+            exchange=",".join(EXCHANGE_FILTERS),
+            limit=5000,
+        )
+
+        if not screener_stocks:
+            logger.warning("Screener returned no stocks; ticker cache not refreshed")
             return 0
-        
-        logger.info(f"Retrieved {len(stock_list)} stocks from FMP")
-        
-        # Filter the stock list BEFORE processing to avoid processing 85k stocks
-        logger.info("Pre-filtering stocks to reduce processing time...")
-        filtered_stocks = []
-        
-        for stock in stock_list:
-            # Quick pre-filter to avoid processing irrelevant stocks
-            symbol = stock.get("symbol", "").strip().upper()
-            exchange = stock.get("exchangeShortName", "").strip().upper()
-            market_cap = stock.get("marketCap")
-            price = stock.get("price")
-            
-            # Basic validation and filtering
-            if (symbol and len(symbol) <= 10 and 
-                exchange in EXCHANGE_FILTERS and
-                price is not None and float(price) >= 1.0 and
-                market_cap is not None and float(market_cap) >= 50_000_000):
-                filtered_stocks.append(stock)
-                
-                # Limit to 5000 stocks to avoid extremely long processing
-                if len(filtered_stocks) >= 5000:
-                    break
-        
-        logger.info(f"Pre-filtered to {len(filtered_stocks)} relevant stocks (from {len(stock_list)})")
-        
-        processed_count = 0
+
+        logger.info(f"Retrieved {len(screener_stocks)} stocks from FMP screener")
+
         valid_count = 0
-        
-        # Process in batches for better performance
-        batch_size = 100
-        ticker_batch = []
-        
-        for stock in filtered_stocks:
-            processed_count += 1
-            
-            # Extract stock information
-            symbol = stock.get("symbol", "").strip().upper()
-            name = stock.get("name", "").strip()
-            exchange = stock.get("exchangeShortName", "").strip().upper()
-            market_cap = stock.get("marketCap")
+        unknown_volume_count = 0
+
+        for stock in screener_stocks:
+            symbol = (stock.get("symbol") or "").strip().upper()
+            exchange = (stock.get("exchangeShortName") or "").strip().upper()
+
+            if not symbol or len(symbol) > 10 or exchange not in EXCHANGE_FILTERS:
+                continue
+
             price = stock.get("price")
-            
-            # Basic validation
-            if not symbol or len(symbol) > 10:
-                continue
-            
-            # Filter by exchange
-            if exchange not in EXCHANGE_FILTERS:
-                continue
-            
-            # Skip penny stocks and very low prices
             if price is not None and float(price) < 1.0:
                 continue
-            
-            # Skip very small market cap
-            if market_cap is not None and float(market_cap) < 50_000_000:  # $50M minimum
-                continue
-            
-            # Estimate volume (FMP stock list doesn't always have volume)
-            estimated_volume = None
-            if market_cap and price:
-                # Rough estimate based on market cap
-                estimated_volume = max(100_000, float(market_cap) / (float(price) * 1000))
-            
-            # Add to batch
-            ticker_batch.append({
-                "symbol": symbol,
-                "name": name,
-                "exchange": exchange,
-                "market_cap": float(market_cap) if market_cap else None,
-                "last_volume": estimated_volume,
-                "is_active": True
-            })
-            
-            # Process batch when it reaches batch_size
-            if len(ticker_batch) >= batch_size:
-                try:
-                    # Use individual upserts for now (batch_upsert_tickers has issues)
-                    for ticker in ticker_batch:
-                        await upsert_ticker(
-                            symbol=ticker["symbol"],
-                            name=ticker["name"],
-                            exchange=ticker["exchange"],
-                            market_cap=ticker["market_cap"],
-                            last_volume=ticker["last_volume"],
-                            is_active=ticker["is_active"]
-                        )
-                    valid_count += len(ticker_batch)
-                    logger.info(f"Processed batch of {len(ticker_batch)} tickers")
-                except Exception as e:
-                    logger.warning(f"Failed to save ticker batch: {e}")
-                
-                ticker_batch = []
-        
-        # Process remaining tickers
-        if ticker_batch:
+
+            market_cap = stock.get("marketCap")
+            # REAL traded volume from the screener; NEVER fabricated.
+            raw_volume = stock.get("volume")
+            last_volume = (
+                float(raw_volume) if raw_volume not in (None, "", 0) else None
+            )
+            if last_volume is None:
+                unknown_volume_count += 1
+
             try:
-                # Use individual upserts for now (batch_upsert_tickers has issues)
-                for ticker in ticker_batch:
-                    await upsert_ticker(
-                        symbol=ticker["symbol"],
-                        name=ticker["name"],
-                        exchange=ticker["exchange"],
-                        market_cap=ticker["market_cap"],
-                        last_volume=ticker["last_volume"],
-                        is_active=ticker["is_active"]
-                    )
-                valid_count += len(ticker_batch)
-                logger.info(f"Processed final batch of {len(ticker_batch)} tickers")
+                await upsert_ticker(
+                    symbol=symbol,
+                    name=(stock.get("companyName") or "").strip(),
+                    exchange=exchange,
+                    market_cap=float(market_cap) if market_cap else None,
+                    last_volume=last_volume,
+                    is_active=True,
+                )
+                valid_count += 1
             except Exception as e:
-                logger.warning(f"Failed to save final ticker batch: {e}")
-        
+                logger.warning(f"Failed to save ticker {symbol}: {e}")
+
         logger.info(
-            f"Ticker refresh complete: processed {processed_count}, "
-            f"saved {valid_count} valid tickers"
+            f"Ticker refresh complete: saved {valid_count} tickers "
+            f"({unknown_volume_count} with unknown volume)"
         )
-        
+
         return valid_count
-        
+
     except Exception as e:
         logger.error(f"Failed to refresh ticker cache: {e}")
         raise
@@ -338,48 +274,48 @@ async def update_ticker_volume(symbol: str, volume: float) -> None:
 
 def filter_by_liquidity(
     stock_data: Dict[str, Any],
-    min_market_cap: float = 200_000_000,
-    min_avg_volume: float = 200_000
-) -> bool:
+    min_avg_volume: float = 200_000,
+    min_price: float = 1.0,
+) -> Tuple[bool, Optional[str]]:
     """
-    Check if stock meets liquidity requirements based on actual data
+    Check liquidity using REAL data from the historical price series.
+
+    Volume here is genuine traded volume from FMP historical bars (not
+    fabricated). Market-cap enforcement is intentionally NOT performed here:
+    shares outstanding are not present in the historical payload, so any
+    market-cap number would be a guess. Market-cap filtering is applied at the
+    universe level in get_candidate_tickers()/the screener instead (B9).
+
+    Returns (passed, rejection_reason). rejection_reason is None when passed.
     """
-    
     try:
-        # Extract data from FMP response
-        if "historical" not in stock_data or not stock_data["historical"]:
-            return False
-        
-        historical = stock_data["historical"]
-        
-        # Get recent volume data (last 20 days)
+        historical = stock_data.get("historical") if stock_data else None
+        if not historical:
+            return False, "no_historical_data"
+
         recent_data = historical[:20] if len(historical) >= 20 else historical
-        
         if not recent_data:
-            return False
-        
-        # Calculate average volume
-        volumes = [float(day.get("volume", 0)) for day in recent_data if day.get("volume")]
-        
+            return False, "no_historical_data"
+
+        volumes = [
+            float(day.get("volume", 0) or 0)
+            for day in recent_data
+            if day.get("volume") is not None
+        ]
         if not volumes:
-            return False
-        
+            # Real volume unavailable: reject rather than invent a value.
+            return False, "volume_unknown"
+
         avg_volume = sum(volumes) / len(volumes)
-        
-        # Get latest price for market cap estimation
-        latest_price = float(recent_data[0].get("close", 0))
-        
-        # Rough market cap estimation (this is approximate)
-        # In production, you'd want to get shares outstanding from FMP
-        estimated_shares = 100_000_000  # Default estimate
-        estimated_market_cap = latest_price * estimated_shares
-        
-        # Apply filters
-        volume_check = avg_volume >= min_avg_volume
-        price_check = latest_price >= 1.0  # No penny stocks
-        
-        return volume_check and price_check
-        
+        latest_price = float(recent_data[0].get("close", 0) or 0)
+
+        if latest_price < min_price:
+            return False, "price_below_min"
+        if avg_volume < min_avg_volume:
+            return False, "avg_volume_below_min"
+
+        return True, None
+
     except Exception as e:
         logger.warning(f"Failed to check liquidity: {e}")
-        return False
+        return False, "liquidity_check_error"

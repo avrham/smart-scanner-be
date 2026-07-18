@@ -63,14 +63,19 @@ async def scheduled_maintenance_job():
 
 
 def start_scheduler():
-    """Start the background scheduler"""
+    """Start the background scheduler.
+
+    This in-process APScheduler is the SINGLE authoritative scheduler (B6).
+    The external docker curl-loop trigger was removed to avoid duplicate runs.
+    Jobs use max_instances=1 + coalesce=True to further guard against overlap.
+    """
     global scheduler
     
     if scheduler is not None:
-        logger.warning("Scheduler already running")
+        logger.warning("Scheduler already running; refusing to start a second instance")
         return
     
-    logger.info("Starting scheduler")
+    logger.info("Starting scheduler (single authoritative source for scans)")
     
     scheduler = AsyncIOScheduler()
     
