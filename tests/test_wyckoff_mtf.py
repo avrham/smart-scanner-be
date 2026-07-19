@@ -394,11 +394,13 @@ def test_funnel_evaluates_wyckoff_via_registry_watch(monkeypatch):
     # History fetch depth was sized to wyckoff's deep-history requirement.
     assert fake_fmp.timeseries == max(350, WyckoffMTFStrategy.min_daily_bars + 60)
     assert set(fake_fmp.requested) == {"AAA", "BBB"}
-    # No 4H available in the funnel -> WATCH, never ENTER, nothing saved.
+    # No 4H available in the funnel -> WATCH, never ENTER. Phase 5.2: WATCH
+    # candidates are persisted (with decision cards) by default.
     assert sc["stage_3_evaluated"] == 2
     assert sc["watch_count"] == 2
     assert sc["enter_count"] == 0
-    assert saved == []
+    assert sc["watch_saved_count"] == 2
+    assert sorted(saved) == ["AAA", "BBB"]
 
 
 def test_funnel_dry_run_wyckoff_makes_no_fmp_calls(monkeypatch):

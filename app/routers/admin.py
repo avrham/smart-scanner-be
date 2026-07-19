@@ -37,6 +37,7 @@ async def start_scan(
     scanner_mode: str = Body("legacy"),
     limit: Optional[int] = Body(None),
     dry_run: bool = Body(False),
+    persist_watch: Optional[bool] = Body(None),
 ):
     """Trigger a manual scan cycle for a given pattern (default sma150_bounce).
 
@@ -48,6 +49,9 @@ async def start_scan(
         signal writes, and returns telemetry synchronously - the safe way to
         validate. Without dry_run it fetches history for liquidity survivors
         (bounded by `limit`) and evaluates the strategy.
+
+    persist_watch (funnel mode only): override Phase 5.2 WATCH persistence
+    (default true). Legacy mode ignores it.
     """
 
     chosen_batch_size = batch_size or settings.SCAN_BATCH_SIZE
@@ -57,6 +61,8 @@ async def start_scan(
     if scanner_mode == "funnel":
         funnel_scan_id = str(uuid.uuid4())
         funnel_limit = limit if limit is not None else batch_size
+        # None values are ignored by the funnel's config merge (keeps defaults).
+        funnel_scanner_config = {"persist_watch_candidates": persist_watch}
 
         # dry_run is FMP-free and fast -> run synchronously and return telemetry.
         if dry_run:
@@ -64,6 +70,7 @@ async def start_scan(
                 fmp=None,
                 pattern_code=pattern_code,
                 limit=funnel_limit,
+                scanner_config=funnel_scanner_config,
                 ignore_seen=ignore_seen,
                 dry_run=True,
                 scan_id=funnel_scan_id,
@@ -81,6 +88,7 @@ async def start_scan(
                     fmp=fmp,
                     pattern_code=pattern_code,
                     limit=funnel_limit,
+                    scanner_config=funnel_scanner_config,
                     ignore_seen=ignore_seen,
                     dry_run=False,
                     scan_id=funnel_scan_id,

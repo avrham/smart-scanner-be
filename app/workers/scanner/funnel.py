@@ -36,6 +36,7 @@ from app.workers.strategies import (
     StrategyResult,
     get_strategy,
 )
+from app.workers.strategies.decision_card import build_decision_card
 from app.workers.persistence import (
     get_universe_tickers,
     log_pattern_run,
@@ -58,6 +59,7 @@ DEFAULT_SCANNER_CONFIG: Dict[str, Any] = {
     "sample_rejections_limit": 25, # cap stored per-symbol reject samples
     "allow_unknown_volume": False, # never include unknown-volume names by default
     "enable_expensive_stages": False,  # Stage 4 (4H etc.) stays off in Phase 3
+    "persist_watch_candidates": True,  # Phase 5.2: save WATCH + decision card
     "scanner_version": SCANNER_VERSION,
 }
 
@@ -274,6 +276,7 @@ async def run_funnel_scan(
         "stage_4_4h_fetched": 0,
         "enter_count": 0,
         "watch_count": 0,   # not supported by sma150_bounce (documented)
+        "watch_saved_count": 0,  # Phase 5.2: WATCH candidates persisted
         "reject_count": 0,
     }
 
@@ -301,6 +304,8 @@ async def run_funnel_scan(
     )
     strategy_wants_4h = "4h" in (getattr(strategy, "required_timeframes", None) or [])
     use_4h = expensive_enabled and strategy_wants_4h
+    # Phase 5.2: persist WATCH candidates (with decision cards) unless disabled.
+    persist_watch = bool(scfg.get("persist_watch_candidates", True))
     if not expensive_enabled:
         extra_notes.append("expensive stages (4H) disabled")
     elif not strategy_wants_4h:
@@ -409,10 +414,15 @@ async def run_funnel_scan(
                 stage_counts["enter_count"] += 1
                 await _maybe_save(result)
             elif result.decision == StrategyDecision.WATCH:
-                # Not produced by sma150_bounce today; supported for future
-                # strategies. WATCH candidates are counted but not persisted yet.
+                # Phase 5.2: WATCH candidates are valuable decision-support data.
+                # Persist them (with a decision card) when enabled; outcome
+                # tracking only ever consumes verdict='ENTER', so WATCH rows are
+                # inspectable history, not entries.
                 stage_counts["watch_count"] += 1
+                if persist_watch and await _maybe_save(result):
+                    stage_counts["watch_saved_count"] += 1
             else:
+                # Low-quality AVOID/REJECT are never persisted unless debug mode.
                 stage_counts["reject_count"] += 1
                 tracker.add(
                     symbol, "evaluation",
@@ -459,24 +469,30 @@ async def _fetch_4h(fmp: FMPClient, symbol: str) -> Optional[pd.DataFrame]:
         return None
 
 
-async def _maybe_save(result: StrategyResult) -> None:
+async def _maybe_save(result: StrategyResult) -> bool:
     """Persist a signal via the existing pipeline (Phase 2 compatible).
 
-    Persists the strategy's `details` verbatim so downstream (UI + Phase 2
-    outcome tracking) sees exactly the same payload as before Phase 4.
+    Phase 5.2: a deterministic decision card is attached at
+    `details.decision_card` (built only from StrategyResult fields — nothing is
+    invented). The strategy's own detail fields are otherwise untouched.
+    Returns True when the row was written.
     """
     try:
+        details = dict(result.details or {})
+        details["decision_card"] = build_decision_card(result)
         await save_signal(
             symbol=result.symbol,
             pattern_code=result.pattern_code,
             verdict=result.verdict,
             score=result.score,
             reason=result.reason,
-            details=result.details,
+            details=details,
             snapshot_date=date.fromisoformat(result.details["snapshot_date"]),
         )
+        return True
     except Exception as exc:
         logger.error("Failed to save funnel signal for %s: %s", result.symbol, exc)
+        return False
 
 
 async def _persist_telemetry(

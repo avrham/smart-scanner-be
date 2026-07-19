@@ -466,6 +466,17 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - [x] Defaults safe: no 4H in dry_run, none for sma150, none for rejects, `limit` bounds fetches
 - [x] Deterministic tests (`tests/test_funnel_4h.py`); docs (`docs/phase-5-1-4h-trigger-support-summary.md`)
 
+### Phase 5.2 — WATCH persistence + structured decision cards
+- [x] Deterministic decision-card builder from `StrategyResult` only, no LLM (`app/workers/strategies/decision_card.py`); card stored at `signals.details.decision_card`
+- [x] Funnel persists WATCH candidates (verdict='WATCH') with cards; default on, disable via scanner `persist_watch_candidates` or admin `persist_watch=false`; ENTER signals get cards too
+- [x] AVOID/REJECT still never persisted unless `DEBUG_SAVE_AVOID`; no schema change needed (`signals.verdict` is free TEXT)
+- [x] Telemetry: `stage_counts.watch_saved_count`
+- [x] Outcome tracking unaffected: loader filters `verdict='ENTER'`, so WATCH rows are inspectable history, never treated as entries (verified by test)
+- [x] Deterministic tests (`tests/test_watch_persistence.py`); docs (`docs/phase-5-2-watch-candidates-summary.md`)
+
+Note: the public `GET /api/signals` endpoints filter `verdict='ENTER'`, so WATCH
+rows do not leak into the existing UI; surfacing them is deliberate Phase 6 work.
+
 ### Phase 6 — Decision cards & UI
 - [ ] Structured decision card generation (data-driven)
 - [ ] Signal drawer + filters + MTF context
