@@ -119,6 +119,42 @@ class FMPClient:
             logger.error(f"Failed to fetch historical data for {symbol}: {e}")
             raise
     
+    async def fetch_historical_4h(
+        self,
+        symbol: str,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get 4-hour OHLCV bars for a symbol (Phase 5.1, survivor-only usage).
+
+        Uses `/historical-chart/4hour/{symbol}`. Returns the SAME payload shape
+        as daily history ({"symbol", "historical": [...]}) so `to_dataframe`
+        works unchanged; rows are newest-first like the daily endpoint.
+
+        SAFETY: this endpoint is expensive and may not exist on all FMP plans.
+        It NEVER raises — missing/empty/unsupported responses (e.g. an
+        "Error Message" dict) yield an empty `historical` list so the caller can
+        classify it as data-unavailable instead of crashing a scan.
+        """
+        path = f"/historical-chart/4hour/{symbol}"
+        try:
+            result = await self._request(path)
+        except Exception as e:
+            logger.warning(f"4H data unavailable for {symbol} (endpoint/plan?): {e}")
+            return {"symbol": symbol, "historical": []}
+
+        # Endpoint returns a bare list of bars; anything else (error dict,
+        # None) means unsupported/empty.
+        if not isinstance(result, list) or not result:
+            logger.warning(f"No 4H data for {symbol}")
+            return {"symbol": symbol, "historical": []}
+
+        required = {"date", "open", "high", "low", "close", "volume"}
+        rows = [r for r in result if isinstance(r, dict) and required.issubset(r.keys())]
+        if limit is not None:
+            rows = rows[: int(limit)]  # newest-first -> keep most recent N
+        logger.info(f"Fetched {len(rows)} 4H bars for {symbol}")
+        return {"symbol": symbol, "historical": rows}
+
     async def get_company_profile(self, symbol: str) -> Dict[str, Any]:
         """Get company profile information"""
         path = f"/profile/{symbol}"

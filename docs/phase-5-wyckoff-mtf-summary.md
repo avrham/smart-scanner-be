@@ -103,10 +103,13 @@ sma150 config is untouched.
   details/score_components/required_timeframes/entry_price/stop_price/
   target_price/invalidation/setup_type/strategy_version`.
 - **Funnel (Phase 3):** selectable via `pattern_code="wyckoff_mtf"`; evaluated
-  through the registry. Funnel remains **opt-in and non-default**; expensive 4H
-  stages stay disabled, so via the funnel wyckoff returns at most WATCH (nothing
-  is saved). `dry_run` still makes zero FMP calls and no DB writes. `limit` still
-  bounds the history fetch, now sized to wyckoff's deep-history need.
+  through the registry. Funnel remains **opt-in and non-default**. Expensive 4H
+  stages are **off by default**, so a default funnel run yields at most WATCH
+  (nothing saved). **Phase 5.1:** with an explicit opt-in
+  (`enable_expensive_stages` or `enable_4h_trigger`) the funnel fetches 4H for
+  WATCH survivors only and can upgrade them to ENTER — see
+  `docs/phase-5-1-4h-trigger-support-summary.md`. `dry_run` still makes zero FMP
+  calls and no DB writes. `limit` still bounds the history fetch.
 - **Outcome tracking (Phase 2):** when a wyckoff signal is created it carries
   `side`, `entry_price`, `stop_price`, `invalidation`, `setup_type`, and a
   timeframe summary in `details`, making outcomes more useful. Outcomes are still
@@ -125,7 +128,9 @@ curl -s -X POST "$BASE/api/admin/scan/start" \
 ```
 
 A non-dry-run funnel scan for wyckoff fetches deep daily history for the bounded
-survivors and will emit at most WATCH (4H disabled). Apply migration 004 first if
+survivors and — by default — emits at most WATCH (4H disabled). Enabling the 4H
+trigger for a tiny validation run is covered in
+`docs/phase-5-1-4h-trigger-support-summary.md`. Apply migration 004 first if
 you want DB-authoritative config; flip `patterns.is_enabled` to true only when you
 deliberately want it scanned.
 
@@ -146,8 +151,9 @@ saved); funnel dry-run makes no FMP calls.
 ## What remains unproven / not done
 
 - **No proof of alpha.** Requires Phase 2 outcomes accumulating vs. baselines.
-- 4H entries are untested against a live intraday feed (no FMP intraday endpoint
-  exists yet). ENTER via wyckoff currently needs externally injected 4H data.
+- 4H entries are untested against a live intraday feed. Phase 5.1 added a
+  survivor-only fetch path (`/historical-chart/4hour`), but it has only been
+  exercised with mocked responses; the endpoint depends on the FMP plan.
 - Weekly phase and swing-structure rules are coarse v1 heuristics; LPS/LPSY and
   richer Wyckoff logic are deferred.
 - No scheduler, no UI, no broker execution, no LLM were added.

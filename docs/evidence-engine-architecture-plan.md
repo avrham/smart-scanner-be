@@ -443,10 +443,13 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - [ ] LPS/LPSY and other subjective/effort-vs-result reads — OUT OF SCOPE (documented as future)
 
 **Implementation notes (Phase 5):**
-- **No live 4H fetch.** The FMP client has no intraday endpoint, so 4H is never
-  fetched automatically. The strategy uses 4H only when the caller injects it via
-  `StrategyContext.data_meta["df_4h"]` and `enable_4h_trigger` is true. Through
-  the funnel (expensive stages disabled) wyckoff yields at most WATCH.
+- ~~No live 4H fetch.~~ **Updated in Phase 5.1:** the FMP client now has
+  `fetch_historical_4h` (`/historical-chart/4hour/{symbol}`) and the funnel can
+  fetch 4H — but ONLY for WATCH survivors (monthly/weekly/daily already valid),
+  only for strategies declaring "4h" in `required_timeframes`, and only when
+  explicitly enabled (scanner `enable_expensive_stages` or pattern
+  `enable_4h_trigger`). Default remains OFF: through a default funnel run wyckoff
+  still yields at most WATCH. See `docs/phase-5-1-4h-trigger-support-summary.md`.
 - Score is a decomposed `structure_score` (0..1) from raw components
   (`monthly_bias_quality`, `weekly_alignment_quality`, `daily_setup_quality`,
   `volume_confirmation`); the 4H trigger only flips WATCH↔ENTER. No 0-100 score.
@@ -455,6 +458,13 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - Signals (when created) carry `side`, `entry_price`/`stop_price`/`invalidation`,
   `setup_type`, and a timeframe summary in `details` for Phase 2 outcome tracking.
 - See `docs/phase-5-wyckoff-mtf-summary.md`.
+
+### Phase 5.1 — Survivor-only 4H trigger support
+- [x] `FMPClient.fetch_historical_4h(symbol, limit)` — same payload shape as daily; never raises; empty on unsupported plan/endpoint
+- [x] Funnel Stage 4: fetch 4H only for WATCH survivors of a "4h"-declaring strategy, with explicit opt-in (`enable_expensive_stages` or `enable_4h_trigger`); re-evaluate with `data_meta["df_4h"]` injected (daily data reused)
+- [x] Telemetry: `stage_counts.stage_4_4h_fetched` + `api_call_counts.four_hour_fetches`
+- [x] Defaults safe: no 4H in dry_run, none for sma150, none for rejects, `limit` bounds fetches
+- [x] Deterministic tests (`tests/test_funnel_4h.py`); docs (`docs/phase-5-1-4h-trigger-support-summary.md`)
 
 ### Phase 6 — Decision cards & UI
 - [ ] Structured decision card generation (data-driven)

@@ -256,6 +256,8 @@ class WyckoffMTFStrategy(Strategy):
             f"{decision.value} {side.value} {setup_type} | "
             f"monthly={bias}, weekly_phase={phase}, score={score}"
         )
+        if decision == StrategyDecision.WATCH:
+            reason += " | MTF + daily setup valid, no 4H trigger yet"
         details: Dict[str, Any] = {
             "symbol": context.symbol,
             "snapshot_date": snapshot_date,

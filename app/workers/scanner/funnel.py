@@ -10,9 +10,12 @@ Two layers:
 SAFETY:
   * Cheap stages (0/1) never touch FMP. `dry_run=True` stops after Stage 1, so it
     is completely FMP-free and safe for validation/tests.
-  * Expensive stages (Stage 4 / 4H) are DISABLED; the hook is a documented no-op.
+  * Stage 4 (4H) is survivor-only and OFF by default (Phase 5.1): it requires an
+    explicit opt-in (scanner enable_expensive_stages or pattern enable_4h_trigger),
+    a strategy that declares "4h" in required_timeframes, AND a WATCH result from
+    Stage 3 — i.e. monthly/weekly/daily already valid, trigger missing.
   * The survivor set fed to the (expensive) history fetch is bounded by `limit`
-    / max_universe_size to prevent broad FMP usage.
+    / max_universe_size to prevent broad FMP usage; 4H fetches are a subset of it.
 """
 
 import asyncio
@@ -247,7 +250,7 @@ async def run_funnel_scan(
     scfg = _merge_scanner_config(scanner_config)
     tracker = RejectionTracker(sample_limit=int(scfg["sample_rejections_limit"]))
     extra_notes: List[str] = []
-    api_call_counts: Dict[str, int] = {"historical_fetches": 0}
+    api_call_counts: Dict[str, int] = {"historical_fetches": 0, "four_hour_fetches": 0}
 
     # Phase 4/5: resolve the strategy first (fails fast on unknown pattern) and
     # use ITS defaults for the Phase 1 config resolver (DB overrides on top).
@@ -268,6 +271,7 @@ async def run_funnel_scan(
         "stage_1_liquidity_passed": 0,
         "stage_2_prefilter_passed": 0,
         "stage_3_evaluated": 0,
+        "stage_4_4h_fetched": 0,
         "enter_count": 0,
         "watch_count": 0,   # not supported by sma150_bounce (documented)
         "reject_count": 0,
@@ -287,8 +291,22 @@ async def run_funnel_scan(
             f"survivors capped {len(survivors)}->{len(bounded)} (limit={cap})"
         )
 
-    if not scfg["enable_expensive_stages"]:
-        extra_notes.append("expensive stages (4H) disabled in Phase 3")
+    # Phase 5.1: survivor-only 4H gate. Explicit opt-in via scanner-level
+    # enable_expensive_stages OR pattern-level enable_4h_trigger. Only strategies
+    # that declare "4h" in required_timeframes (wyckoff_mtf) ever fetch it, and
+    # only for candidates that already passed liquidity + prefilter + monthly/
+    # weekly/daily (i.e. Stage 3 returned WATCH awaiting a trigger).
+    expensive_enabled = bool(scfg["enable_expensive_stages"]) or bool(
+        pattern_config.get("enable_4h_trigger", False)
+    )
+    strategy_wants_4h = "4h" in (getattr(strategy, "required_timeframes", None) or [])
+    use_4h = expensive_enabled and strategy_wants_4h
+    if not expensive_enabled:
+        extra_notes.append("expensive stages (4H) disabled")
+    elif not strategy_wants_4h:
+        extra_notes.append("expensive stages enabled but strategy does not use 4H")
+    else:
+        extra_notes.append("4H trigger enabled: survivor-only fetches")
 
     if dry_run:
         extra_notes.append("dry_run: stages 2-3 skipped, no FMP calls, no writes")
@@ -365,6 +383,26 @@ async def run_funnel_scan(
             )
             result = strategy.evaluate(df, context)
             stage_counts["stage_3_evaluated"] += 1
+
+            # Stage 4 - survivor-only 4H trigger (Phase 5.1). Fetch 4H ONLY when
+            # the strategy said WATCH (monthly/weekly/daily valid, trigger
+            # missing) and the expensive gate is explicitly enabled. Daily data
+            # is reused; one extra bounded call per WATCH survivor at most.
+            if use_4h and result.decision == StrategyDecision.WATCH:
+                df_4h = await _fetch_4h(fmp, symbol)
+                api_call_counts["four_hour_fetches"] += 1
+                stage_counts["stage_4_4h_fetched"] += 1
+                if df_4h is not None and not df_4h.empty:
+                    context_4h = StrategyContext(
+                        symbol=symbol,
+                        pattern_code=pattern_code,
+                        config={**pattern_config, "enable_4h_trigger": True},
+                        scanner_mode="funnel",
+                        scan_run_id=scan_id,
+                        data_meta={"df_4h": df_4h},
+                    )
+                    result = strategy.evaluate(df, context_4h)
+
             await mark_seen_today(symbol, scan_date)
 
             if result.decision == StrategyDecision.ENTER:
@@ -386,10 +424,6 @@ async def run_funnel_scan(
             logger.error("Funnel eval failed for %s: %s", symbol, exc)
             tracker.add(symbol, "evaluation", "eval_error")
 
-    # Stage 4 hook - expensive data only for survivors (disabled in Phase 3).
-    # Intentionally a no-op; wired here so a future strategy can request 4H data
-    # for the ENTER/WATCH survivors without restructuring the funnel.
-
     finished_at = datetime.utcnow()
     telemetry = assemble_telemetry(
         pattern_code=pattern_code,
@@ -407,6 +441,22 @@ async def run_funnel_scan(
     if scan_id:
         await event_bus.publish(scan_id, {"type": "finished", "telemetry": telemetry})
     return _summary(telemetry, stage_counts, dry_run=False)
+
+
+async def _fetch_4h(fmp: FMPClient, symbol: str) -> Optional[pd.DataFrame]:
+    """Fetch + normalize 4H bars for ONE survivor. Never raises.
+
+    Returns None when the endpoint is unsupported/empty so the caller keeps the
+    WATCH decision instead of failing the scan. No fake data is ever created.
+    """
+    try:
+        payload = await fmp.fetch_historical_4h(symbol)
+        if not payload.get("historical"):
+            return None
+        return to_dataframe(payload)
+    except Exception as exc:
+        logger.warning("4H fetch/normalize failed for %s: %s", symbol, exc)
+        return None
 
 
 async def _maybe_save(result: StrategyResult) -> None:
