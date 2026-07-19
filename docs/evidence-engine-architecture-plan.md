@@ -401,11 +401,11 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - [ ] Full backtest harness over historical universe (deferred; outcome tracking of live signals first)
 
 ### Phase 3 — Funnel scanner
-- [ ] Liquid universe builder (real volume)
-- [ ] Deterministic staged filtering + telemetry
-- [ ] Funnel default; random behind flag only
-- [ ] Expensive data (4H) only for survivors
-- [ ] `scan_runs.stage_telemetry` persisted + tests
+- [x] Liquid universe builder (real volume, from ticker cache; NULLs preserved)
+- [x] Deterministic staged filtering + telemetry (`app/workers/scanner/funnel.py`)
+- [x] Funnel available behind `scanner_mode=funnel`; legacy random remains default (flip default later)
+- [x] Expensive data (4H) hook present but disabled (`enable_expensive_stages=false`)
+- [x] Staged telemetry persisted in `pattern_runs.notes` (no migration) + tests
 
 ### Phase 4 — Strategy interface
 - [ ] `Strategy` contract + registry
@@ -566,3 +566,35 @@ smoke was intentionally skipped before Phase 2. Outcome tracking has been proven
 on synthetic data via unit tests, but has NOT yet been run end-to-end against
 real generated signals + live FMP data. This remains open and should be closed
 before drawing any conclusions about signal value.
+
+---
+
+## 20. Phase 3 implementation notes (DONE)
+
+Phase 3 (hierarchical funnel scanner) is implemented. Full details in
+`docs/phase-3-funnel-scanner-summary.md`. Summary:
+
+- New `app/workers/scanner/funnel.py`: staged funnel with pure, unit-tested
+  classifiers (`classify_liquidity`, `cheap_prefilter`), a `RejectionTracker`
+  (capped samples), telemetry assembly, and an async orchestrator
+  `run_funnel_scan(...)`.
+- Stage 0 universe from the ticker cache via new read-only
+  `get_universe_tickers()` (real values, NULLs preserved — no fabrication).
+- Stage 1 liquidity filter runs BEFORE any FMP history fetch; Stage 2 cheap
+  daily prefilters; Stage 3 strategy evaluation on survivors only (reuses the
+  Phase 1 config resolver + `evaluate_sma150_bounce`). Stage 4 (4H/expensive) is
+  a documented, disabled no-op hook.
+- Telemetry (scanner_version, config_summary, stage_counts,
+  rejection_reason_counts, capped sample_rejections, api_call_counts, timings)
+  persisted as JSON in `pattern_runs.notes` — no migration needed.
+- Admin `POST /api/admin/scan/start` gains `scanner_mode` (`legacy` default |
+  `funnel`), `limit`, and `dry_run`. `dry_run` runs Stages 0-1 only: no FMP, no
+  writes, returns telemetry synchronously (safe validation path). Legacy random
+  scan is unchanged and remains the default.
+- New signals from the funnel go through the existing `save_signal` pipeline, so
+  they are automatically Phase 2 outcome-tracking compatible. `side` is NOT
+  invented for `sma150_bounce`; it stays absent (outcome tracking defaults LONG).
+- 19 new tests (75 total), all deterministic — no live FMP/Supabase.
+
+Deferred by design: making funnel the default, `scan_rejects` table, real 4H
+data, extra baselines, strategy interface, Wyckoff, LLM, UI.

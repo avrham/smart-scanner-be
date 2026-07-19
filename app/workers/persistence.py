@@ -383,6 +383,48 @@ async def get_candidate_tickers(
         await release_db_connection(conn)
 
 
+async def get_universe_tickers(
+    exchanges: list = None,
+    limit: int = 5000,
+) -> List[Dict[str, Any]]:
+    """Load raw ticker rows (symbol, market_cap, last_volume) for the funnel.
+
+    Unlike get_candidate_tickers (which pre-filters and returns symbols only),
+    this returns the raw cached values INCLUDING NULLs so the funnel can classify
+    rejections precisely (market_cap_unknown vs below_min, volume_unknown vs
+    below_min). Never fabricates values. Ordered by market cap desc so a bounded
+    validation run keeps the most liquid names.
+    """
+    if exchanges is None:
+        exchanges = ["NASDAQ", "NYSE", "AMEX"]
+
+    conn = await get_db_connection()
+    try:
+        query = """
+            SELECT symbol, market_cap, last_volume, exchange
+            FROM tickers
+            WHERE is_active = true
+              AND exchange = ANY($1)
+            ORDER BY market_cap DESC NULLS LAST
+            LIMIT $2
+        """
+        rows = await conn.fetch(query, exchanges, limit)
+        return [
+            {
+                "symbol": r["symbol"],
+                "market_cap": float(r["market_cap"]) if r["market_cap"] is not None else None,
+                "last_volume": float(r["last_volume"]) if r["last_volume"] is not None else None,
+                "exchange": r["exchange"],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"Failed to load universe tickers: {e}")
+        return []
+    finally:
+        await release_db_connection(conn)
+
+
 async def cleanup_old_daily_seen(days_to_keep: int = 7) -> int:
     """Clean up old daily_seen entries"""
     conn = await get_db_connection()

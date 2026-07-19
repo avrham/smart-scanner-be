@@ -16,6 +16,7 @@ from app.workers.fmp_client import FMPClient
 from app.workers.tickers import refresh_tickers_cache
 from app.workers.maintenance import cleanup_daily_seen, clear_daily_seen
 from app.workers.outcomes.service import calculate_outcomes_for_signals
+from app.workers.scanner.funnel import run_funnel_scan
 from app.config import settings
 from app.utils.events import event_bus
 
@@ -32,12 +33,70 @@ async def start_scan(
     batch_size: Optional[int] = Body(None),
     symbols: Any = Body(None),
     ignore_seen: bool = Body(False),
-    return_details: bool = Body(False)
+    return_details: bool = Body(False),
+    scanner_mode: str = Body("legacy"),
+    limit: Optional[int] = Body(None),
+    dry_run: bool = Body(False),
 ):
-    """Trigger a manual scan cycle for a given pattern (default sma150_bounce)."""
+    """Trigger a manual scan cycle for a given pattern (default sma150_bounce).
+
+    scanner_mode:
+      * "legacy" (default) - preserves the existing random-batch behavior and
+        endpoint contract.
+      * "funnel"  - Phase 3 hierarchical funnel. With dry_run=True it runs the
+        cheap stages only (universe + liquidity), performs NO FMP calls and NO
+        signal writes, and returns telemetry synchronously - the safe way to
+        validate. Without dry_run it fetches history for liquidity survivors
+        (bounded by `limit`) and evaluates the strategy.
+    """
 
     chosen_batch_size = batch_size or settings.SCAN_BATCH_SIZE
     logger = logging.getLogger(__name__)
+
+    # Phase 3: hierarchical funnel scanner (opt-in).
+    if scanner_mode == "funnel":
+        funnel_scan_id = str(uuid.uuid4())
+        funnel_limit = limit if limit is not None else batch_size
+
+        # dry_run is FMP-free and fast -> run synchronously and return telemetry.
+        if dry_run:
+            summary = await run_funnel_scan(
+                fmp=None,
+                pattern_code=pattern_code,
+                limit=funnel_limit,
+                ignore_seen=ignore_seen,
+                dry_run=True,
+                scan_id=funnel_scan_id,
+            )
+            return {"message": "Funnel dry-run completed", "scan_id": funnel_scan_id, **summary}
+
+        async def run_funnel():
+            run_logger = logging.getLogger(__name__)
+            fmp = FMPClient(
+                api_key=settings.FMP_API_KEY,
+                max_concurrent=settings.FMP_MAX_CONCURRENT,
+            )
+            try:
+                await run_funnel_scan(
+                    fmp=fmp,
+                    pattern_code=pattern_code,
+                    limit=funnel_limit,
+                    ignore_seen=ignore_seen,
+                    dry_run=False,
+                    scan_id=funnel_scan_id,
+                )
+            except Exception as e:
+                run_logger.error(f"[ADMIN] funnel scan failed: {e}")
+                await event_bus.publish(funnel_scan_id, {"type": "error", "error": str(e)})
+
+        background_tasks.add_task(run_funnel)
+        return {
+            "message": "Funnel scan enqueued",
+            "scanner_mode": "funnel",
+            "pattern_code": pattern_code,
+            "limit": funnel_limit,
+            "scan_id": funnel_scan_id,
+        }
     # Normalize symbols: accept list[str] or comma-separated string
     normalized_symbols: Optional[List[str]] = None
     try:
