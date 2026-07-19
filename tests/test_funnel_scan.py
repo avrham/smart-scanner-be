@@ -104,6 +104,10 @@ def test_full_run_counts_and_saves(monkeypatch):
 
     class _FakeStrategy:
         pattern_code = "sma150_bounce"
+        min_daily_bars = 200
+
+        def default_config(self):
+            return {}
 
         def evaluate(self, df, context):
             # Funnel must route through the registry and pass the resolved config.
@@ -169,6 +173,10 @@ def test_limit_caps_survivors_before_fetch(monkeypatch):
 
     class _AvoidStrategy:
         pattern_code = "sma150_bounce"
+        min_daily_bars = 200
+
+        def default_config(self):
+            return {}
 
         def evaluate(self, df, context):
             return StrategyResult(

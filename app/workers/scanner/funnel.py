@@ -27,7 +27,6 @@ import pandas as pd
 from app.workers.fmp_client import FMPClient
 from app.workers.indicators import to_dataframe, validate_dataframe
 from app.workers.patterns.config import resolve_pattern_config
-from app.workers.patterns.sma150 import DEFAULT_CONFIG
 from app.workers.strategies import (
     StrategyContext,
     StrategyDecision,
@@ -250,8 +249,10 @@ async def run_funnel_scan(
     extra_notes: List[str] = []
     api_call_counts: Dict[str, int] = {"historical_fetches": 0}
 
-    # Resolve strategy thresholds via the Phase 1 config resolver (DB overrides).
-    pattern_config = await resolve_pattern_config(pattern_code, DEFAULT_CONFIG.copy())
+    # Phase 4/5: resolve the strategy first (fails fast on unknown pattern) and
+    # use ITS defaults for the Phase 1 config resolver (DB overrides on top).
+    strategy = get_strategy(pattern_code)
+    pattern_config = await resolve_pattern_config(pattern_code, strategy.default_config())
     liq = pattern_config.get("min_liquidity_filters", {}) or {}
     min_market_cap = float(liq.get("min_market_cap", 200_000_000))
     min_daily_volume = float(liq.get("min_daily_volume", 200_000))
@@ -313,9 +314,11 @@ async def run_funnel_scan(
     if fmp is None:
         raise ValueError("run_funnel_scan requires an FMP client when dry_run is False")
 
-    # Phase 4: Stage 3 evaluates through the strategy interface, not sma150
-    # internals. Resolve once (fails fast on an unknown pattern_code).
-    strategy = get_strategy(pattern_code)
+    # Stage 3 evaluates through the strategy interface (resolved above). Size the
+    # daily history fetch + prefilter to the strategy's needs (e.g. Wyckoff needs
+    # deep history for monthly bars). Still ONE bounded call per survivor.
+    min_bars = int(getattr(strategy, "min_daily_bars", MIN_BARS))
+    timeseries = max(350, min_bars + 60)
 
     bounded_symbols = [t["symbol"] for t in bounded]
     if scan_id:
@@ -323,7 +326,7 @@ async def run_funnel_scan(
             scan_id, {"type": "stage", "stage": "fetching_data", "total": len(bounded_symbols)}
         )
 
-    historical_batch = await fmp.batch_historical_data(bounded_symbols, timeseries=350)
+    historical_batch = await fmp.batch_historical_data(bounded_symbols, timeseries=timeseries)
     api_call_counts["historical_fetches"] = len(bounded_symbols)
 
     if scan_id:
@@ -344,8 +347,8 @@ async def run_funnel_scan(
             except Exception:
                 df = None
 
-            # Stage 2 - cheap prefilter.
-            reason = cheap_prefilter(df, min_price)
+            # Stage 2 - cheap prefilter (min_bars sized to the strategy).
+            reason = cheap_prefilter(df, min_price, min_bars=min_bars)
             if reason is not None:
                 tracker.add(symbol, "prefilter", reason)
                 await mark_seen_today(symbol, scan_date)

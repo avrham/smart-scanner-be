@@ -35,6 +35,7 @@ class Sma150BounceStrategy(Strategy):
     pattern_code = "sma150_bounce"
     version = SCORE_VERSION  # "sma150.v2"
     required_timeframes = ["1d"]
+    min_daily_bars = 200  # sma_window (150) + 50 warmup, matches evaluator guard
 
     def default_config(self) -> Dict[str, Any]:
         """Safe defaults used when no DB config is resolved by the caller."""

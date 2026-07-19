@@ -48,11 +48,14 @@ def list_strategies() -> List[str]:
 
 def _register_defaults() -> None:
     """Register the built-in strategies. Imported here to avoid import cycles."""
-    # Local import: sma150_adapter imports base only, never the registry.
+    # Local imports: adapters import base (+ their own logic), never the registry.
     from app.workers.strategies.sma150_adapter import Sma150BounceStrategy
+    from app.workers.strategies.wyckoff import WyckoffMTFStrategy
 
     if "sma150_bounce" not in _REGISTRY:
         register_strategy(Sma150BounceStrategy())
+    if "wyckoff_mtf" not in _REGISTRY:
+        register_strategy(WyckoffMTFStrategy())
 
 
 _register_defaults()

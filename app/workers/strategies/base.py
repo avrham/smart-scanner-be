@@ -104,6 +104,14 @@ class Strategy(ABC):
     pattern_code: str = ""
     version: str = "unknown"
     required_timeframes: List[str] = ["1d"]
+    # Minimum daily bars the strategy needs. The funnel uses this to size the
+    # (bounded) history fetch and the cheap prefilter. Kept as a simple attribute
+    # so it works even for lightweight test doubles.
+    min_daily_bars: int = 200
+
+    def default_config(self) -> Dict[str, Any]:
+        """Safe default config used when no DB config is resolved. Override."""
+        return {}
 
     @abstractmethod
     def evaluate(self, df: pd.DataFrame, context: StrategyContext) -> StrategyResult:

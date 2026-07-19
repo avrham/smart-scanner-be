@@ -432,12 +432,29 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - See `docs/phase-4-strategy-interface-summary.md`.
 
 ### Phase 5 — Wyckoff MTF v1 (deterministic only)
-- [ ] Monthly macro bias (long MA + swing structure + slope; reject NEUTRAL)
-- [ ] Weekly alignment + rough phase (accumulation/markup/distribution/markdown/unknown; reject conflict)
-- [ ] Daily setup detection with explicit measurable rules (spring/LPS/SOS/UTAD/LPSY/SOW/range breakout/breakdown)
-- [ ] 4H trigger only for survivors; explicit LONG/SHORT + entry/stop/invalidation/holding window
-- [ ] Mark any subjective rule OUT OF SCOPE; substitute simpler measurable setup
-- [ ] Tests for each deterministic rule
+- [x] Timeframe utils (`app/workers/timeframes.py`): normalize + daily→weekly (`W-FRI`) / monthly (`ME`) preserving OHLCV semantics
+- [x] Monthly macro bias (SMA20 + slope + no 3 consecutive lower-lows/higher-highs; reject NEUTRAL)
+- [x] Weekly alignment + rough phase (accumulation/markup/distribution/markdown/unknown; reject conflict)
+- [x] Daily setup detection with explicit measurable rules (spring/SOS/range_breakout for LONG; utad/SOW/range_breakdown for SHORT)
+- [x] 4H trigger only when enabled AND data injected; explicit LONG/SHORT + entry/stop/invalidation. If no 4H → WATCH (not ENTER)
+- [x] `wyckoff_mtf` behind the Phase 4 Strategy interface + registry; funnel evaluates it via the registry (opt-in, non-default)
+- [x] Migration `004_phase5_wyckoff_mtf_config.sql` (registers pattern DISABLED + config; additive/idempotent)
+- [x] Deterministic tests for every rule + strategy WATCH/ENTER + funnel integration (`tests/test_wyckoff_mtf.py`)
+- [ ] LPS/LPSY and other subjective/effort-vs-result reads — OUT OF SCOPE (documented as future)
+
+**Implementation notes (Phase 5):**
+- **No live 4H fetch.** The FMP client has no intraday endpoint, so 4H is never
+  fetched automatically. The strategy uses 4H only when the caller injects it via
+  `StrategyContext.data_meta["df_4h"]` and `enable_4h_trigger` is true. Through
+  the funnel (expensive stages disabled) wyckoff yields at most WATCH.
+- Score is a decomposed `structure_score` (0..1) from raw components
+  (`monthly_bias_quality`, `weekly_alignment_quality`, `daily_setup_quality`,
+  `volume_confirmation`); the 4H trigger only flips WATCH↔ENTER. No 0-100 score.
+- wyckoff needs deep daily history (≥ ~540 bars for ≥24 monthly bars). The funnel
+  sizes the bounded history fetch + cheap prefilter from `strategy.min_daily_bars`.
+- Signals (when created) carry `side`, `entry_price`/`stop_price`/`invalidation`,
+  `setup_type`, and a timeframe summary in `details` for Phase 2 outcome tracking.
+- See `docs/phase-5-wyckoff-mtf-summary.md`.
 
 ### Phase 6 — Decision cards & UI
 - [ ] Structured decision card generation (data-driven)
