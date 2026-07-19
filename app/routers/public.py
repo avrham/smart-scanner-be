@@ -3,9 +3,9 @@ Public API endpoints for Smart Scanner
 Read-only endpoints for frontend consumption
 """
 
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 from datetime import datetime, date
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 import asyncpg
 
 from app.deps import get_db
@@ -15,6 +15,60 @@ from app.models.responses import (
 
 
 router = APIRouter()
+
+# Phase 6: candidate filters. 'ALL' means decision-support candidates
+# (ENTER + WATCH) — never debug AVOID rows.
+VALID_VERDICTS = {"ENTER", "WATCH", "ALL"}
+VALID_SIDES = {"LONG", "SHORT"}
+
+
+def build_signals_query(
+    verdict: str = "ENTER",
+    pattern_code: Optional[str] = None,
+    side: Optional[str] = None,
+    min_score: Optional[float] = None,
+    since: Optional[datetime] = None,
+    limit: int = 50,
+) -> Tuple[str, List[Any]]:
+    """Build the signals SELECT with filters. Pure — unit-testable without DB.
+
+    Default verdict='ENTER' preserves the pre-Phase-6 endpoint behavior.
+    `side` filters on details->>'side' (set by strategies that define direction).
+    """
+    where = []
+    params: List[Any] = []
+
+    if verdict == "ALL":
+        where.append("s.verdict IN ('ENTER', 'WATCH')")
+    else:
+        params.append(verdict)
+        where.append(f"s.verdict = ${len(params)}")
+
+    if pattern_code:
+        params.append(pattern_code)
+        where.append(f"s.pattern_code = ${len(params)}")
+
+    if side:
+        params.append(side)
+        where.append(f"s.details->>'side' = ${len(params)}")
+
+    if min_score is not None:
+        params.append(min_score)
+        where.append(f"s.score >= ${len(params)}")
+
+    if since:
+        params.append(since)
+        where.append(f"s.created_at >= ${len(params)}")
+
+    params.append(limit)
+    query = f"""
+        SELECT s.id, s.symbol, s.pattern_code, s.verdict, s.probability,
+               s.score, s.reason, s.details, s.snapshot_date, s.created_at
+        FROM signals s
+        WHERE {' AND '.join(where)}
+        ORDER BY s.created_at DESC LIMIT ${len(params)}
+    """
+    return query, params
 
 
 @router.get("/patterns", response_model=List[PatternResponse])
@@ -57,35 +111,41 @@ async def get_patterns(db: asyncpg.Connection = Depends(get_db)):
 @router.get("/signals", response_model=List[SignalResponse])
 async def get_signals(
     pattern_code: Optional[str] = Query(None, description="Filter by pattern code"),
+    verdict: str = Query("ENTER", description="'ENTER' | 'WATCH' | 'ALL' (ENTER+WATCH)"),
+    side: Optional[str] = Query(None, description="'LONG' | 'SHORT' (details.side)"),
+    min_score: Optional[float] = Query(None, ge=0, le=1, description="Minimum score"),
     limit: int = Query(50, ge=1, le=500, description="Number of signals to return"),
     since: Optional[datetime] = Query(None, description="Return signals created after this time"),
     db: asyncpg.Connection = Depends(get_db)
 ):
-    """Get latest ENTER signals (sma150_bounce only shows ENTER signals)"""
-    
-    query = """
-        SELECT s.id, s.symbol, s.pattern_code, s.verdict, s.probability,
-               s.score, s.reason, s.details, s.snapshot_date, s.created_at
-        FROM signals s
-        WHERE s.verdict = 'ENTER'
+    """Get candidate signals.
+
+    Default (verdict='ENTER') preserves the original behavior. Phase 6 adds
+    WATCH candidates (valid setups awaiting a trigger) and filters for the
+    decision UI. AVOID/debug rows are never returned.
     """
-    
-    params = []
-    param_count = 0
-    
-    if pattern_code:
-        param_count += 1
-        query += f" AND s.pattern_code = ${param_count}"
-        params.append(pattern_code)
-    
-    if since:
-        param_count += 1
-        query += f" AND s.created_at >= ${param_count}"
-        params.append(since)
-    
-    query += f" ORDER BY s.created_at DESC LIMIT ${param_count + 1}"
-    params.append(limit)
-    
+    verdict = (verdict or "ENTER").upper()
+    if verdict not in VALID_VERDICTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid verdict '{verdict}'. Allowed: {sorted(VALID_VERDICTS)}",
+        )
+    if side:
+        side = side.upper()
+        if side not in VALID_SIDES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid side '{side}'. Allowed: {sorted(VALID_SIDES)}",
+            )
+
+    query, params = build_signals_query(
+        verdict=verdict,
+        pattern_code=pattern_code,
+        side=side,
+        min_score=min_score,
+        since=since,
+        limit=limit,
+    )
     signals = await db.fetch(query, *params)
     
     return [

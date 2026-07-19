@@ -22,7 +22,7 @@ class SignalResponse(BaseModel):
     id: str
     symbol: str
     pattern_code: str
-    verdict: str  # 'ENTER' | 'AVOID'
+    verdict: str  # 'ENTER' | 'WATCH' | 'AVOID' (debug only)
     probability: Optional[float] = None
     score: Optional[float] = None
     reason: Optional[str] = None
