@@ -27,7 +27,13 @@ import pandas as pd
 from app.workers.fmp_client import FMPClient
 from app.workers.indicators import to_dataframe, validate_dataframe
 from app.workers.patterns.config import resolve_pattern_config
-from app.workers.patterns.sma150 import DEFAULT_CONFIG, evaluate_sma150_bounce
+from app.workers.patterns.sma150 import DEFAULT_CONFIG
+from app.workers.strategies import (
+    StrategyContext,
+    StrategyDecision,
+    StrategyResult,
+    get_strategy,
+)
 from app.workers.persistence import (
     get_universe_tickers,
     log_pattern_run,
@@ -307,6 +313,10 @@ async def run_funnel_scan(
     if fmp is None:
         raise ValueError("run_funnel_scan requires an FMP client when dry_run is False")
 
+    # Phase 4: Stage 3 evaluates through the strategy interface, not sma150
+    # internals. Resolve once (fails fast on an unknown pattern_code).
+    strategy = get_strategy(pattern_code)
+
     bounded_symbols = [t["symbol"] for t in bounded]
     if scan_id:
         await event_bus.publish(
@@ -342,24 +352,33 @@ async def run_funnel_scan(
                 continue
             stage_counts["stage_2_prefilter_passed"] += 1
 
-            # Stage 3 - strategy evaluation on survivors only.
-            result = evaluate_sma150_bounce(symbol, df, pattern_config)
+            # Stage 3 - strategy evaluation on survivors only (via registry).
+            context = StrategyContext(
+                symbol=symbol,
+                pattern_code=pattern_code,
+                config=pattern_config,
+                scanner_mode="funnel",
+                scan_run_id=scan_id,
+            )
+            result = strategy.evaluate(df, context)
             stage_counts["stage_3_evaluated"] += 1
             await mark_seen_today(symbol, scan_date)
 
-            verdict = result.get("verdict")
-            if verdict == "ENTER":
+            if result.decision == StrategyDecision.ENTER:
                 stage_counts["enter_count"] += 1
-                await _maybe_save(symbol, pattern_code, result)
+                await _maybe_save(result)
+            elif result.decision == StrategyDecision.WATCH:
+                # Not produced by sma150_bounce today; supported for future
+                # strategies. WATCH candidates are counted but not persisted yet.
+                stage_counts["watch_count"] += 1
             else:
                 stage_counts["reject_count"] += 1
-                details = result.get("details") or {}
                 tracker.add(
                     symbol, "evaluation",
-                    details.get("rejection_reason") or "avoided",
+                    result.rejection_reason or "avoided",
                 )
                 if settings.DEBUG_SAVE_AVOID:
-                    await _maybe_save(symbol, pattern_code, result)
+                    await _maybe_save(result)
         except Exception as exc:  # never let one symbol abort the run
             logger.error("Funnel eval failed for %s: %s", symbol, exc)
             tracker.add(symbol, "evaluation", "eval_error")
@@ -387,20 +406,24 @@ async def run_funnel_scan(
     return _summary(telemetry, stage_counts, dry_run=False)
 
 
-async def _maybe_save(symbol: str, pattern_code: str, result: Dict[str, Any]) -> None:
-    """Persist a signal via the existing pipeline (Phase 2 compatible)."""
+async def _maybe_save(result: StrategyResult) -> None:
+    """Persist a signal via the existing pipeline (Phase 2 compatible).
+
+    Persists the strategy's `details` verbatim so downstream (UI + Phase 2
+    outcome tracking) sees exactly the same payload as before Phase 4.
+    """
     try:
         await save_signal(
-            symbol=symbol,
-            pattern_code=pattern_code,
-            verdict=result["verdict"],
-            score=result.get("score"),
-            reason=result.get("reason"),
-            details=result.get("details"),
-            snapshot_date=date.fromisoformat(result["details"]["snapshot_date"]),
+            symbol=result.symbol,
+            pattern_code=result.pattern_code,
+            verdict=result.verdict,
+            score=result.score,
+            reason=result.reason,
+            details=result.details,
+            snapshot_date=date.fromisoformat(result.details["snapshot_date"]),
         )
     except Exception as exc:
-        logger.error("Failed to save funnel signal for %s: %s", symbol, exc)
+        logger.error("Failed to save funnel signal for %s: %s", result.symbol, exc)
 
 
 async def _persist_telemetry(

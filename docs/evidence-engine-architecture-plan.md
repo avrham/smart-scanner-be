@@ -408,10 +408,28 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 - [x] Staged telemetry persisted in `pattern_runs.notes` (no migration) + tests
 
 ### Phase 4 — Strategy interface
-- [ ] `Strategy` contract + registry
-- [ ] Migrate `sma150_bounce` into contract (as baseline)
-- [ ] Replace `if pattern_code == ...` branches
-- [ ] Prepare `wyckoff_mtf` skeleton behind flag + tests
+- [x] `Strategy` contract + enums (`StrategyDecision`, `StrategySide`), `StrategyContext`, `StrategyResult` (`app/workers/strategies/base.py`)
+- [x] Static registry `get_strategy` / `list_strategies` / `register_strategy` with clear `UnknownStrategyError` (`app/workers/strategies/registry.py`)
+- [x] `sma150_bounce` wrapped behind the contract without behavior change (`app/workers/strategies/sma150_adapter.py`)
+- [x] Funnel Stage 3 evaluates through the registry (no direct sma150 import); legacy `scan_runner` preserved unchanged
+- [ ] Prepare `wyckoff_mtf` skeleton behind flag + tests (Phase 5)
+
+**Implementation notes (Phase 4):**
+- The interface is deliberately small and typed. `StrategyResult` carries
+  `decision/side/score/reason/rejection_reason/details/score_components` plus
+  optional `entry_price/stop_price/target_price/invalidation/setup_type` and
+  `required_timeframes`/`strategy_version` for future strategies.
+- **sma150 behavior is unchanged.** The adapter calls the existing
+  `evaluate_sma150_bounce` and repackages the result; persisted `details` are
+  byte-identical, so the UI and Phase 2 outcome tracking see the same payload.
+- **Side decision:** sma150_bounce is a long-only rebound setup and Phase 2
+  outcome tracking already defaults these signals to LONG. We expose
+  `side=LONG` at the interface level but do NOT inject side/stop/target into the
+  persisted `details` (nothing invented). Formal per-strategy direction/stop/
+  target lives with future strategies (Wyckoff MTF, Phase 5).
+- Legacy `scan_runner` still calls sma150 directly (kept working, low risk);
+  routing it through the registry is optional and deferred.
+- See `docs/phase-4-strategy-interface-summary.md`.
 
 ### Phase 5 — Wyckoff MTF v1 (deterministic only)
 - [ ] Monthly macro bias (long MA + swing structure + slope; reject NEUTRAL)

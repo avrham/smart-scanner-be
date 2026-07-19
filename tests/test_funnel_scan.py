@@ -7,6 +7,7 @@ entrypoints are driven with asyncio.run so no pytest plugin is required.
 import asyncio
 
 import app.workers.scanner.funnel as funnel
+from app.workers.strategies.base import StrategyDecision, StrategyResult
 
 
 def _async(value):
@@ -101,21 +102,34 @@ def test_full_run_counts_and_saves(monkeypatch):
 
     captured = {}
 
-    def fake_eval(symbol, df, config):
-        captured["config"] = config
-        if symbol == "GOOD1":
-            return {
-                "verdict": "ENTER",
-                "score": 0.9,
-                "reason": "ok",
-                "details": {"snapshot_date": "2023-06-01"},
-            }
-        return {
-            "verdict": "AVOID",
-            "score": 0.1,
-            "reason": "meh",
-            "details": {"snapshot_date": "2023-06-01", "rejection_reason": "score_below_threshold"},
-        }
+    class _FakeStrategy:
+        pattern_code = "sma150_bounce"
+
+        def evaluate(self, df, context):
+            # Funnel must route through the registry and pass the resolved config.
+            captured["config"] = context.config
+            captured["scanner_mode"] = context.scanner_mode
+            if context.symbol == "GOOD1":
+                return StrategyResult(
+                    decision=StrategyDecision.ENTER,
+                    symbol=context.symbol,
+                    pattern_code=context.pattern_code,
+                    score=0.9,
+                    reason="ok",
+                    details={"snapshot_date": "2023-06-01"},
+                )
+            return StrategyResult(
+                decision=StrategyDecision.AVOID,
+                symbol=context.symbol,
+                pattern_code=context.pattern_code,
+                score=0.1,
+                reason="meh",
+                rejection_reason="score_below_threshold",
+                details={
+                    "snapshot_date": "2023-06-01",
+                    "rejection_reason": "score_below_threshold",
+                },
+            )
 
     saved = []
 
@@ -123,7 +137,7 @@ def test_full_run_counts_and_saves(monkeypatch):
         saved.append(kwargs["symbol"])
         return "sig-id"
 
-    monkeypatch.setattr(funnel, "evaluate_sma150_bounce", fake_eval)
+    monkeypatch.setattr(funnel, "get_strategy", lambda pc: _FakeStrategy())
     monkeypatch.setattr(funnel, "save_signal", fake_save)
 
     fake_fmp = _FakeFMP({"GOOD1": _fmp_history(), "GOOD2": _fmp_history()})
@@ -143,19 +157,31 @@ def test_full_run_counts_and_saves(monkeypatch):
     assert sc["enter_count"] == 1
     assert sc["reject_count"] == 1
     assert saved == ["GOOD1"]  # only ENTER saved (DEBUG_SAVE_AVOID off)
-    # The resolved DB pattern config was passed into evaluation.
+    # The resolved DB pattern config was passed into evaluation via the context.
     assert captured["config"]["score_threshold"] == 0.5
+    assert captured["scanner_mode"] == "funnel"
     # Expensive 4H stage documented as disabled.
     assert any("4H" in n for n in summary["telemetry"]["notes"])
 
 
 def test_limit_caps_survivors_before_fetch(monkeypatch):
     _patch_common(monkeypatch)
-    monkeypatch.setattr(
-        funnel, "evaluate_sma150_bounce",
-        lambda s, d, c: {"verdict": "AVOID", "score": 0.0, "reason": "x",
-                         "details": {"snapshot_date": "2023-06-01", "rejection_reason": "x"}},
-    )
+
+    class _AvoidStrategy:
+        pattern_code = "sma150_bounce"
+
+        def evaluate(self, df, context):
+            return StrategyResult(
+                decision=StrategyDecision.AVOID,
+                symbol=context.symbol,
+                pattern_code=context.pattern_code,
+                score=0.0,
+                reason="x",
+                rejection_reason="x",
+                details={"snapshot_date": "2023-06-01", "rejection_reason": "x"},
+            )
+
+    monkeypatch.setattr(funnel, "get_strategy", lambda pc: _AvoidStrategy())
     monkeypatch.setattr(funnel, "save_signal", _async("id"))
     fake_fmp = _FakeFMP({"GOOD1": _fmp_history(), "GOOD2": _fmp_history()})
 
