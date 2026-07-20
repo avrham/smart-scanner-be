@@ -28,11 +28,13 @@ from app.workers.massive_client import (
     map_grouped_row,
 )
 from app.workers.screening import (
+    ENRICHMENT_SELECTION_STRATEGY,
     MIC_TO_SHORT,
     classify_ticker,
     enrichment_status_for,
     needs_profile_refresh,
     prescreen_bars,
+    prioritize_enrichment,
 )
 
 
@@ -168,14 +170,18 @@ class MassiveProvider(MarketDataProvider):
 
         profiles = {p["symbol"]: p for p in await market_store.get_ticker_profiles(survivors)}
         now = datetime.utcnow()
-        to_refresh = [
+        stale = [
             s for s in survivors
             if needs_profile_refresh(
                 (profiles.get(s) or {}).get("profile_synced_at"),
                 now,
                 settings.MASSIVE_PROFILE_CACHE_DAYS,
             )
-        ][:max_detail_calls]
+        ]
+        # Deterministic priority: dollar volume desc, volume desc, symbol asc.
+        bars_by_symbol = {b["symbol"]: b for b in bars if b.get("symbol")}
+        prioritized = prioritize_enrichment(stale, bars_by_symbol)
+        to_refresh = prioritized[:max_detail_calls]
 
         enriched = missing = errors = 0
         for symbol in to_refresh:
@@ -205,7 +211,10 @@ class MassiveProvider(MarketDataProvider):
             "enriched": enriched,
             "missing_market_cap": missing,
             "errors": errors,
-            "cached_fresh": len(survivors) - len(to_refresh),
+            "cached_fresh": len(survivors) - len(stale),
+            "selection_strategy": ENRICHMENT_SELECTION_STRATEGY,
+            "selected_symbols": to_refresh[:25],
+            "remaining_stale_survivors": len(prioritized) - len(to_refresh),
         }
         logger.info("[massive] enrichment: %s", summary)
         return summary

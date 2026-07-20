@@ -129,6 +129,31 @@ def prescreen_bars(
     return passed, reasons
 
 
+# Deterministic enrichment ordering (see prioritize_enrichment).
+ENRICHMENT_SELECTION_STRATEGY = "dollar_volume_desc"
+
+
+def prioritize_enrichment(
+    symbols: List[str],
+    bars_by_symbol: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    """Deterministic enrichment priority for stale pre-screen survivors.
+
+    Order: highest dollar volume (close * volume) first, then highest raw
+    volume, then symbol ascending as a stable tie-break. Market cap is NEVER
+    used — it is the missing field enrichment exists to fetch.
+    """
+    def key(symbol: str):
+        bar = bars_by_symbol.get(symbol) or {}
+        try:
+            volume = float(bar.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            volume = 0.0
+        return (-dollar_volume(bar), -volume, symbol)
+
+    return sorted(symbols, key=key)
+
+
 def needs_profile_refresh(
     profile_synced_at: Optional[datetime],
     now: datetime,
