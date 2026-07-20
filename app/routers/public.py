@@ -4,8 +4,9 @@ Read-only endpoints for frontend consumption
 """
 
 import json
+import logging
 import uuid as uuid_lib
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date
 from fastapi import APIRouter, Depends, HTTPException, Query
 import asyncpg
@@ -16,7 +17,59 @@ from app.models.responses import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+
+def normalize_json_object(
+    value: Any,
+    field_name: str,
+    record_id: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Normalize a JSONB column value that MUST be a JSON object (or NULL).
+
+    asyncpg returns JSONB as a raw JSON string unless a codec is configured,
+    so persisted objects arrive as '{"symbol": ...}' and would fail pydantic
+    Dict validation if passed through unchanged.
+
+    Rules:
+      * None                          -> None
+      * dict                          -> unchanged
+      * str decoding to a JSON object -> decoded dict
+      * anything else (arrays, scalars, malformed JSON, wrong Python type)
+        -> HTTP 500; the log records field name, record id, value type and
+        exception class ONLY — never the persisted payload itself.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError) as exc:
+            logger.error(
+                "Corrupted JSONB field %s (record=%s): malformed JSON string "
+                "(%s)", field_name, record_id, type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=500, detail="Internal serialization error"
+            )
+        if isinstance(decoded, dict):
+            return decoded
+        logger.error(
+            "Corrupted JSONB field %s (record=%s): decoded to %s, expected "
+            "object", field_name, record_id, type(decoded).__name__,
+        )
+        raise HTTPException(
+            status_code=500, detail="Internal serialization error"
+        )
+    logger.error(
+        "Corrupted JSONB field %s (record=%s): unexpected Python type %s",
+        field_name, record_id, type(value).__name__,
+    )
+    raise HTTPException(status_code=500, detail="Internal serialization error")
 
 # Phase 6: candidate filters. 'ALL' means decision-support candidates
 # (ENTER + WATCH) — never debug AVOID rows.
@@ -208,7 +261,9 @@ async def get_signals(
             "probability": float(signal["probability"]) if signal["probability"] else None,
             "score": float(signal["score"]) if signal["score"] else None,
             "reason": signal["reason"],
-            "details": signal["details"],
+            "details": normalize_json_object(
+                signal["details"], "signals.details", signal["id"]
+            ),
             "snapshot_date": signal["snapshot_date"],
             "created_at": signal["created_at"]
         }
@@ -244,7 +299,9 @@ async def get_signal(
         "probability": float(signal["probability"]) if signal["probability"] else None,
         "score": float(signal["score"]) if signal["score"] else None,
         "reason": signal["reason"],
-        "details": signal["details"],
+        "details": normalize_json_object(
+            signal["details"], "signals.details", signal["id"]
+        ),
         "snapshot_date": signal["snapshot_date"],
         "created_at": signal["created_at"]
     }
