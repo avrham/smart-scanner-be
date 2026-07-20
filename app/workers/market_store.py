@@ -222,6 +222,37 @@ async def get_latest_bar_date(symbol: str) -> Optional[date]:
         await release_db_connection(conn)
 
 
+async def get_ticker_counts() -> Dict[str, int]:
+    """Universe counts for coverage reporting (local DB only)."""
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE is_active = true) AS active,
+                   COUNT(*) FILTER (WHERE eligible = true AND is_active = true) AS eligible
+            FROM tickers
+            """
+        )
+        return {
+            "total": row["total"] if row else 0,
+            "active": row["active"] if row else 0,
+            "eligible": row["eligible"] if row else 0,
+        }
+    finally:
+        await release_db_connection(conn)
+
+
+async def get_latest_daily_bar_date() -> Optional[date]:
+    """Most recent trading date with locally stored bars (any symbol)."""
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow("SELECT MAX(trading_date) AS d FROM daily_bars")
+        return row["d"] if row else None
+    finally:
+        await release_db_connection(conn)
+
+
 async def get_provider_sync_status() -> Dict[str, Any]:
     """Sync freshness for the health endpoint. Tolerates a missing migration."""
     status: Dict[str, Any] = {

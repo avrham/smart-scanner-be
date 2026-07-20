@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     MASSIVE_REQUESTS_PER_MINUTE: int = 5   # Massive Basic plan
     MASSIVE_PROFILE_CACHE_DAYS: int = 7    # ticker-details (market cap) cache
 
+    # Phase 7A: a 'running' market-data job whose last update is older than
+    # this is considered stale (crashed process) and auto-failed so it never
+    # blocks new work.
+    MARKET_DATA_JOB_STALE_MINUTES: int = 30
+
     # Universe eligibility (Massive reference data). Classification uses the
     # provider's type/exchange fields, never ticker suffixes.
     UNIVERSE_ALLOWED_EXCHANGES: List[str] = ["XNAS", "XNYS", "XASE"]  # MIC codes

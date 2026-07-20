@@ -148,7 +148,10 @@ class MassiveProvider(MarketDataProvider):
         return summary
 
     async def enrich_market_caps(
-        self, trading_date: date, max_detail_calls: int = 25
+        self,
+        trading_date: date,
+        max_detail_calls: int = 25,
+        progress_callback: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Survivor-only market-cap enrichment.
 
@@ -156,6 +159,10 @@ class MassiveProvider(MarketDataProvider):
         2. Detail calls ONLY for survivors whose cached profile is stale
            (older than MASSIVE_PROFILE_CACHE_DAYS), bounded by max_detail_calls.
         Missing market cap keeps NULL + enrichment_status='missing_market_cap'.
+
+        progress_callback (Phase 7A, optional): async callable receiving small
+        counter dicts after selection and periodically during the detail loop.
+        Failures in the callback never fail the enrichment itself.
         """
         bars = await market_store.get_bars_for_date(trading_date)
         eligible = await market_store.get_eligible_symbols()
@@ -183,7 +190,24 @@ class MassiveProvider(MarketDataProvider):
         prioritized = prioritize_enrichment(stale, bars_by_symbol)
         to_refresh = prioritized[:max_detail_calls]
 
-        enriched = missing = errors = 0
+        async def _report(payload: Dict[str, Any]) -> None:
+            if progress_callback is None:
+                return
+            try:
+                await progress_callback(payload)
+            except Exception as exc:  # progress is observability, never fatal
+                logger.warning("[massive] progress callback failed: %s", type(exc).__name__)
+
+        await _report(
+            {
+                "phase": "selected",
+                "prescreen_survivors": len(survivors),
+                "stale_candidates": len(prioritized),
+                "detail_calls_planned": len(to_refresh),
+            }
+        )
+
+        enriched = missing = errors = processed = 0
         for symbol in to_refresh:
             try:
                 details = await self.client.get_ticker_details(symbol)
@@ -201,6 +225,18 @@ class MassiveProvider(MarketDataProvider):
             except MassiveApiError as exc:
                 errors += 1
                 logger.warning("[massive] enrichment failed for %s: %s", symbol, exc)
+            processed += 1
+            if processed % 5 == 0 or processed == len(to_refresh):
+                await _report(
+                    {
+                        "phase": "enriching",
+                        "processed": processed,
+                        "planned": len(to_refresh),
+                        "enriched": enriched,
+                        "missing_market_cap": missing,
+                        "errors": errors,
+                    }
+                )
 
         summary = {
             "provider": self.name,

@@ -5,6 +5,7 @@ Write endpoints protected by worker token
 
 from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException
 from typing import Any, List, Optional
+import re
 import uuid
 from fastapi import WebSocket, WebSocketDisconnect
 import logging
@@ -15,6 +16,8 @@ from app.workers.scan_runner import run_scan_batch
 from app.workers.maintenance import cleanup_daily_seen, clear_daily_seen
 from app.workers.outcomes.service import calculate_outcomes_for_signals
 from app.workers.scanner.funnel import run_funnel_scan
+from app.workers import market_jobs, market_store
+from app.workers.coverage import UnsupportedProviderError, get_market_data_coverage
 from app.providers import ProviderConfigError, get_market_data_provider
 from app.config import settings
 from app.utils.events import event_bus
@@ -290,14 +293,19 @@ async def universe_enrich(
     trading_date: Optional[str] = Body(None, embed=True),
     max_detail_calls: int = Body(25, embed=True),
 ):
-    """Survivor-only market-cap enrichment (Massive only).
+    """Survivor-only market-cap enrichment as a DURABLE job (Phase 7A).
 
-    Pre-screens locally stored bars for the date (free), then calls ticker
-    details ONLY for survivors with stale profiles, bounded by max_detail_calls
-    (25 calls ≈ 5 minutes on Massive Basic). Runs in the background.
+    Creates a queued `market_data_jobs` row and runs asynchronously
+    (queued -> running -> completed/failed) with bounded progress. Duplicate
+    active jobs for the same provider + trading date are rejected by a
+    database unique index — not an in-memory lock. Enrichment behavior is
+    unchanged: local pre-screen, deterministic dollar-volume prioritization,
+    fresh-profile skipping, rate limiter, max_detail_calls bound.
+
+    trading_date is ALWAYS resolved before job insertion (NULL would bypass
+    the duplicate-protection index): when omitted, the latest locally stored
+    daily-bar date is used; with no local bars the request is rejected.
     """
-    from datetime import date as _date, timedelta as _timedelta
-
     try:
         provider = get_market_data_provider()
     except ProviderConfigError as exc:
@@ -308,28 +316,122 @@ async def universe_enrich(
             status_code=400, detail="Enrichment is only supported for the massive provider"
         )
 
-    if not trading_date:
-        d = _date.today() - _timedelta(days=1)
-        while d.weekday() >= 5:
-            d -= _timedelta(days=1)
-        trading_date = str(d)
-
-    async def enrich_task():
-        run_logger = logging.getLogger(__name__)
-        try:
-            summary = await provider.enrich_market_caps(
-                _date.fromisoformat(trading_date), max_detail_calls=max_detail_calls
+    if trading_date:
+        parsed_date = parse_trading_date(trading_date)
+    else:
+        parsed_date = await market_store.get_latest_daily_bar_date()
+        if parsed_date is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No locally stored daily bars — run POST /api/admin/market/daily-sync "
+                    "first, or pass an explicit trading_date"
+                ),
             )
-            run_logger.info(f"[ADMIN] enrichment finished: {summary}")
-        except Exception as e:
-            run_logger.error(f"[ADMIN] enrichment failed: {e}")
+        trading_date = str(parsed_date)
 
-    background_tasks.add_task(enrich_task)
+    # A crashed process must never block new work: recover stale jobs first.
+    await market_jobs.recover_stale_jobs(settings.MARKET_DATA_JOB_STALE_MINUTES)
+
+    try:
+        job_id = await market_jobs.create_job(
+            job_type=market_jobs.JOB_TYPE_ENRICHMENT,
+            provider=provider.name,
+            trading_date=parsed_date,
+            requested_limit=max_detail_calls,
+        )
+    except market_jobs.DuplicateActiveJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    background_tasks.add_task(
+        market_jobs.run_enrichment_job, job_id, provider, parsed_date, max_detail_calls
+    )
     return {
-        "message": "Enrichment started",
+        "message": "Enrichment job queued",
+        "job_id": job_id,
+        "status": "queued",
         "trading_date": trading_date,
         "max_detail_calls": max_detail_calls,
     }
+
+
+@router.get("/market-data/jobs/{job_id}")
+async def get_market_data_job(
+    job_id: str,
+    _: str = Depends(get_worker_token),
+):
+    """Status of a single durable market-data job."""
+    job = await market_jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+_TRADING_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def parse_trading_date(value: str):
+    """Strict YYYY-MM-DD validation (rejects other ISO variants)."""
+    from datetime import date as _date
+
+    if not _TRADING_DATE_RE.match(value or ""):
+        raise HTTPException(status_code=400, detail="trading_date must be YYYY-MM-DD")
+    try:
+        return _date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="trading_date must be a valid YYYY-MM-DD date")
+
+
+@router.get("/market-data/jobs")
+async def list_market_data_jobs(
+    _: str = Depends(get_worker_token),
+    job_type: Optional[str] = None,
+    provider: Optional[str] = None,
+    status: Optional[str] = None,
+    trading_date: Optional[str] = None,
+    limit: int = 50,
+):
+    """Bounded, filtered listing of durable market-data jobs (newest first).
+
+    Filters (job_type, provider, status, trading_date) compose with AND
+    semantics; provider is an exact normalized match.
+    """
+    if status is not None and status not in market_jobs.JOB_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Expected one of: {', '.join(market_jobs.JOB_STATUSES)}",
+        )
+    if limit < 1 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 200")
+    parsed_date = parse_trading_date(trading_date) if trading_date is not None else None
+    jobs = await market_jobs.list_jobs(
+        job_type=job_type,
+        status=status,
+        provider=provider,
+        trading_date=parsed_date,
+        limit=limit,
+    )
+    return {"jobs": jobs, "count": len(jobs)}
+
+
+@router.get("/market-data/coverage")
+async def market_data_coverage(
+    _: str = Depends(get_worker_token),
+    trading_date: Optional[str] = None,
+    provider: Optional[str] = None,
+):
+    """Local-only market-data coverage snapshot (Phase 7A).
+
+    Uses ONLY locally stored data — never constructs a provider client and
+    never calls the network. `provider` defaults to the configured
+    MARKET_DATA_PROVIDER and is echoed in the response after validation.
+    Defaults to the latest stored trading date.
+    """
+    parsed = parse_trading_date(trading_date) if trading_date is not None else None
+    try:
+        return await get_market_data_coverage(parsed, provider=provider)
+    except UnsupportedProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/maintenance/reset-daily-seen")
