@@ -169,7 +169,7 @@ class MassiveProvider(MarketDataProvider):
         )
 
         profiles = {p["symbol"]: p for p in await market_store.get_ticker_profiles(survivors)}
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stale = [
             s for s in survivors
             if needs_profile_refresh(

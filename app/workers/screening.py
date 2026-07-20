@@ -13,7 +13,7 @@ while VWAP is optional in grouped rows; using close keeps the metric defined
 for every bar and deterministic).
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -154,15 +154,32 @@ def prioritize_enrichment(
     return sorted(symbols, key=key)
 
 
+def _as_utc(value: datetime) -> datetime:
+    """Normalize to a timezone-aware UTC datetime without mutating the input.
+
+    Aware values are converted to UTC; naive legacy values (e.g. rows written
+    with datetime.utcnow() before the timezone fix) are interpreted as UTC.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def needs_profile_refresh(
     profile_synced_at: Optional[datetime],
     now: datetime,
     cache_days: int,
 ) -> bool:
-    """True when the cached ticker profile (market cap) is stale or missing."""
+    """True when the cached ticker profile (market cap) is stale or missing.
+
+    Timezone-safe: profile_synced_at comes from a timestamptz column via
+    asyncpg (aware), but legacy values and some callers may be naive. Both
+    sides are normalized to aware UTC before comparison; naive values are
+    treated as UTC.
+    """
     if profile_synced_at is None:
         return True
-    return (now - profile_synced_at) > timedelta(days=cache_days)
+    return (_as_utc(now) - _as_utc(profile_synced_at)) > timedelta(days=cache_days)
 
 
 def enrichment_status_for(market_cap: Optional[float]) -> str:
