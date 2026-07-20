@@ -64,6 +64,10 @@ DEFAULT_SCANNER_CONFIG: Dict[str, Any] = {
 
 MIN_BARS = 200
 
+# Cap for the bounded result-symbol lists included in telemetry/summary
+# (enter_symbols / watch_symbols / evaluated_symbols). Never raw payloads.
+RESULT_SYMBOLS_CAP = 25
+
 
 # --------------------------------------------------------------------------- #
 # Pure stage classifiers
@@ -186,6 +190,13 @@ def build_config_summary(
     }
 
 
+def build_data_source(provider_name: str, dry_run: bool) -> str:
+    """Provider-aware data_source label. Never claims a provider that wasn't used."""
+    if dry_run:
+        return "tickers_cache only (dry_run: no historical provider calls)"
+    return f"tickers_cache + {provider_name}_historical"
+
+
 def assemble_telemetry(
     *,
     pattern_code: str,
@@ -198,6 +209,8 @@ def assemble_telemetry(
     api_call_counts: Dict[str, int],
     dry_run: bool,
     extra_notes: List[str],
+    market_data_provider: str = "unknown",
+    result_symbols: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
     """Assemble the structured telemetry object stored in pattern_runs.notes."""
     telemetry = {
@@ -210,10 +223,14 @@ def assemble_telemetry(
         "universe_count": stage_counts.get("stage_0_universe", 0),
         "stage_counts": stage_counts,
         "api_call_counts": api_call_counts,
-        "data_source": "tickers_cache + fmp_historical",
+        "market_data_provider": market_data_provider,
+        "data_source": build_data_source(market_data_provider, dry_run),
         "dry_run": dry_run,
         "notes": extra_notes,
     }
+    telemetry.update(result_symbols or {
+        "enter_symbols": [], "watch_symbols": [], "evaluated_symbols": [],
+    })
     telemetry.update(tracker.as_dict())
     return telemetry
 
@@ -252,6 +269,16 @@ async def run_funnel_scan(
     tracker = RejectionTracker(sample_limit=int(scfg["sample_rejections_limit"]))
     extra_notes: List[str] = []
     api_call_counts: Dict[str, int] = {"historical_fetches": 0, "four_hour_fetches": 0}
+    # Provider identity for telemetry (never claim a provider that wasn't used).
+    provider_name = getattr(fmp, "name", None) or ("none" if fmp is None else "unknown")
+    # Bounded result visibility (capped symbol lists; no raw payloads).
+    result_symbols: Dict[str, List[str]] = {
+        "enter_symbols": [], "watch_symbols": [], "evaluated_symbols": [],
+    }
+
+    def _track_symbol(bucket: str, symbol: str) -> None:
+        if len(result_symbols[bucket]) < RESULT_SYMBOLS_CAP:
+            result_symbols[bucket].append(symbol)
 
     # Phase 4/5: resolve the strategy first (fails fast on unknown pattern) and
     # use ITS defaults for the Phase 1 config resolver (DB overrides on top).
@@ -313,7 +340,7 @@ async def run_funnel_scan(
         extra_notes.append("4H trigger enabled: survivor-only fetches")
 
     if dry_run:
-        extra_notes.append("dry_run: stages 2-3 skipped, no FMP calls, no writes")
+        extra_notes.append("dry_run: stages 2-3 skipped, no provider calls, no writes")
         finished_at = datetime.utcnow()
         telemetry = assemble_telemetry(
             pattern_code=pattern_code,
@@ -326,6 +353,8 @@ async def run_funnel_scan(
             api_call_counts=api_call_counts,
             dry_run=True,
             extra_notes=extra_notes,
+            market_data_provider=provider_name,
+            result_symbols=result_symbols,
         )
         await _persist_telemetry(pattern_code, stage_counts, telemetry, started_at)
         if scan_id:
@@ -387,6 +416,7 @@ async def run_funnel_scan(
             )
             result = strategy.evaluate(df, context)
             stage_counts["stage_3_evaluated"] += 1
+            _track_symbol("evaluated_symbols", symbol)
 
             # Stage 4 - survivor-only 4H trigger (Phase 5.1). Fetch 4H ONLY when
             # the strategy said WATCH (monthly/weekly/daily valid, trigger
@@ -411,6 +441,7 @@ async def run_funnel_scan(
 
             if result.decision == StrategyDecision.ENTER:
                 stage_counts["enter_count"] += 1
+                _track_symbol("enter_symbols", symbol)
                 await _maybe_save(result)
             elif result.decision == StrategyDecision.WATCH:
                 # Phase 5.2: WATCH candidates are valuable decision-support data.
@@ -418,6 +449,7 @@ async def run_funnel_scan(
                 # tracking only ever consumes verdict='ENTER', so WATCH rows are
                 # inspectable history, not entries.
                 stage_counts["watch_count"] += 1
+                _track_symbol("watch_symbols", symbol)
                 if persist_watch and await _maybe_save(result):
                     stage_counts["watch_saved_count"] += 1
             else:
@@ -445,6 +477,8 @@ async def run_funnel_scan(
         api_call_counts=api_call_counts,
         dry_run=False,
         extra_notes=extra_notes,
+        market_data_provider=provider_name,
+        result_symbols=result_symbols,
     )
     await _persist_telemetry(pattern_code, stage_counts, telemetry, started_at)
     if scan_id:
@@ -519,10 +553,15 @@ def _summary(
     return {
         "success": True,
         "scanner_version": telemetry["scanner_version"],
+        "market_data_provider": telemetry.get("market_data_provider"),
         "dry_run": dry_run,
         "scanned_count": stage_counts["stage_3_evaluated"],
         "enter_count": stage_counts["enter_count"],
         "rejected_count": stage_counts["reject_count"],
+        # Bounded result visibility (capped at RESULT_SYMBOLS_CAP each).
+        "enter_symbols": telemetry.get("enter_symbols", []),
+        "watch_symbols": telemetry.get("watch_symbols", []),
+        "evaluated_symbols": telemetry.get("evaluated_symbols", []),
         "stage_counts": stage_counts,
         "telemetry": telemetry,
     }

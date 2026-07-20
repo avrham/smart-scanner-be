@@ -315,21 +315,28 @@ async def upsert_ticker(
     exchange: Optional[str] = None,
     market_cap: Optional[float] = None,
     last_volume: Optional[float] = None,
-    is_active: bool = True
+    is_active: bool = True,
+    eligible: Optional[bool] = None,
 ) -> None:
-    """Insert or update ticker information"""
+    """Insert or update ticker information.
+
+    `eligible=None` preserves any stored classification (COALESCE); passing a
+    boolean sets it explicitly (the FMP screener refresh marks its rows True so
+    the funnel's `eligible = true` universe filter works on both providers).
+    """
     conn = await get_db_connection()
     
     try:
         query = """
-            INSERT INTO tickers (symbol, name, exchange, market_cap, last_volume, is_active, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO tickers (symbol, name, exchange, market_cap, last_volume, is_active, eligible, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (symbol) DO UPDATE SET
                 name = COALESCE(EXCLUDED.name, tickers.name),
                 exchange = COALESCE(EXCLUDED.exchange, tickers.exchange),
                 market_cap = COALESCE(EXCLUDED.market_cap, tickers.market_cap),
                 last_volume = COALESCE(EXCLUDED.last_volume, tickers.last_volume),
                 is_active = EXCLUDED.is_active,
+                eligible = COALESCE(EXCLUDED.eligible, tickers.eligible),
                 updated_at = EXCLUDED.updated_at
         """
         
@@ -341,6 +348,7 @@ async def upsert_ticker(
             market_cap,
             last_volume,
             is_active,
+            eligible,
             datetime.utcnow()
         )
         
@@ -356,17 +364,24 @@ async def get_candidate_tickers(
     min_volume: float = 200_000,
     exchanges: list = None
 ) -> list[str]:
-    """Get list of candidate tickers for scanning based on filters"""
+    """Get list of candidate tickers for scanning based on filters.
+
+    Legacy path. Rows the universe sync explicitly classified as ineligible
+    (eligible = false: warrants/units/ETFs...) are excluded; rows never
+    classified (eligible IS NULL, e.g. pre-005 or FMP-screener rows) are kept
+    for backward compatibility.
+    """
     if exchanges is None:
         exchanges = ["NASDAQ", "NYSE"]
-    
+
     conn = await get_db_connection()
-    
+
     try:
         query = """
             SELECT symbol
             FROM tickers
             WHERE is_active = true
+              AND eligible IS NOT FALSE
               AND market_cap >= $1
               AND last_volume >= $2
               AND exchange = ANY($3)
@@ -383,6 +398,19 @@ async def get_candidate_tickers(
         await release_db_connection(conn)
 
 
+def _default_universe_exchanges() -> List[str]:
+    """Configured supported exchanges as legacy short names.
+
+    UNIVERSE_ALLOWED_EXCHANGES holds MIC codes (XNAS/XNYS/XASE); the tickers
+    cache stores short names (NASDAQ/NYSE/AMEX). Map via the same table the
+    universe sync uses; keep unmapped values verbatim.
+    """
+    from app.config import settings
+    from app.workers.screening import MIC_TO_SHORT
+
+    return [MIC_TO_SHORT.get(e.upper(), e.upper()) for e in settings.UNIVERSE_ALLOWED_EXCHANGES]
+
+
 async def get_universe_tickers(
     exchanges: list = None,
     limit: int = 5000,
@@ -394,9 +422,15 @@ async def get_universe_tickers(
     rejections precisely (market_cap_unknown vs below_min, volume_unknown vs
     below_min). Never fabricates values. Ordered by market cap desc so a bounded
     validation run keeps the most liquid names.
+
+    Only rows the universe sync classified as `eligible = true` enter Stage 0
+    (migration 005): warrants/units/ETFs etc. are excluded by the STORED
+    classification, never re-inferred from symbol suffixes. Eligible common
+    stocks with market_cap NULL are intentionally kept so the funnel can reject
+    them honestly as market_cap_unknown until enrichment covers them.
     """
     if exchanges is None:
-        exchanges = ["NASDAQ", "NYSE", "AMEX"]
+        exchanges = _default_universe_exchanges()
 
     conn = await get_db_connection()
     try:
@@ -404,6 +438,7 @@ async def get_universe_tickers(
             SELECT symbol, market_cap, last_volume, exchange
             FROM tickers
             WHERE is_active = true
+              AND eligible = true
               AND exchange = ANY($1)
             ORDER BY market_cap DESC NULLS LAST
             LIMIT $2

@@ -79,6 +79,10 @@ async def refresh_tickers_cache(fmp: FMPClient) -> int:
                     market_cap=float(market_cap) if market_cap else None,
                     last_volume=last_volume,
                     is_active=True,
+                    # Screener-passing rows are FMP's universe; mark them
+                    # eligible so the funnel's eligible=true filter includes
+                    # them when running on the FMP fallback.
+                    eligible=True,
                 )
                 valid_count += 1
             except Exception as e:
