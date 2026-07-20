@@ -4,12 +4,13 @@ Two layers:
   * build_outcome_from_frames(...)  - PURE: takes DataFrames + a signal and
     produces a complete outcome record. Fully unit-testable, no I/O.
   * calculate_outcomes_for_signals(...) - async orchestration: loads signals
-    from the DB, fetches OHLCV (symbol + SPY/QQQ) via FMP, calls the pure
-    builder, and persists. One symbol failing never aborts the whole run.
+    from the DB, fetches OHLCV (symbol + SPY/QQQ) via the configured
+    MarketDataProvider, calls the pure builder, and persists. One symbol failing
+    never aborts the whole run.
 
-SAFETY: this module performs FMP calls when the async orchestrator runs, but it
-is only ever invoked on demand (admin endpoint) and is bounded by `limit`. It is
-NOT wired into the scheduler and is not enabled automatically.
+SAFETY: this module performs provider API calls when the async orchestrator
+runs, but it is only ever invoked on demand (admin endpoint) and is bounded by
+`limit`. It is NOT wired into the scheduler and is not enabled automatically.
 """
 
 import logging
@@ -176,9 +177,10 @@ def build_outcome_from_frames(
     return base_record
 
 
-async def _fetch_frame(fmp, symbol: str, timeseries: int = 400) -> Optional[pd.DataFrame]:
+async def _fetch_frame(provider, symbol: str, timeseries: int = 400) -> Optional[pd.DataFrame]:
+    """Fetch one symbol's daily frame via the provider-neutral interface."""
     try:
-        data = await fmp.get_historical_data(symbol, timeseries=timeseries)
+        data = await provider.get_daily_history(symbol, timeseries=timeseries)
         df = to_dataframe(data)
         return df if not df.empty else None
     except Exception as exc:
@@ -187,7 +189,7 @@ async def _fetch_frame(fmp, symbol: str, timeseries: int = 400) -> Optional[pd.D
 
 
 async def calculate_outcomes_for_signals(
-    fmp,
+    provider,
     limit: int = 100,
     pattern_code: Optional[str] = None,
     include_recalc: bool = False,
@@ -212,7 +214,7 @@ async def calculate_outcomes_for_signals(
     # Fetch benchmarks once for the whole run.
     benchmark_frames: Dict[str, Optional[pd.DataFrame]] = {}
     for bench in BENCHMARK_SYMBOLS:
-        benchmark_frames[bench] = await _fetch_frame(fmp, bench)
+        benchmark_frames[bench] = await _fetch_frame(provider, bench)
 
     # Cache per-symbol frames (a symbol may have multiple signals).
     symbol_cache: Dict[str, Optional[pd.DataFrame]] = {}
@@ -221,7 +223,7 @@ async def calculate_outcomes_for_signals(
         symbol = signal["symbol"]
         try:
             if symbol not in symbol_cache:
-                symbol_cache[symbol] = await _fetch_frame(fmp, symbol)
+                symbol_cache[symbol] = await _fetch_frame(provider, symbol)
             symbol_df = symbol_cache[symbol]
 
             record = build_outcome_from_frames(signal, symbol_df, benchmark_frames)

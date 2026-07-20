@@ -62,14 +62,40 @@ async def root():
     return {"message": "Smart Scanner API v1.1", "status": "healthy"}
 
 
+def _provider_health() -> dict:
+    """Safe provider status block. NEVER includes API keys."""
+    provider = (settings.MARKET_DATA_PROVIDER or "massive").lower()
+    if provider == "massive":
+        credentials = bool((settings.MASSIVE_API_KEY or "").strip())
+        rate_limit = f"{settings.MASSIVE_REQUESTS_PER_MINUTE}/min (basic)"
+    else:
+        credentials = bool((settings.FMP_API_KEY or "").strip())
+        rate_limit = f"{settings.FMP_RATE_LIMIT_PER_MIN}/min"
+    return {
+        "provider": provider,
+        "credentials_configured": credentials,
+        "rate_limit": rate_limit,
+    }
+
+
 async def _health_payload(db) -> JSONResponse | dict:
-    """Shared health logic: verify DB connectivity."""
+    """Shared health logic: DB connectivity + safe provider status."""
+    provider_block = _provider_health()
+    try:
+        from app.workers.market_store import get_provider_sync_status
+
+        sync_status = await get_provider_sync_status()
+        provider_block.update(sync_status)
+    except Exception:
+        pass  # never fail health because of the sync-status lookup
+
     try:
         await db.execute("SELECT 1")
         return {
             "status": "healthy",
             "database": "connected",
-            "version": "1.1.0"
+            "version": "1.1.0",
+            "market_data": provider_block,
         }
     except Exception as e:
         return JSONResponse(
@@ -77,7 +103,8 @@ async def _health_payload(db) -> JSONResponse | dict:
             content={
                 "status": "unhealthy",
                 "database": "disconnected",
-                "error": str(e)
+                "error": str(e),
+                "market_data": provider_block,
             }
         )
 

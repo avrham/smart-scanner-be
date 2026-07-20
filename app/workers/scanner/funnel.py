@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from app.workers.fmp_client import FMPClient
 from app.workers.indicators import to_dataframe, validate_dataframe
 from app.workers.patterns.config import resolve_pattern_config
 from app.workers.strategies import (
@@ -231,7 +230,7 @@ def _merge_scanner_config(overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]
 
 
 async def run_funnel_scan(
-    fmp: Optional[FMPClient],
+    fmp: Optional[Any],  # any MarketDataProvider (massive default, fmp fallback)
     pattern_code: str = "sma150_bounce",
     limit: Optional[int] = None,
     scanner_config: Optional[Dict[str, Any]] = None,
@@ -453,7 +452,7 @@ async def run_funnel_scan(
     return _summary(telemetry, stage_counts, dry_run=False)
 
 
-async def _fetch_4h(fmp: FMPClient, symbol: str) -> Optional[pd.DataFrame]:
+async def _fetch_4h(fmp: Any, symbol: str) -> Optional[pd.DataFrame]:
     """Fetch + normalize 4H bars for ONE survivor. Never raises.
 
     Returns None when the endpoint is unsupported/empty so the caller keeps the

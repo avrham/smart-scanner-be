@@ -3,7 +3,7 @@ Admin API endpoints for Smart Scanner
 Write endpoints protected by worker token
 """
 
-from fastapi import APIRouter, Depends, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException
 from typing import Any, List, Optional
 import uuid
 from fastapi import WebSocket, WebSocketDisconnect
@@ -12,11 +12,10 @@ import asyncpg
 
 from app.deps import get_db, get_worker_token
 from app.workers.scan_runner import run_scan_batch
-from app.workers.fmp_client import FMPClient
-from app.workers.tickers import refresh_tickers_cache
 from app.workers.maintenance import cleanup_daily_seen, clear_daily_seen
 from app.workers.outcomes.service import calculate_outcomes_for_signals
 from app.workers.scanner.funnel import run_funnel_scan
+from app.providers import ProviderConfigError, get_market_data_provider
 from app.config import settings
 from app.utils.events import event_bus
 
@@ -77,15 +76,18 @@ async def start_scan(
             )
             return {"message": "Funnel dry-run completed", "scan_id": funnel_scan_id, **summary}
 
+        # Funnel scans use the configured MarketDataProvider (Massive default,
+        # FMP fallback). Fail fast with a clear JSON error if misconfigured.
+        try:
+            provider = get_market_data_provider()
+        except ProviderConfigError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
         async def run_funnel():
             run_logger = logging.getLogger(__name__)
-            fmp = FMPClient(
-                api_key=settings.FMP_API_KEY,
-                max_concurrent=settings.FMP_MAX_CONCURRENT,
-            )
             try:
                 await run_funnel_scan(
-                    fmp=fmp,
+                    fmp=provider,
                     pattern_code=pattern_code,
                     limit=funnel_limit,
                     scanner_config=funnel_scanner_config,
@@ -121,12 +123,15 @@ async def start_scan(
 
     scan_id = str(uuid.uuid4())
 
+    # Legacy scans also go through the configured MarketDataProvider.
+    try:
+        legacy_provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     async def run_scan():
         run_logger = logging.getLogger(__name__)
-        fmp = FMPClient(
-            api_key=settings.FMP_API_KEY,
-            max_concurrent=settings.FMP_MAX_CONCURRENT
-        )
+        fmp = legacy_provider
         try:
             run_logger.info(
                 f"[ADMIN] scan started: pattern={pattern_code}, batch_size={chosen_batch_size}"
@@ -152,7 +157,7 @@ async def start_scan(
     if normalized_symbols and len(normalized_symbols) > 0:
         await event_bus.publish(scan_id, {"type": "started", "pattern": pattern_code, "batch_size": chosen_batch_size, "symbols": normalized_symbols})
         summary = await run_scan_batch(
-            FMPClient(api_key=settings.FMP_API_KEY, max_concurrent=settings.FMP_MAX_CONCURRENT),
+            legacy_provider,
             batch_size=chosen_batch_size,
             pattern_code=pattern_code,
             symbols=normalized_symbols,
@@ -201,18 +206,130 @@ async def refresh_tickers(
     background_tasks: BackgroundTasks,
     _: str = Depends(get_worker_token)
 ):
-    """Refresh the tickers cache from FMP"""
-    
+    """Refresh the tickers cache via the configured provider.
+
+    massive -> full reference universe sync; fmp -> legacy screener refresh.
+    (Kept for backward compatibility; /universe/sync is the same operation.)
+    """
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     async def refresh_task():
-        fmp = FMPClient(
-            api_key=settings.FMP_API_KEY,
-            max_concurrent=settings.FMP_MAX_CONCURRENT
-        )
-        await refresh_tickers_cache(fmp)
-    
+        run_logger = logging.getLogger(__name__)
+        try:
+            summary = await provider.sync_universe()
+            run_logger.info(f"[ADMIN] ticker refresh finished: {summary}")
+        except Exception as e:
+            run_logger.error(f"[ADMIN] ticker refresh failed: {e}")
+
     background_tasks.add_task(refresh_task)
-    
-    return {"message": "Ticker refresh started"}
+
+    return {"message": "Ticker refresh started", "provider": provider.name}
+
+
+@router.post("/universe/sync")
+async def universe_sync(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+):
+    """Sync the ticker universe from the configured provider (paginated).
+
+    On Massive Basic this is ~12-13 reference requests paced at the configured
+    rate limit (a few minutes). Runs in the background.
+    """
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    async def sync_task():
+        run_logger = logging.getLogger(__name__)
+        try:
+            summary = await provider.sync_universe()
+            run_logger.info(f"[ADMIN] universe sync finished: {summary}")
+        except Exception as e:
+            run_logger.error(f"[ADMIN] universe sync failed: {e}")
+
+    background_tasks.add_task(sync_task)
+    return {"message": "Universe sync started", "provider": provider.name}
+
+
+@router.post("/market/daily-sync")
+async def market_daily_sync(
+    _: str = Depends(get_worker_token),
+    trading_date: Optional[str] = Body(None, embed=True),
+):
+    """Ingest the whole-market grouped daily snapshot for one date (1 request).
+
+    trading_date defaults to the most recent weekday (YYYY-MM-DD). Runs
+    synchronously (single request) and returns the ingest summary.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    if not trading_date:
+        d = _date.today() - _timedelta(days=1)
+        while d.weekday() >= 5:  # skip Sat/Sun
+            d -= _timedelta(days=1)
+        trading_date = str(d)
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    summary = await provider.get_daily_market_summary(trading_date)
+    return {"message": "Daily market sync completed", **summary}
+
+
+@router.post("/universe/enrich")
+async def universe_enrich(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+    trading_date: Optional[str] = Body(None, embed=True),
+    max_detail_calls: int = Body(25, embed=True),
+):
+    """Survivor-only market-cap enrichment (Massive only).
+
+    Pre-screens locally stored bars for the date (free), then calls ticker
+    details ONLY for survivors with stale profiles, bounded by max_detail_calls
+    (25 calls ≈ 5 minutes on Massive Basic). Runs in the background.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    if provider.name != "massive":
+        raise HTTPException(
+            status_code=400, detail="Enrichment is only supported for the massive provider"
+        )
+
+    if not trading_date:
+        d = _date.today() - _timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= _timedelta(days=1)
+        trading_date = str(d)
+
+    async def enrich_task():
+        run_logger = logging.getLogger(__name__)
+        try:
+            summary = await provider.enrich_market_caps(
+                _date.fromisoformat(trading_date), max_detail_calls=max_detail_calls
+            )
+            run_logger.info(f"[ADMIN] enrichment finished: {summary}")
+        except Exception as e:
+            run_logger.error(f"[ADMIN] enrichment failed: {e}")
+
+    background_tasks.add_task(enrich_task)
+    return {
+        "message": "Enrichment started",
+        "trading_date": trading_date,
+        "max_detail_calls": max_detail_calls,
+    }
 
 
 @router.post("/maintenance/reset-daily-seen")
@@ -251,22 +368,24 @@ async def calculate_outcomes(
     """Compute outcomes for signals that need them (Phase 2).
 
     Bounded by `limit`. Protected by the worker token. This fetches historical
-    OHLCV from FMP for the affected symbols plus SPY/QQQ, so it should be run
-    deliberately (it is NOT scheduled and not enabled automatically).
+    OHLCV from the configured MarketDataProvider for the affected symbols plus
+    SPY/QQQ, so it should be run deliberately (it is NOT scheduled and not
+    enabled automatically).
     """
     logger = logging.getLogger(__name__)
 
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     async def _run() -> dict:
-        fmp = FMPClient(
-            api_key=settings.FMP_API_KEY,
-            max_concurrent=settings.FMP_MAX_CONCURRENT,
-        )
         logger.info(
             "[ADMIN] outcome calc start: limit=%s, pattern=%s, recalc=%s",
             limit, pattern_code, include_recalc,
         )
         summary = await calculate_outcomes_for_signals(
-            fmp,
+            provider,
             limit=limit,
             pattern_code=pattern_code,
             include_recalc=include_recalc,

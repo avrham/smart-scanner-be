@@ -10,7 +10,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.workers.scan_runner import run_scan_batch, run_maintenance_tasks
-from app.workers.fmp_client import FMPClient
+from app.providers import get_market_data_provider
 from app.config import settings
 
 
@@ -25,15 +25,12 @@ async def scheduled_scan_job():
     logger.info("Starting scheduled scan job")
     
     try:
-        # Create FMP client
-        fmp = FMPClient(
-            api_key=settings.FMP_API_KEY,
-            max_concurrent=settings.FMP_MAX_CONCURRENT
-        )
+        # Use the configured MarketDataProvider (massive default, fmp fallback).
+        provider = get_market_data_provider()
         
         # Run scan batch
         result = await run_scan_batch(
-            fmp=fmp,
+            fmp=provider,
             batch_size=settings.SCAN_BATCH_SIZE,
             pattern_code="sma150_bounce"
         )

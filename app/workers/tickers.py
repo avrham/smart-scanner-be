@@ -97,12 +97,17 @@ async def refresh_tickers_cache(fmp: FMPClient) -> int:
 
 
 async def load_candidate_pool(
-    fmp: FMPClient,
+    fmp: Any,
     min_market_cap: float = None,
     min_volume: float = None
 ) -> List[str]:
     """
-    Load filtered candidate pool for scanning
+    Load filtered candidate pool for scanning.
+
+    `fmp` may be any MarketDataProvider; the dynamic screener/stock-list
+    fallbacks below are FMP-specific and are skipped (hasattr-guarded) for
+    providers that don't expose them (e.g. Massive, whose universe comes from
+    the reference sync instead).
     """
     
     # Use config defaults if not provided
@@ -130,7 +135,10 @@ async def load_candidate_pool(
             logger.info(f"⚠️ Only {len(candidates)} candidates found in DB, using dynamic fallback")
             
             # Try to get a filtered list from FMP stock screener first
+            # (FMP-only capability; other providers skip to the next fallback).
             try:
+                if not hasattr(fmp, "get_stock_screener"):
+                    raise AttributeError("provider has no stock screener")
                 logger.info("Attempting to use FMP stock screener for dynamic candidates...")
                 screener_stocks = await fmp.get_stock_screener(
                     market_cap_more_than=min_market_cap,
@@ -155,8 +163,11 @@ async def load_candidate_pool(
             except Exception as e:
                 logger.warning(f"Stock screener failed, falling back to stock list: {e}")
             
-            # Fallback to basic stock list (without market cap filtering since it's not available)
+            # Fallback to basic stock list (FMP-only; skipped for providers
+            # without it — the curated list below is used instead)
             try:
+                if not hasattr(fmp, "list_stocks"):
+                    raise AttributeError("provider has no stock list")
                 all_stocks = await fmp.list_stocks()
                 dynamic_candidates = []
                 

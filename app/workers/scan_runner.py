@@ -11,7 +11,6 @@ from collections import Counter
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional
 
-from app.workers.fmp_client import FMPClient
 from app.workers.persistence import was_seen_today, mark_seen_today, save_signal, log_pattern_run
 from app.workers.patterns.sma150 import evaluate_sma150_bounce, DEFAULT_CONFIG
 from app.workers.patterns.config import resolve_pattern_config
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 async def process_single_symbol(
-    fmp: FMPClient,
+    fmp: Any,
     symbol: str,
     pattern_code: str = "sma150_bounce",
     scan_date: date = None,
@@ -374,7 +373,7 @@ async def process_single_symbol_with_data(
 
 
 async def run_scan_batch(
-    fmp: FMPClient,
+    fmp: Any,
     batch_size: int = 150,
     pattern_code: str = "sma150_bounce",
     max_concurrent: int = 10,
@@ -636,12 +635,10 @@ if __name__ == "__main__":
     async def test_run():
         from app.config import settings
         
-        fmp = FMPClient(
-            api_key=settings.FMP_API_KEY,
-            max_concurrent=settings.FMP_MAX_CONCURRENT
-        )
-        
-        result = await run_scan_batch(fmp, batch_size=10)
+        from app.providers import get_market_data_provider
+
+        provider = get_market_data_provider()
+        result = await run_scan_batch(provider, batch_size=10)
         print(f"Test run result: {result}")
     
     asyncio.run(test_run())

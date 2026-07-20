@@ -477,6 +477,16 @@ Frontend (`smart-scanner-ui`): component tests for filters and decision-card ren
 Note: the public `GET /api/signals` endpoints filter `verdict='ENTER'`, so WATCH
 rows do not leak into the existing UI; surfacing them is deliberate Phase 6 work.
 
+### Provider migration — Massive as primary market data provider
+- [x] `MarketDataProvider` interface (`app/providers/base.py`); scanner/admin depend on it, not on a vendor
+- [x] Massive client (`app/workers/massive_client.py`): auth (header + apiKey re-applied to `next_url`), 5 rpm limiter, retries w/ backoff (429/5xx/timeouts), fail-fast 401/403, structured secret-free errors
+- [x] Universe sync (paginated reference tickers → extended `tickers` columns; classification by type/exchange metadata, OTC/ETF/warrants excluded by default)
+- [x] Grouped daily ingestion (1 request/market/day → `daily_bars`, migration 005) + `tickers.last_volume` propagation
+- [x] Free local pre-screen (min price / volume / close×volume dollar volume) BEFORE survivor-only market-cap enrichment (7-day profile cache; missing cap → `enrichment_status='missing_market_cap'`, never 0)
+- [x] Local-first incremental historical bars via aggregates; strategies keep reporting required-vs-available bars (wyckoff's 540 NOT reduced — not satisfiable on Massive Basic's ~2y history)
+- [x] FMP preserved as fallback (`MARKET_DATA_PROVIDER=fmp`); legacy scans + outcome calculation still use FMP directly
+- [x] `/api/health` provider block (name, credentials flag, rate mode, sync freshness; never the key); mocked tests; `docs/massive-provider-setup.md`
+
 ### Phase 6 — Decision cards & UI
 - [ ] Structured decision card generation (data-driven)
 - [ ] Signal drawer + filters + MTF context
