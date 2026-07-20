@@ -106,9 +106,15 @@ documents, this section is authoritative.
 - **Signals** — existing `signals` table (migration 001): id, symbol,
   pattern_code, verdict (ENTER/WATCH/AVOID), probability, score, reason,
   details JSONB, snapshot_date, created_at.
-  **Gap (7B): no `scan_run_id`, no dedicated strategy/policy version columns
-  — versions live only inside `details` (`score_version`,
-  `strategy_version` on cards). Signals are not yet fully reproducible.**
+  **Resolved in 7B:** signals are IMMUTABLE, identified by
+  `signal_fingerprint` (migration 007 replaces the destructive
+  symbol/pattern/date upsert); every new signal gets a 1:1
+  `signal_provenance` row (origin scan_run_id, exact
+  strategy/policy/provenance versions, config snapshot+hash, bounded
+  evidence snapshot + pruning metadata, market-data as-of) plus a
+  `scan_run_signals` occurrence link, all written in the same transaction.
+  Repeated exact detections reuse the existing signal (link only). Pre-7B
+  rows remain readable as `legacy_unlinked` with NULL fingerprints.
 - **Outcomes** — migration 003 `signal_outcomes` (forward returns 1/3/5/10/20D,
   MFE/MAE, stop/target hits, `calculation_version='outcome.v1'`), pure
   calculator + baselines (same-ticker buy-hold, SPY, QQQ), aggregation
@@ -134,12 +140,19 @@ documents, this section is authoritative.
 | Outcome math | `signal_outcomes.calculation_version` | `outcome.v1` |
 | Decision card | `details.decision_card.card_version` | card builder version |
 | Funnel | telemetry `scanner_version` | `funnel_v1` |
+| Decision policy (7B) | `signal_provenance.decision_policy_version` | `strategy_decision.v1` |
+| Provenance record (7B) | `signal_provenance.provenance_version` | `provenance.v1` |
+| Fingerprint algorithm (7B) | `signals.signal_fingerprint_version` | `signal_fingerprint.v1` |
+
+These remain SEPARATE identities by design: strategy version ≠ decision-card
+version ≠ outcome-calculation version ≠ decision-policy version ≠
+provenance version.
 
 ### Known validation debts
 
 - Controlled scan smoke before Phase 2 was intentionally skipped (recorded).
 - No signal alpha has been demonstrated; outcome sample sizes are tiny.
-- Signals lack explicit scan-run provenance (see Phase 7B).
+- Migration 007 is written and tested but not yet applied to Supabase.
 
 ## 3. Target pipeline
 
@@ -167,7 +180,7 @@ filter can never be outvoted by soft evidence or an LLM narrative.
 Historical phases 1–6 (plus 5.1/5.2 and the Massive migration) keep their
 numbers and are not reopened.
 
-### Phase 7A — durable market-data jobs and coverage observability *(this session)*
+### Phase 7A — durable market-data jobs and coverage observability *(COMPLETE, live-validated)*
 
 - `market_data_jobs` table (migration 006): queued/running/completed/failed/
   cancelled; initially `market_cap_enrichment`. Persists provider, trading
@@ -214,15 +227,165 @@ numbers and are not reopened.
   reuse the same table and API contract unchanged; no new queue system
   (Celery/Redis/pg-boss) is introduced in this phase.
 
-### Phase 7B — scan and signal provenance
+### Phase 7B — scan and signal provenance *(COMPLETE — implemented contracts below)*
 
-- Additive migration: `signals.scan_run_id`, `signals.strategy_version`,
-  `signals.decision_policy_version`, config snapshot hash (or snapshot JSONB),
-  market-data as-of timestamp.
-- `pattern_runs` gains a stable `scan_run_id` correlation to signals.
-- Outcomes copy the strategy/policy versions they evaluated.
-- Goal: every persisted signal reproducible from stored provenance
-  (see §7 Provenance requirements).
+Implemented (migration 007 `007_scan_signal_provenance.sql`, additive and
+idempotent; no backfill of legacy rows):
+
+**Canonical scan-run identity** — `pattern_runs` IS the canonical scan-run
+table (no second identity was created). The UUID returned by
+`POST /api/admin/scan/start` — the same one the scan WebSocket subscribes
+to — is now the `pattern_runs.id`, created at scan START
+(`app/workers/scan_runs.py::create_scan_run`, status `running`) and
+finalized at scan end (`finalize_scan_run`: status `completed`/`failed`,
+counts, `finished_at`, telemetry JSONB + legacy `notes`). New columns:
+`scanner_mode`, `status`, `provider`, `dry_run`, `requested_limit`,
+`scan_date`, `finished_at`, `telemetry`, `created_at`, `updated_at`.
+Funnel, legacy and scheduled scans all create/finalize their run; a run id
+is generated internally when a caller does not supply one.
+
+**Signal provenance** — one-to-one `signal_provenance` table (PK
+`signal_id` FK→signals ON DELETE CASCADE; `scan_run_id` FK→pattern_runs):
+`source_path` (`funnel` | `legacy` | `scheduled` | `manual`),
+`scanner_mode`, `provider`, `strategy_code`, `strategy_version` (from the
+real `StrategyResult`, e.g. `sma150.v2`, `wyckoff_mtf.v1`),
+`decision_policy_version` (`strategy_decision.v1` — the strategies' implicit
+decision rules, named so future explicit policies version separately),
+`provenance_version` (`provenance.v1`), `config_hash` + `config_snapshot`,
+`market_data_as_of`, `evidence_snapshot`, `external_observation_ids`
+(always `[]` until Phase 10 — never placeholder IDs). Indexed on
+scan_run_id, (strategy_code, strategy_version), decision_policy_version,
+config_hash.
+
+**Immutable signal identity** — `signals.signal_fingerprint` (nullable
+TEXT): SHA-256 over the canonical decision inputs (fingerprint algorithm
+version, symbol, strategy code+version, decision-policy version, config
+hash, snapshot date, market-data as-of in UTC, verdict,
+`evidence_original_sha256` — the hash of the COMPLETE canonical evidence
+BEFORE size pruning, so decisions differing only in later-pruned optional
+evidence stay distinct — and sorted external-observation ids; recursively
+sorted keys; deliberately NO scan_run_id and no secrets/LLM prose). The
+fingerprint ALGORITHM is explicitly versioned:
+`signals.signal_fingerprint_version = 'signal_fingerprint.v1'`, persisted
+with every new fingerprint, included in the hashed payload, compared during
+deduplication, and exposed by the provenance endpoint; a CHECK constraint
+forbids partial identity states (fingerprint without version or vice
+versa), and legacy rows keep both NULL. The pre-7B
+`UNIQUE(symbol, pattern_code, snapshot_date)` constraint — which made
+different strategy versions/config hashes/data snapshots mutually
+DESTRUCTIVE on the same day (the old upsert overwrote both the signal row
+and its provenance) — is dropped and replaced by a unique partial index on
+`(signal_fingerprint, signal_fingerprint_version)` for non-null
+fingerprints. Legacy rows keep `signal_fingerprint` NULL (never
+fabricated), stay readable, and keep their historical dedup semantics via a
+partial legacy index (`WHERE signal_fingerprint IS NULL`). This lets
+`sma150.v2`/`sma150.v3`, `wyckoff_mtf.v1`/`v2`, Wyckoff with/without
+Lorentzian, different config hashes, and different market-data snapshots
+coexist as distinct immutable signals on the same symbol and date.
+
+**Centralized transactional persistence** — `save_signal`
+(`app/workers/persistence.py`) is the ONLY `INSERT INTO signals` path
+(enforced by a source-scanning test) and REQUIRES a provenance record.
+Semantics: a NEW fingerprint inserts signal + origin provenance + occurrence
+link in ONE transaction; an exact repeated fingerprint returns the existing
+`signal_id` (deduplicated) — the signal row, evidence, provenance, and the
+origin `scan_run_id` are NEVER overwritten (a compatibility check refuses a
+fingerprint reuse whose stored identity disagrees). Returns
+`{signal_id, created_new_signal, deduplicated, signal_fingerprint,
+signal_fingerprint_version}`. Builders live in `app/workers/provenance.py`.
+
+**Scan-run occurrence links** — `scan_run_signals` (PK
+`(scan_run_id, signal_id)`, `source_path`, `created_new_signal`,
+`linked_at`): EVERY scan that detects a signal records a link, including
+re-detections of an immutable signal created by an earlier scan.
+Semantics: `signal_provenance.scan_run_id` = the ORIGIN scan that first
+created the signal; `scan_run_signals` = every detection. Scan telemetry
+distinguishes `signals_created` / `signals_deduplicated` / `signals_linked`
+(a repeated exact signal is never counted as newly created).
+
+**Configuration snapshot/hash** — sanitized (secret-shaped keys and
+credential-looking values stripped before hashing AND persistence),
+canonical JSON (recursively sorted keys, semantic list order, compact),
+SHA-256. Same logical config in any dict order ⇒ same hash; any meaningful
+change ⇒ different hash.
+
+**Evidence snapshot** — deterministic evidence only (score_components,
+thresholds_used, bounces_detail, trend_context, decision-card evidence,
+timeframe summary, missing data/trigger/confirmation, rejection reason).
+Missing fields are never invented; no LLM prose. Bounded to 64 KiB with
+DETERMINISTIC pruning: only optional keys may be pruned (largest serialized
+size first, key name as tiebreak); mandatory decision inputs
+(verdict/decision, score_components, thresholds_used, trigger/confirmation
+needed, missing_data, rejection/waiting reason, timeframe summary,
+snapshot/as-of info, decision-card evidence) can never be pruned. The
+original snapshot's `evidence_original_sha256` and
+`evidence_original_size_bytes` plus `evidence_pruned` /
+`evidence_pruned_keys` are persisted for reproducibility. If even the
+mandatory-only snapshot exceeds the bound, persistence is REJECTED
+(`EvidenceTooLargeError`) and the whole signal transaction is aborted — a
+snapshot missing its core decision inputs is never stored.
+
+**Market-data as-of** — latest bar actually present in the evaluated
+dataframe, normalized to UTC; NULL + explicit
+`market_data_as_of_missing_reason` when no trustworthy timestamp exists.
+Never insertion/server/provider-response time.
+
+**Outcome linkage** — `signal_outcomes` gains `scan_run_id`,
+`strategy_code`, `strategy_version`, `decision_policy_version`,
+`config_hash`, `provenance_version`, frozen at outcome creation from the
+signal's provenance row (legacy signals ⇒ NULLs, never inferred). Historical
+outcomes untouched.
+
+**APIs** — `GET /api/signals/{id}/provenance` (legacy rows return
+`provenance_status="legacy_unlinked"` with no fabricated fields);
+`GET /api/signals` gains additive AND-composing filters `scan_run_id`,
+`strategy_version`, `decision_policy_version`, `config_hash` (the
+`scan_run_id` filter is the chosen scan→signals listing path; no redundant
+admin endpoint was added). The `scan_run_id` filter queries the
+`scan_run_signals` OCCURRENCE table, so it returns every signal a scan
+detected — including immutable signals originally created by an earlier
+scan — not only origin provenance rows.
+
+**Scan failure lifecycle** — every handled exception in a scan entry path
+(admin funnel, legacy batch, scheduled batch — all of which funnel through
+`run_funnel_scan` / `run_scan_batch`) finalizes the canonical run:
+`status='failed'`, `finished_at`, sanitized+bounded `error_code` /
+`error_message` columns, partial telemetry when available. No handled
+exception leaves a scan in `running`. **Zero candidates is NOT a failure:**
+a scan that executes normally and finds nothing to evaluate (empty universe
+/ empty candidate pool) finalizes as `completed` with zero counts, no error
+identity, and `telemetry.terminal_reason='no_candidates'` — `failed` is
+reserved for operational/configuration/data-readiness/strategy exceptions.
+**Process-death limitation
+(documented, by design):** an abrupt process death cannot execute
+finalization, so a stale `running` row may remain — it is kept for forensic
+visibility, never blocks new scans (scan runs are independent rows with no
+active-run uniqueness), and scans are NOT resumable; a stale-run sweeper is
+possible later but is deliberately not claimed here.
+
+**Outcome semantics under immutable identity** — outcomes stay keyed 1:1 to
+the immutable signal variant: an exact repeated scan reuses the same
+`signal_id` and therefore cannot create a second outcome; a different
+strategy version, config hash, market-data as-of, or external-observation
+set is a different fingerprint ⇒ distinct signal ⇒ distinct outcome row,
+each frozen with its own version identity.
+
+**How this enables the later phases:**
+
+- `sma150.v3` vs `sma150.v2` and `wyckoff_mtf.v2` vs `wyckoff_mtf.v1`:
+  both versions can run side by side; every signal and outcome carries the
+  exact `strategy_version`, so outcome grouping/comparison is a WHERE
+  clause, immune to later version changes.
+- Wyckoff ± Lorentzian / internal strategies ± AI Edge (Phases 10–11):
+  `external_observation_ids` is structurally ready; an ablation is
+  "same strategy_version + decision_policy_version, different evidence
+  set/config_hash", each arm immutably identified.
+- Immutable ablation experiments: `config_snapshot` + `config_hash` freeze
+  the exact resolved configuration per signal — experiments never depend on
+  the mutable pattern-config rows.
+- Outcome grouping by strategy version, decision policy and config hash:
+  the frozen columns on `signal_outcomes` make per-version expectancy /
+  baseline-delta reports simple aggregations.
 
 ### Phase 8 — evidence contracts and sma150.v3
 
@@ -369,9 +532,10 @@ evidence snapshot, decision, created_at
 Outcomes must preserve the strategy and policy versions being evaluated so a
 later version change cannot silently contaminate historical statistics.
 
-Current gap (audited): signals persist strategy versions only inside
-`details`; `scan_run_id` is available in `StrategyContext` but not persisted.
-Phase 7B closes this.
+Status: implemented in Phase 7B for all signals persisted after migration
+007 (see the Phase 7B section for the concrete contracts). Legacy rows are
+reported as `legacy_unlinked` and are never backfilled with fabricated
+provenance.
 
 ## 8. Ablation and experiment requirements (Phase 11 target)
 

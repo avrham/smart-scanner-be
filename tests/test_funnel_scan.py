@@ -71,7 +71,8 @@ _UNIVERSE = [
 def _patch_common(monkeypatch):
     monkeypatch.setattr(funnel, "resolve_pattern_config", _async(dict(_PATTERN_CONFIG)))
     monkeypatch.setattr(funnel, "get_universe_tickers", _async(list(_UNIVERSE)))
-    monkeypatch.setattr(funnel, "log_pattern_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "create_scan_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "finalize_scan_run", _async(None))
     monkeypatch.setattr(funnel, "was_seen_today", _async(False))
     monkeypatch.setattr(funnel, "mark_seen_today", _async(None))
 
@@ -139,7 +140,7 @@ def test_full_run_counts_and_saves(monkeypatch):
 
     async def fake_save(**kwargs):
         saved.append(kwargs["symbol"])
-        return "sig-id"
+        return {"signal_id": "sig-id", "created_new_signal": True, "deduplicated": False}
 
     monkeypatch.setattr(funnel, "get_strategy", lambda pc: _FakeStrategy())
     monkeypatch.setattr(funnel, "save_signal", fake_save)
@@ -190,7 +191,7 @@ def test_limit_caps_survivors_before_fetch(monkeypatch):
             )
 
     monkeypatch.setattr(funnel, "get_strategy", lambda pc: _AvoidStrategy())
-    monkeypatch.setattr(funnel, "save_signal", _async("id"))
+    monkeypatch.setattr(funnel, "save_signal", _async({"signal_id": "id", "created_new_signal": True, "deduplicated": False}))
     fake_fmp = _FakeFMP({"GOOD1": _fmp_history(), "GOOD2": _fmp_history()})
 
     summary = asyncio.run(

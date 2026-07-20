@@ -19,8 +19,8 @@ SAFETY:
 """
 
 import asyncio
-import json
 import logging
+import uuid
 from collections import Counter
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,11 +38,12 @@ from app.workers.strategies import (
 from app.workers.strategies.decision_card import build_decision_card
 from app.workers.persistence import (
     get_universe_tickers,
-    log_pattern_run,
     mark_seen_today,
     save_signal,
     was_seen_today,
 )
+from app.workers.provenance import build_provenance, market_data_as_of_from_df
+from app.workers.scan_runs import create_scan_run, finalize_scan_run
 from app.config import settings
 from app.utils.events import event_bus
 
@@ -232,6 +233,11 @@ def assemble_telemetry(
         "enter_symbols": [], "watch_symbols": [], "evaluated_symbols": [],
     })
     telemetry.update(tracker.as_dict())
+    # Zero candidates is a NORMAL completed outcome; the explicit terminal
+    # reason distinguishes "nothing to evaluate" from "evaluated, no setup"
+    # without any error identity.
+    if stage_counts.get("stage_0_universe", 0) == 0 and not dry_run:
+        telemetry["terminal_reason"] = "no_candidates"
     return telemetry
 
 
@@ -265,6 +271,10 @@ async def run_funnel_scan(
     """
     started_at = datetime.utcnow()
     scan_date = scan_date or date.today()
+    # Phase 7B: the scan ALWAYS has a canonical identity — the same UUID the
+    # admin endpoint returned / the WebSocket uses. Generated here only when a
+    # caller (e.g. a test) didn't provide one.
+    scan_id = scan_id or str(uuid.uuid4())
     scfg = _merge_scanner_config(scanner_config)
     tracker = RejectionTracker(sample_limit=int(scfg["sample_rejections_limit"]))
     extra_notes: List[str] = []
@@ -289,13 +299,8 @@ async def run_funnel_scan(
     min_daily_volume = float(liq.get("min_daily_volume", 200_000))
     min_price = float(pattern_config.get("min_price", 1.0))
 
-    if scan_id:
-        await event_bus.publish(scan_id, {"type": "stage", "stage": "universe_build"})
-
-    # Stage 0 - universe from the ticker cache (real values, includes NULLs).
-    universe = await get_universe_tickers()
     stage_counts: Dict[str, int] = {
-        "stage_0_universe": len(universe),
+        "stage_0_universe": 0,
         "stage_1_liquidity_passed": 0,
         "stage_2_prefilter_passed": 0,
         "stage_3_evaluated": 0,
@@ -304,7 +309,97 @@ async def run_funnel_scan(
         "watch_count": 0,   # not supported by sma150_bounce (documented)
         "watch_saved_count": 0,  # Phase 5.2: WATCH candidates persisted
         "reject_count": 0,
+        # Phase 7B immutable-identity accounting: a repeated exact signal is
+        # deduplicated (linked to this scan), never counted as newly created.
+        "signals_created": 0,
+        "signals_deduplicated": 0,
+        "signals_linked": 0,
     }
+
+    # Phase 7B: create the CANONICAL scan-run row at scan START (status=
+    # 'running') so persisted signals can FK-link to this exact run via
+    # signal_provenance.scan_run_id. Same UUID as the endpoint/WebSocket.
+    await create_scan_run(
+        scan_run_id=scan_id,
+        pattern_code=pattern_code,
+        scanner_mode="funnel",
+        provider=provider_name,
+        dry_run=dry_run,
+        requested_limit=limit,
+        scan_date=scan_date,
+        run_started_at=started_at,
+    )
+
+    try:
+        return await _run_funnel_stages(
+            fmp=fmp,
+            pattern_code=pattern_code,
+            limit=limit,
+            ignore_seen=ignore_seen,
+            dry_run=dry_run,
+            scan_id=scan_id,
+            scan_date=scan_date,
+            started_at=started_at,
+            scfg=scfg,
+            tracker=tracker,
+            extra_notes=extra_notes,
+            api_call_counts=api_call_counts,
+            provider_name=provider_name,
+            result_symbols=result_symbols,
+            _track_symbol=_track_symbol,
+            strategy=strategy,
+            pattern_config=pattern_config,
+            stage_counts=stage_counts,
+            min_market_cap=min_market_cap,
+            min_daily_volume=min_daily_volume,
+            min_price=min_price,
+        )
+    except Exception as exc:
+        # HANDLED failure lifecycle: the canonical run row must never stay
+        # 'running' after a handled exception. Counts reflect whatever
+        # completed before the failure; partial telemetry only, nothing
+        # invented. (Abrupt process death cannot run this block — see the
+        # roadmap: stale 'running' rows are forensic, never blocking.)
+        await _persist_telemetry(
+            scan_id, "failed", stage_counts,
+            {"partial": True, "stage_counts": dict(stage_counts)},
+            error_code="funnel_scan_exception",
+            error_message=str(exc),
+        )
+        raise
+
+
+async def _run_funnel_stages(
+    *,
+    fmp: Optional[Any],
+    pattern_code: str,
+    limit: Optional[int],
+    ignore_seen: bool,
+    dry_run: bool,
+    scan_id: str,
+    scan_date: date,
+    started_at: datetime,
+    scfg: Dict[str, Any],
+    tracker: RejectionTracker,
+    extra_notes: List[str],
+    api_call_counts: Dict[str, int],
+    provider_name: str,
+    result_symbols: Dict[str, List[str]],
+    _track_symbol,
+    strategy: Any,
+    pattern_config: Dict[str, Any],
+    stage_counts: Dict[str, int],
+    min_market_cap: float,
+    min_daily_volume: float,
+    min_price: float,
+) -> Dict[str, Any]:
+    """Stages 0-4 of the funnel (split out so a failure finalizes the run)."""
+    if scan_id:
+        await event_bus.publish(scan_id, {"type": "stage", "stage": "universe_build"})
+
+    # Stage 0 - universe from the ticker cache (real values, includes NULLs).
+    universe = await get_universe_tickers()
+    stage_counts["stage_0_universe"] = len(universe)
 
     # Stage 1 - liquidity filter (cheap, no FMP).
     survivors = apply_liquidity_filter(
@@ -356,7 +451,7 @@ async def run_funnel_scan(
             market_data_provider=provider_name,
             result_symbols=result_symbols,
         )
-        await _persist_telemetry(pattern_code, stage_counts, telemetry, started_at)
+        await _persist_telemetry(scan_id, "completed", stage_counts, telemetry)
         if scan_id:
             await event_bus.publish(scan_id, {"type": "finished", "telemetry": telemetry})
         return _summary(telemetry, stage_counts, dry_run=True)
@@ -383,6 +478,44 @@ async def run_funnel_scan(
     if scan_id:
         await event_bus.publish(
             scan_id, {"type": "stage", "stage": "evaluating", "total": len(bounded_symbols)}
+        )
+
+    # Phase 7B: decision-relevant scanner settings included in each signal's
+    # config snapshot/hash (secrets are stripped by the provenance builder).
+    scanner_settings = {
+        "scanner_version": scfg.get("scanner_version", SCANNER_VERSION),
+        "max_universe_size": scfg.get("max_universe_size"),
+        "allow_unknown_volume": scfg.get("allow_unknown_volume"),
+        "enable_expensive_stages": expensive_enabled,
+        "persist_watch_candidates": persist_watch,
+        "requested_limit": limit,
+        "min_daily_bars": min_bars,
+        "required_timeframes": list(getattr(strategy, "required_timeframes", None) or []),
+    }
+
+    def _provenance_for(
+        result: StrategyResult,
+        df: Optional[pd.DataFrame],
+        details: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Provenance from the REAL strategy result + the evaluated dataframe.
+
+        `details` already includes the decision card so the evidence snapshot
+        (and hence the immutable fingerprint) covers the full persisted
+        deterministic evidence.
+        """
+        return build_provenance(
+            scan_run_id=scan_id,
+            source_path="funnel",
+            scanner_mode="funnel",
+            provider=provider_name,
+            strategy_code=result.pattern_code,
+            strategy_version=result.strategy_version or getattr(strategy, "version", "unknown"),
+            strategy_config=pattern_config,
+            scanner_settings=scanner_settings,
+            details=details,
+            score_components=result.score_components,
+            market_data_as_of=market_data_as_of_from_df(df),
         )
 
     for ticker in bounded:
@@ -442,7 +575,7 @@ async def run_funnel_scan(
             if result.decision == StrategyDecision.ENTER:
                 stage_counts["enter_count"] += 1
                 _track_symbol("enter_symbols", symbol)
-                await _maybe_save(result)
+                await _maybe_save(result, df, _provenance_for, stage_counts)
             elif result.decision == StrategyDecision.WATCH:
                 # Phase 5.2: WATCH candidates are valuable decision-support data.
                 # Persist them (with a decision card) when enabled; outcome
@@ -450,7 +583,7 @@ async def run_funnel_scan(
                 # inspectable history, not entries.
                 stage_counts["watch_count"] += 1
                 _track_symbol("watch_symbols", symbol)
-                if persist_watch and await _maybe_save(result):
+                if persist_watch and await _maybe_save(result, df, _provenance_for, stage_counts):
                     stage_counts["watch_saved_count"] += 1
             else:
                 # Low-quality AVOID/REJECT are never persisted unless debug mode.
@@ -460,7 +593,7 @@ async def run_funnel_scan(
                     result.rejection_reason or "avoided",
                 )
                 if settings.DEBUG_SAVE_AVOID:
-                    await _maybe_save(result)
+                    await _maybe_save(result, df, _provenance_for, stage_counts)
         except Exception as exc:  # never let one symbol abort the run
             logger.error("Funnel eval failed for %s: %s", symbol, exc)
             tracker.add(symbol, "evaluation", "eval_error")
@@ -480,7 +613,7 @@ async def run_funnel_scan(
         market_data_provider=provider_name,
         result_symbols=result_symbols,
     )
-    await _persist_telemetry(pattern_code, stage_counts, telemetry, started_at)
+    await _persist_telemetry(scan_id, "completed", stage_counts, telemetry)
     if scan_id:
         await event_bus.publish(scan_id, {"type": "finished", "telemetry": telemetry})
     return _summary(telemetry, stage_counts, dry_run=False)
@@ -502,18 +635,28 @@ async def _fetch_4h(fmp: Any, symbol: str) -> Optional[pd.DataFrame]:
         return None
 
 
-async def _maybe_save(result: StrategyResult) -> bool:
-    """Persist a signal via the existing pipeline (Phase 2 compatible).
+async def _maybe_save(
+    result: StrategyResult,
+    df: Optional[pd.DataFrame],
+    provenance_for,
+    stage_counts: Dict[str, int],
+) -> bool:
+    """Persist a signal via the canonical immutable pipeline.
 
     Phase 5.2: a deterministic decision card is attached at
     `details.decision_card` (built only from StrategyResult fields — nothing is
-    invented). The strategy's own detail fields are otherwise untouched.
-    Returns True when the row was written.
+    invented). Phase 7B: the card is added BEFORE the provenance/evidence
+    snapshot is built so the immutable fingerprint covers the full persisted
+    evidence; signal + provenance + scan occurrence link share one
+    transaction. A repeated exact fingerprint is deduplicated (linked, never
+    re-created or overwritten). Returns True when the signal was persisted or
+    linked.
     """
     try:
         details = dict(result.details or {})
         details["decision_card"] = build_decision_card(result)
-        await save_signal(
+        provenance = provenance_for(result, df, details)
+        save_result = await save_signal(
             symbol=result.symbol,
             pattern_code=result.pattern_code,
             verdict=result.verdict,
@@ -521,7 +664,13 @@ async def _maybe_save(result: StrategyResult) -> bool:
             reason=result.reason,
             details=details,
             snapshot_date=date.fromisoformat(result.details["snapshot_date"]),
+            provenance=provenance,
         )
+        if save_result.get("created_new_signal"):
+            stage_counts["signals_created"] += 1
+        else:
+            stage_counts["signals_deduplicated"] += 1
+        stage_counts["signals_linked"] += 1
         return True
     except Exception as exc:
         logger.error("Failed to save funnel signal for %s: %s", result.symbol, exc)
@@ -529,19 +678,25 @@ async def _maybe_save(result: StrategyResult) -> bool:
 
 
 async def _persist_telemetry(
-    pattern_code: str,
+    scan_id: str,
+    status: str,
     stage_counts: Dict[str, int],
-    telemetry: Dict[str, Any],
-    started_at: datetime,
+    telemetry: Optional[Dict[str, Any]],
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
 ) -> None:
+    """Finalize the canonical scan-run row (counts + telemetry + status +
+    safe error identity for failed runs)."""
     try:
-        await log_pattern_run(
-            pattern_code=pattern_code,
+        await finalize_scan_run(
+            scan_run_id=scan_id,
+            status=status,
             scanned_count=stage_counts["stage_3_evaluated"],
             enter_count=stage_counts["enter_count"],
             rejected_count=stage_counts["reject_count"],
-            notes=json.dumps(telemetry),
-            run_started_at=started_at,
+            telemetry=telemetry,
+            error_code=error_code,
+            error_message=error_message,
         )
     except Exception as exc:
         logger.error("Failed to persist funnel telemetry: %s", exc)

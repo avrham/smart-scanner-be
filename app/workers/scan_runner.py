@@ -7,15 +7,18 @@ import asyncio
 import json
 import logging
 import random
+import uuid
 from collections import Counter
 from datetime import datetime, date
 from typing import List, Dict, Any, Optional
 
-from app.workers.persistence import was_seen_today, mark_seen_today, save_signal, log_pattern_run
-from app.workers.patterns.sma150 import evaluate_sma150_bounce, DEFAULT_CONFIG
+from app.workers.persistence import was_seen_today, mark_seen_today, save_signal
+from app.workers.patterns.sma150 import evaluate_sma150_bounce, DEFAULT_CONFIG, SCORE_VERSION
 from app.workers.patterns.config import resolve_pattern_config
 from app.workers.indicators import to_dataframe, validate_dataframe
 from app.workers.tickers import load_candidate_pool, select_random_batch, filter_by_liquidity
+from app.workers.provenance import build_provenance, market_data_as_of_from_df
+from app.workers.scan_runs import create_scan_run, finalize_scan_run
 from app.config import settings
 from app.utils.events import event_bus
 import pandas as pd
@@ -37,13 +40,46 @@ def _liquidity_params(config: Dict[str, Any]) -> Dict[str, float]:
 logger = logging.getLogger(__name__)
 
 
+def _legacy_provenance(
+    result: Dict[str, Any],
+    pattern_code: str,
+    config: Dict[str, Any],
+    df: Optional[pd.DataFrame],
+    scan_run_id: Optional[str],
+    source_path: str,
+    provider_name: Optional[str],
+) -> Dict[str, Any]:
+    """Provenance for the legacy sma150 dict-result path (Phase 7B).
+
+    strategy_version comes from the evaluator's own score_version (sma150.v2);
+    market_data_as_of from the latest bar actually evaluated. Nothing is
+    inferred from timestamps or pattern names beyond what the evaluator emits.
+    """
+    details = result.get("details") or {}
+    return build_provenance(
+        scan_run_id=scan_run_id,
+        source_path=source_path,
+        scanner_mode="legacy",
+        provider=provider_name,
+        strategy_code=pattern_code,
+        strategy_version=details.get("score_version") or SCORE_VERSION,
+        strategy_config=config,
+        details=details,
+        score_components=details.get("score_components"),
+        market_data_as_of=market_data_as_of_from_df(df),
+    )
+
+
 async def process_single_symbol(
     fmp: Any,
     symbol: str,
     pattern_code: str = "sma150_bounce",
     scan_date: date = None,
     ignore_seen: bool = False,
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
+    scan_run_id: Optional[str] = None,
+    source_path: str = "manual",  # documented no-scan-context path (direct call)
+    provider_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Process a single symbol for pattern detection
@@ -164,17 +200,22 @@ async def process_single_symbol(
         
         if should_save:
             try:
-                signal_id = await save_signal(
+                save_result = await save_signal(
                     symbol=symbol,
                     pattern_code=pattern_code,
                     verdict=result["verdict"],
                     score=result["score"],
                     reason=result["reason"],
                     details=result["details"],
-                    snapshot_date=date.fromisoformat(result["details"]["snapshot_date"])
+                    snapshot_date=date.fromisoformat(result["details"]["snapshot_date"]),
+                    provenance=_legacy_provenance(
+                        result, pattern_code, config, df,
+                        scan_run_id, source_path, provider_name,
+                    ),
                 )
-                
-                result["signal_id"] = signal_id
+
+                result["signal_id"] = save_result["signal_id"]
+                result["signal_created_new"] = save_result["created_new_signal"]
                 
                 # Log ENTER signals
                 if result["verdict"] == "ENTER":
@@ -218,7 +259,10 @@ async def process_single_symbol_with_data(
     pattern_code: str = "sma150_bounce",
     scan_date: date = None,
     ignore_seen: bool = False,
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
+    scan_run_id: Optional[str] = None,
+    source_path: str = "legacy",
+    provider_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Process a single symbol for pattern detection using pre-fetched data
@@ -324,17 +368,22 @@ async def process_single_symbol_with_data(
         
         if should_save:
             try:
-                signal_id = await save_signal(
+                save_result = await save_signal(
                     symbol=symbol,
                     pattern_code=pattern_code,
                     verdict=result["verdict"],
                     score=result["score"],
                     reason=result["reason"],
                     details=result["details"],
-                    snapshot_date=date.fromisoformat(result["details"]["snapshot_date"])
+                    snapshot_date=date.fromisoformat(result["details"]["snapshot_date"]),
+                    provenance=_legacy_provenance(
+                        result, pattern_code, config, df,
+                        scan_run_id, source_path, provider_name,
+                    ),
                 )
-                
-                result["signal_id"] = signal_id
+
+                result["signal_id"] = save_result["signal_id"]
+                result["signal_created_new"] = save_result["created_new_signal"]
                 
                 # Log ENTER signals
                 if result["verdict"] == "ENTER":
@@ -379,7 +428,8 @@ async def run_scan_batch(
     max_concurrent: int = 10,
     symbols: List[str] | None = None,
     ignore_seen: bool = False,
-    scan_id: Optional[str] = None
+    scan_id: Optional[str] = None,
+    source_path: str = "legacy",
 ) -> Dict[str, Any]:
     """
     Run a complete scan batch
@@ -391,8 +441,24 @@ async def run_scan_batch(
     run_start = datetime.utcnow()
     logger.info(f"Starting scan batch: size={batch_size}, pattern={pattern_code}")
 
+    # Phase 7B: every batch scan has a canonical scan-run identity (the same
+    # UUID the admin endpoint/WebSocket use when they provided one).
+    scan_id = scan_id or str(uuid.uuid4())
+    provider_name = getattr(fmp, "name", None) or "unknown"
+
     # Resolve config once per run (B1): DB config overrides safe defaults.
     config = await resolve_pattern_config(pattern_code, _resolve_default_config(pattern_code))
+
+    await create_scan_run(
+        scan_run_id=scan_id,
+        pattern_code=pattern_code,
+        scanner_mode=source_path,
+        provider=provider_name,
+        dry_run=False,
+        requested_limit=batch_size,
+        scan_date=date.today(),
+        run_started_at=run_start,
+    )
 
     try:
         # Determine symbols to scan
@@ -414,16 +480,44 @@ async def run_scan_batch(
             # Load candidate pool from cache/FMP and pick a random batch
             candidate_pool = await load_candidate_pool(fmp)
             if not candidate_pool:
-                logger.error("No candidates available for scanning")
-                if scan_id:
-                    await event_bus.publish(scan_id, {"type": "error", "error": "No candidates available"})
-                return {
-                    "success": False,
-                    "error": "No candidates available",
+                # Zero candidates is a NORMAL terminal outcome, not a failure:
+                # the scan executed its candidate-loading step and legitimately
+                # found nothing to evaluate. Finalize as completed with zero
+                # counts, no error identity, and an explicit terminal_reason.
+                logger.info("No candidates available for scanning; completing with zero results")
+                telemetry = {
+                    "pattern": pattern_code,
+                    "terminal_reason": "no_candidates",
+                    "total_evaluated": 0,
+                    "scanned": 0,
+                    "entered": 0,
+                    "avoided": 0,
+                    "errors": 0,
+                    "signals_created": 0,
+                    "signals_deduplicated": 0,
+                    "signals_linked": 0,
+                }
+                try:
+                    await finalize_scan_run(
+                        scan_run_id=scan_id, status="completed",
+                        scanned_count=0, enter_count=0, rejected_count=0,
+                        telemetry=telemetry,
+                    )
+                except Exception as finalize_exc:
+                    logger.error(f"Failed to finalize zero-candidate scan run: {finalize_exc}")
+                summary = {
+                    "success": True,
+                    "scan_id": scan_id,
+                    "terminal_reason": "no_candidates",
+                    "telemetry": telemetry,
                     "scanned_count": 0,
                     "enter_count": 0,
-                    "rejected_count": 0
+                    "rejected_count": 0,
+                    "error_count": 0,
                 }
+                if scan_id:
+                    await event_bus.publish(scan_id, {"type": "finished", **summary})
+                return summary
             selected_symbols = select_random_batch(candidate_pool, batch_size)
         
         logger.info(f"Selected {len(selected_symbols)} symbols for scanning: {selected_symbols}")
@@ -448,7 +542,10 @@ async def run_scan_batch(
                     historical_data_batch.get(symbol, {}),
                     pattern_code,
                     ignore_seen=ignore_seen,
-                    config=config
+                    config=config,
+                    scan_run_id=scan_id,
+                    source_path=source_path,
+                    provider_name=provider_name,
                 )
         
         # Create tasks for all symbols
@@ -469,6 +566,8 @@ async def run_scan_batch(
         enter_count = 0
         rejected_count = 0
         error_count = 0
+        signals_created = 0
+        signals_deduplicated = 0
         enter_signals = []
         rejection_reasons: Counter = Counter()
         
@@ -483,6 +582,13 @@ async def run_scan_batch(
                 scanned_count += 1
                 
                 if result["result"]:
+                    # Phase 7B immutable-identity accounting: a repeated exact
+                    # signal is deduplicated, never counted as newly created.
+                    if "signal_created_new" in result["result"]:
+                        if result["result"]["signal_created_new"]:
+                            signals_created += 1
+                        else:
+                            signals_deduplicated += 1
                     if result["result"]["verdict"] == "ENTER":
                         enter_count += 1
                         enter_signals.append({
@@ -525,6 +631,9 @@ async def run_scan_batch(
             "entered": enter_count,
             "avoided": rejected_count,
             "errors": error_count,
+            "signals_created": signals_created,
+            "signals_deduplicated": signals_deduplicated,
+            "signals_linked": signals_created + signals_deduplicated,
             "top_rejection_reasons": dict(rejection_reasons.most_common(10)),
             "config_used": {
                 k: config.get(k)
@@ -537,22 +646,23 @@ async def run_scan_batch(
             "runtime_seconds": round(run_duration, 2),
         }
 
-        # Log pattern run telemetry
+        # Finalize the canonical scan-run row (counts + telemetry + status).
         try:
-            await log_pattern_run(
-                pattern_code=pattern_code,
+            await finalize_scan_run(
+                scan_run_id=scan_id,
+                status="completed",
                 scanned_count=scanned_count,
                 enter_count=enter_count,
                 rejected_count=rejected_count,
-                notes=json.dumps(telemetry),
-                run_started_at=run_start
+                telemetry=telemetry,
             )
         except Exception as e:
-            logger.error(f"Failed to log pattern run: {e}")
+            logger.error(f"Failed to finalize scan run: {e}")
         
         # Summary
         summary = {
             "success": True,
+            "scan_id": scan_id,
             "run_duration_seconds": run_duration,
             "telemetry": telemetry,
             "scanned_count": scanned_count,
@@ -593,10 +703,28 @@ async def run_scan_batch(
     except Exception as e:
         run_duration = (datetime.utcnow() - run_start).total_seconds()
         logger.error(f"Scan batch failed after {run_duration:.1f}s: {e}")
-        
+
+        # HANDLED failure lifecycle: the canonical run row must never stay
+        # 'running' after a handled exception (safe error identity, no
+        # invented telemetry).
+        try:
+            await finalize_scan_run(
+                scan_run_id=scan_id,
+                status="failed",
+                scanned_count=0,
+                enter_count=0,
+                rejected_count=0,
+                telemetry=None,
+                error_code="batch_scan_exception",
+                error_message=str(e),
+            )
+        except Exception as finalize_exc:
+            logger.error(f"Failed to mark scan run as failed: {finalize_exc}")
+
         return {
             "success": False,
             "error": str(e),
+            "scan_id": scan_id,
             "run_duration_seconds": run_duration,
             "scanned_count": 0,
             "enter_count": 0,

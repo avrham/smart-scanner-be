@@ -111,10 +111,20 @@ def build_outcome_from_frames(
     snapshot_date = _as_date(signal.get("snapshot_date"))
     signal_timestamp = signal.get("created_at") or signal.get("snapshot_date")
 
+    # Phase 7B: freeze the exact version identity being evaluated. Legacy
+    # signals without a provenance row keep NULLs (never inferred/faked).
+    prov = signal.get("provenance") or {}
+
     base_record: Dict[str, Any] = {
         "signal_id": signal["signal_id"],
         "symbol": signal["symbol"],
         "pattern_code": signal.get("pattern_code"),
+        "scan_run_id": prov.get("scan_run_id"),
+        "strategy_code": prov.get("strategy_code"),
+        "strategy_version": prov.get("strategy_version"),
+        "decision_policy_version": prov.get("decision_policy_version"),
+        "config_hash": prov.get("config_hash"),
+        "provenance_version": prov.get("provenance_version"),
         "side": side if side in ("LONG", "SHORT") else "LONG",
         "signal_timestamp": signal_timestamp,
         "entry_price": None,

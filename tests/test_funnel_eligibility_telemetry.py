@@ -98,7 +98,8 @@ def test_eligible_null_cap_rejected_as_market_cap_unknown(monkeypatch):
 
     monkeypatch.setattr(funnel, "get_universe_tickers", universe)
     monkeypatch.setattr(funnel, "resolve_pattern_config", cfg)
-    monkeypatch.setattr(funnel, "log_pattern_run", noop)
+    monkeypatch.setattr(funnel, "create_scan_run", noop)
+    monkeypatch.setattr(funnel, "finalize_scan_run", noop)
 
     summary = asyncio.run(
         funnel.run_funnel_scan(fmp=None, pattern_code="sma150_bounce", dry_run=True)
@@ -159,7 +160,8 @@ def _run_named_provider_scan(monkeypatch, provider_name):
 
     monkeypatch.setattr(funnel, "get_universe_tickers", universe)
     monkeypatch.setattr(funnel, "resolve_pattern_config", cfg)
-    monkeypatch.setattr(funnel, "log_pattern_run", noop)
+    monkeypatch.setattr(funnel, "create_scan_run", noop)
+    monkeypatch.setattr(funnel, "finalize_scan_run", noop)
     monkeypatch.setattr(funnel, "was_seen_today", falsey)
     monkeypatch.setattr(funnel, "mark_seen_today", noop)
     monkeypatch.setattr(funnel, "save_signal", noop)
@@ -202,7 +204,8 @@ def test_dry_run_telemetry_reports_no_provider_calls(monkeypatch):
 
     monkeypatch.setattr(funnel, "get_universe_tickers", universe)
     monkeypatch.setattr(funnel, "resolve_pattern_config", cfg)
-    monkeypatch.setattr(funnel, "log_pattern_run", noop)
+    monkeypatch.setattr(funnel, "create_scan_run", noop)
+    monkeypatch.setattr(funnel, "finalize_scan_run", noop)
 
     summary = asyncio.run(
         funnel.run_funnel_scan(fmp=None, pattern_code="sma150_bounce", dry_run=True)
@@ -260,7 +263,8 @@ def test_result_symbol_lists_are_capped(monkeypatch):
 
     monkeypatch.setattr(funnel, "get_universe_tickers", universe)
     monkeypatch.setattr(funnel, "resolve_pattern_config", cfg)
-    monkeypatch.setattr(funnel, "log_pattern_run", noop)
+    monkeypatch.setattr(funnel, "create_scan_run", noop)
+    monkeypatch.setattr(funnel, "finalize_scan_run", noop)
     monkeypatch.setattr(funnel, "was_seen_today", falsey)
     monkeypatch.setattr(funnel, "mark_seen_today", noop)
     monkeypatch.setattr(funnel, "save_signal", noop)

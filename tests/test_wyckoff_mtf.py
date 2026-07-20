@@ -371,7 +371,8 @@ def test_funnel_evaluates_wyckoff_via_registry_watch(monkeypatch):
             {"symbol": "BBB", "market_cap": 4e9, "last_volume": 1e6},
         ]),
     )
-    monkeypatch.setattr(funnel, "log_pattern_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "create_scan_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "finalize_scan_run", _async(None))
     monkeypatch.setattr(funnel, "was_seen_today", _async(False))
     monkeypatch.setattr(funnel, "mark_seen_today", _async(None))
 
@@ -379,7 +380,7 @@ def test_funnel_evaluates_wyckoff_via_registry_watch(monkeypatch):
 
     async def fake_save(**kwargs):
         saved.append(kwargs["symbol"])
-        return "sig-id"
+        return {"signal_id": "sig-id", "created_new_signal": True, "deduplicated": False}
 
     monkeypatch.setattr(funnel, "save_signal", fake_save)
 
@@ -410,7 +411,8 @@ def test_funnel_dry_run_wyckoff_makes_no_fmp_calls(monkeypatch):
         funnel, "get_universe_tickers",
         _async([{"symbol": "AAA", "market_cap": 5e9, "last_volume": 1e6}]),
     )
-    monkeypatch.setattr(funnel, "log_pattern_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "create_scan_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "finalize_scan_run", _async(None))
 
     class _RaisingFMP:
         async def batch_historical_data(self, *a, **k):

@@ -150,7 +150,7 @@ def _run_watch_scan(monkeypatch, scanner_config=None):
 
     async def fake_save(**kwargs):
         saved.append(kwargs)
-        return "sig-id"
+        return {"signal_id": "sig-id", "created_new_signal": True, "deduplicated": False}
 
     monkeypatch.setattr(funnel, "save_signal", fake_save)
     fake = _FakeFMP({"AAA": _daily_payload(_wyckoff_daily())})
@@ -202,7 +202,7 @@ def test_rejects_not_persisted_by_default(monkeypatch):
 
     async def fake_save(**kwargs):
         saved.append(kwargs)
-        return "sig-id"
+        return {"signal_id": "sig-id", "created_new_signal": True, "deduplicated": False}
 
     monkeypatch.setattr(funnel, "save_signal", fake_save)
     fake = _FakeFMP({"FLAT": _daily_payload(_flat_daily())})
@@ -222,7 +222,7 @@ def test_enter_signal_also_gets_decision_card(monkeypatch):
 
     async def fake_save(**kwargs):
         saved.append(kwargs)
-        return "sig-id"
+        return {"signal_id": "sig-id", "created_new_signal": True, "deduplicated": False}
 
     monkeypatch.setattr(funnel, "save_signal", fake_save)
     fake = _FakeFMP(

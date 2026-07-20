@@ -73,59 +73,263 @@ async def save_signal(
     probability: Optional[float] = None,
     reason: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
-    snapshot_date: Optional[date] = None
-) -> str:
+    snapshot_date: Optional[date] = None,
+    provenance: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Persist an IMMUTABLE signal + provenance + scan occurrence link (7B).
+
+    This is the ONLY code path allowed to INSERT INTO signals. Every new
+    signal MUST carry a provenance record (built via
+    app.workers.provenance.build_provenance).
+
+    Identity: a SHA-256 signal_fingerprint (algorithm signal_fingerprint.v1,
+    persisted in signals.signal_fingerprint_version) over the canonical
+    decision inputs (symbol, strategy code+version, decision-policy version,
+    config hash, snapshot date, market-data as-of, verdict, ORIGINAL
+    pre-pruning evidence hash, sorted external observation ids — NO
+    scan_run_id). Semantics:
+
+      * new fingerprint  -> INSERT signal + provenance (origin scan) + link
+      * known fingerprint-> reuse the existing signal_id; evidence, provenance
+        and the ORIGIN scan_run_id are NEVER overwritten; only a new
+        scan_run_signals occurrence link is added
+      * all writes share ONE transaction (all or nothing)
+
+    Returns {"signal_id", "created_new_signal", "deduplicated",
+    "signal_fingerprint", "signal_fingerprint_version"}.
     """
-    Save a signal to the database
-    Returns the signal ID
-    """
+    if not provenance:
+        raise ValueError(
+            "save_signal requires a provenance record (Phase 7B); "
+            "build it with app.workers.provenance.build_provenance"
+        )
+
+    from app.workers.provenance import (
+        MAX_EVIDENCE_BYTES,
+        SIGNAL_FINGERPRINT_VERSION,
+        EvidenceTooLargeError,
+        canonical_json,
+        compute_signal_fingerprint,
+    )
+
+    if snapshot_date is None:
+        snapshot_date = date.today()
+
+    evidence_snapshot = provenance["evidence_snapshot"]
+    # Defensive re-check: an evidence snapshot above the bound must never be
+    # persisted, whatever path produced it.
+    if len(canonical_json(evidence_snapshot).encode("utf-8")) > MAX_EVIDENCE_BYTES:
+        raise EvidenceTooLargeError(
+            f"evidence snapshot exceeds {MAX_EVIDENCE_BYTES} bytes; "
+            "refusing to persist signal"
+        )
+
+    # Identity hashes the ORIGINAL (pre-pruning) evidence: decisions that
+    # differ only in optional evidence later pruned for size must still be
+    # distinct immutable signals.
+    fingerprint = compute_signal_fingerprint(
+        symbol=symbol,
+        strategy_code=provenance["strategy_code"],
+        strategy_version=provenance["strategy_version"],
+        decision_policy_version=provenance["decision_policy_version"],
+        config_hash_value=provenance["config_hash"],
+        snapshot_date=snapshot_date,
+        market_data_as_of=provenance.get("market_data_as_of"),
+        verdict=verdict,
+        evidence_original_sha256=provenance["evidence_original_sha256"],
+        external_observation_ids=provenance.get("external_observation_ids"),
+    )
+    fingerprint_version = SIGNAL_FINGERPRINT_VERSION
+
     conn = await get_db_connection()
-    
+
     try:
-        if snapshot_date is None:
-            snapshot_date = date.today()
-        
         signal_id = uuid.uuid4()
-        
-        query = """
+
+        insert_query = """
             INSERT INTO signals (
                 id, symbol, pattern_code, verdict, probability, score, 
-                reason, details, snapshot_date, created_at
+                reason, details, snapshot_date, created_at,
+                signal_fingerprint, signal_fingerprint_version
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT (symbol, pattern_code, snapshot_date) 
-            DO UPDATE SET
-                verdict = EXCLUDED.verdict,
-                probability = EXCLUDED.probability,
-                score = EXCLUDED.score,
-                reason = EXCLUDED.reason,
-                details = EXCLUDED.details,
-                created_at = EXCLUDED.created_at
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (signal_fingerprint, signal_fingerprint_version)
+                WHERE signal_fingerprint IS NOT NULL
+            DO NOTHING
             RETURNING id
         """
-        
-        result = await conn.fetchrow(
-            query,
-            signal_id,
-            symbol,
-            pattern_code,
-            verdict,
-            probability,
-            score,
-            reason,
-            json.dumps(serialize_for_json(details)) if details else None,
-            snapshot_date,
-            datetime.utcnow()
+
+        async with conn.transaction():
+            result = await conn.fetchrow(
+                insert_query,
+                signal_id,
+                symbol,
+                pattern_code,
+                verdict,
+                probability,
+                score,
+                reason,
+                json.dumps(serialize_for_json(details)) if details else None,
+                snapshot_date,
+                datetime.utcnow(),
+                fingerprint,
+                fingerprint_version,
+            )
+
+            if result is not None:
+                # Brand-new immutable signal: write its origin provenance.
+                saved_id = result["id"]
+                created_new = True
+                await _insert_signal_provenance(conn, saved_id, provenance)
+            else:
+                # Exact repeated fingerprint: reuse the immutable signal.
+                # Nothing about it (row, evidence, provenance, origin scan)
+                # is modified — only an occurrence link is added below.
+                saved_id = await _existing_signal_for_fingerprint(
+                    conn, fingerprint, fingerprint_version, provenance
+                )
+                created_new = False
+
+            await _link_scan_occurrence(conn, saved_id, provenance, created_new)
+
+        logger.info(
+            "Saved %s signal for %s (%s) created_new=%s",
+            verdict, symbol, pattern_code, created_new,
         )
-        
-        logger.info(f"Saved {verdict} signal for {symbol} ({pattern_code})")
-        return str(result["id"] if result else signal_id)
-        
+        return {
+            "signal_id": str(saved_id),
+            "created_new_signal": created_new,
+            "deduplicated": not created_new,
+            "signal_fingerprint": fingerprint,
+            "signal_fingerprint_version": fingerprint_version,
+        }
+
     except Exception as e:
         logger.error(f"Failed to save signal for {symbol}: {e}")
         raise
     finally:
         await release_db_connection(conn)
+
+
+async def _existing_signal_for_fingerprint(
+    conn: asyncpg.Connection,
+    fingerprint: str,
+    fingerprint_version: str,
+    provenance: Dict[str, Any],
+) -> Any:
+    """Resolve the existing signal for a repeated fingerprint.
+
+    Deduplication compares BOTH the fingerprint and its algorithm version:
+    a v1 identity can never be satisfied by a hypothetical v2 row. Also
+    verifies the persisted provenance identity is compatible with the new
+    detection instead of silently replacing anything (the fingerprint already
+    encodes these values, so a mismatch means data corruption or a hash
+    collision — refuse to proceed).
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT s.id, sp.strategy_code, sp.strategy_version,
+               sp.decision_policy_version, sp.config_hash
+        FROM signals s
+        LEFT JOIN signal_provenance sp ON sp.signal_id = s.id
+        WHERE s.signal_fingerprint = $1
+          AND s.signal_fingerprint_version = $2
+        """,
+        fingerprint,
+        fingerprint_version,
+    )
+    if row is None:
+        raise RuntimeError(
+            f"signal fingerprint conflict but no existing row found "
+            f"({fingerprint[:12]}...)"
+        )
+    if row["strategy_code"] is not None:  # provenance row present
+        for field in ("strategy_code", "strategy_version",
+                      "decision_policy_version", "config_hash"):
+            if row[field] != provenance[field]:
+                raise ValueError(
+                    f"fingerprint reuse with incompatible provenance "
+                    f"({field}: stored={row[field]!r} new={provenance[field]!r}); "
+                    "refusing to overwrite immutable provenance"
+                )
+    return row["id"]
+
+
+async def _insert_signal_provenance(
+    conn: asyncpg.Connection,
+    signal_id: Any,
+    provenance: Dict[str, Any],
+) -> None:
+    """Insert the 1:1 ORIGIN provenance row for a NEW signal (same transaction
+    as the signal write — never call outside save_signal's transaction block).
+
+    Plain INSERT by design: provenance records the origin evaluation and is
+    never overwritten by later scans (immutability guarantee).
+    """
+    scan_run_id = provenance.get("scan_run_id")
+    await conn.execute(
+        """
+        INSERT INTO signal_provenance (
+            signal_id, scan_run_id, source_path, scanner_mode, provider,
+            strategy_code, strategy_version, decision_policy_version,
+            provenance_version, config_hash, config_snapshot,
+            market_data_as_of, evidence_snapshot,
+            evidence_original_sha256, evidence_original_size_bytes,
+            evidence_pruned, evidence_pruned_keys,
+            external_observation_ids, created_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, $18, NOW())
+        """,
+        signal_id,
+        uuid.UUID(str(scan_run_id)) if scan_run_id else None,
+        provenance["source_path"],
+        provenance.get("scanner_mode"),
+        provenance.get("provider"),
+        provenance["strategy_code"],
+        provenance["strategy_version"],
+        provenance["decision_policy_version"],
+        provenance["provenance_version"],
+        provenance["config_hash"],
+        json.dumps(serialize_for_json(provenance["config_snapshot"])),
+        provenance.get("market_data_as_of"),
+        json.dumps(serialize_for_json(provenance["evidence_snapshot"])),
+        provenance.get("evidence_original_sha256"),
+        provenance.get("evidence_original_size_bytes"),
+        bool(provenance.get("evidence_pruned", False)),
+        json.dumps(provenance.get("evidence_pruned_keys") or []),
+        json.dumps(provenance.get("external_observation_ids") or []),
+    )
+
+
+async def _link_scan_occurrence(
+    conn: asyncpg.Connection,
+    signal_id: Any,
+    provenance: Dict[str, Any],
+    created_new: bool,
+) -> None:
+    """Record that THIS scan detected the signal (origin or re-detection).
+
+    scan_run_signals is the occurrence ledger; provenance.scan_run_id stays
+    the origin. Signals persisted outside a scan context (documented 'manual'
+    source path) have no scan_run_id and get no link.
+    """
+    scan_run_id = provenance.get("scan_run_id")
+    if not scan_run_id:
+        return
+    await conn.execute(
+        """
+        INSERT INTO scan_run_signals (
+            scan_run_id, signal_id, source_path, created_new_signal, linked_at
+        )
+        VALUES ($1, $2, $3, $4, NOW())
+        ON CONFLICT (scan_run_id, signal_id) DO NOTHING
+        """,
+        uuid.UUID(str(scan_run_id)),
+        signal_id,
+        provenance["source_path"],
+        created_new,
+    )
 
 
 async def was_seen_today(symbol: str, check_date: date = None) -> bool:

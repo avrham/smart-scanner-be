@@ -51,11 +51,18 @@ async def get_signals_needing_outcomes(
             where.append(f"s.pattern_code = ${len(params)}")
 
         params.append(limit)
+        # Phase 7B: LEFT JOIN provenance so new outcomes can FREEZE the exact
+        # signal version they evaluate. Legacy signals have no provenance row
+        # -> these fields stay None and the outcome keeps NULL provenance.
         query = f"""
             SELECT s.id, s.symbol, s.pattern_code, s.snapshot_date,
-                   s.created_at, s.details
+                   s.created_at, s.details,
+                   sp.scan_run_id, sp.strategy_code, sp.strategy_version,
+                   sp.decision_policy_version, sp.config_hash,
+                   sp.provenance_version
             FROM signals s
             LEFT JOIN signal_outcomes o ON o.signal_id = s.id
+            LEFT JOIN signal_provenance sp ON sp.signal_id = s.id
             WHERE {' AND '.join(where)}
             ORDER BY s.snapshot_date ASC
             LIMIT ${len(params)}
@@ -77,6 +84,14 @@ async def get_signals_needing_outcomes(
                     "snapshot_date": r["snapshot_date"],
                     "created_at": r["created_at"],
                     "details": details or {},
+                    "provenance": {
+                        "scan_run_id": str(r["scan_run_id"]) if r["scan_run_id"] else None,
+                        "strategy_code": r["strategy_code"],
+                        "strategy_version": r["strategy_version"],
+                        "decision_policy_version": r["decision_policy_version"],
+                        "config_hash": r["config_hash"],
+                        "provenance_version": r["provenance_version"],
+                    },
                 }
             )
         return result
@@ -105,6 +120,9 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
         now = datetime.utcnow()
         row_id = uuid.uuid4()
 
+        # Phase 7B: outcome provenance columns freeze the signal version being
+        # evaluated (NULL for legacy signals without provenance — never faked).
+        scan_run_id = outcome.get("scan_run_id")
         query = """
             INSERT INTO signal_outcomes (
                 id, signal_id, symbol, pattern_code, side, signal_timestamp,
@@ -113,7 +131,9 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
                 benchmark_returns, same_ticker_buy_hold,
                 max_favorable_excursion, max_adverse_excursion,
                 hit_stop, hit_target, simulated_r,
-                outcome_status, calculation_version, created_at, updated_at
+                outcome_status, calculation_version, created_at, updated_at,
+                scan_run_id, strategy_code, strategy_version,
+                decision_policy_version, config_hash, provenance_version
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6,
@@ -122,7 +142,8 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
                 $16, $17,
                 $18, $19,
                 $20, $21, $22,
-                $23, $24, $25, $26
+                $23, $24, $25, $26,
+                $27, $28, $29, $30, $31, $32
             )
             ON CONFLICT (signal_id) DO UPDATE SET
                 symbol = EXCLUDED.symbol,
@@ -147,7 +168,13 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
                 simulated_r = EXCLUDED.simulated_r,
                 outcome_status = EXCLUDED.outcome_status,
                 calculation_version = EXCLUDED.calculation_version,
-                updated_at = EXCLUDED.updated_at
+                updated_at = EXCLUDED.updated_at,
+                scan_run_id = EXCLUDED.scan_run_id,
+                strategy_code = EXCLUDED.strategy_code,
+                strategy_version = EXCLUDED.strategy_version,
+                decision_policy_version = EXCLUDED.decision_policy_version,
+                config_hash = EXCLUDED.config_hash,
+                provenance_version = EXCLUDED.provenance_version
             RETURNING id
         """
 
@@ -190,6 +217,12 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
             outcome.get("calculation_version", "outcome.v1"),
             now,
             now,
+            uuid.UUID(str(scan_run_id)) if scan_run_id else None,
+            outcome.get("strategy_code"),
+            outcome.get("strategy_version"),
+            outcome.get("decision_policy_version"),
+            outcome.get("config_hash"),
+            outcome.get("provenance_version"),
         )
         return str(result["id"])
     except Exception as exc:
@@ -248,6 +281,13 @@ def _row_to_dict(row) -> Dict[str, Any]:
         "simulated_r": _num(row["simulated_r"]),
         "outcome_status": row["outcome_status"],
         "calculation_version": row["calculation_version"],
+        # Phase 7B provenance columns (NULL for legacy outcomes — never faked).
+        "scan_run_id": str(row["scan_run_id"]) if row["scan_run_id"] else None,
+        "strategy_code": row["strategy_code"],
+        "strategy_version": row["strategy_version"],
+        "decision_policy_version": row["decision_policy_version"],
+        "config_hash": row["config_hash"],
+        "provenance_version": row["provenance_version"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -283,7 +323,9 @@ async def fetch_outcomes(
                    benchmark_returns, same_ticker_buy_hold,
                    max_favorable_excursion, max_adverse_excursion,
                    hit_stop, hit_target, simulated_r,
-                   outcome_status, calculation_version, created_at, updated_at
+                   outcome_status, calculation_version, created_at, updated_at,
+                   scan_run_id, strategy_code, strategy_version,
+                   decision_policy_version, config_hash, provenance_version
             FROM signal_outcomes
             {('WHERE ' + ' AND '.join(where)) if where else ''}
             ORDER BY signal_timestamp DESC

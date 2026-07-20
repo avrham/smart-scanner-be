@@ -130,7 +130,8 @@ def _async(value):
 def _patch_db(monkeypatch, universe, config):
     monkeypatch.setattr(funnel, "resolve_pattern_config", _async(config))
     monkeypatch.setattr(funnel, "get_universe_tickers", _async(universe))
-    monkeypatch.setattr(funnel, "log_pattern_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "create_scan_run", _async("run-id"))
+    monkeypatch.setattr(funnel, "finalize_scan_run", _async(None))
     monkeypatch.setattr(funnel, "was_seen_today", _async(False))
     monkeypatch.setattr(funnel, "mark_seen_today", _async(None))
 
@@ -210,7 +211,7 @@ def test_dry_run_never_fetches_4h_even_when_enabled(monkeypatch):
 def test_disabled_expensive_stages_no_4h_fetch(monkeypatch):
     cfg = WyckoffMTFStrategy().default_config()  # enable_4h_trigger False
     _patch_db(monkeypatch, [{"symbol": "AAA", **_TICKER}], cfg)
-    monkeypatch.setattr(funnel, "save_signal", _async("id"))
+    monkeypatch.setattr(funnel, "save_signal", _async({"signal_id": "id", "created_new_signal": True, "deduplicated": False}))
 
     fake = _FakeFMP({"AAA": _daily_payload(_wyckoff_daily())}, payload_4h=_4h_bars_newest_first())
     summary = asyncio.run(
@@ -236,7 +237,7 @@ def test_4h_converts_watch_to_enter_for_survivors_only(monkeypatch):
 
     async def fake_save(**kwargs):
         saved.append(kwargs)
-        return "sig-id"
+        return {"signal_id": "sig-id", "created_new_signal": True, "deduplicated": False}
 
     monkeypatch.setattr(funnel, "save_signal", fake_save)
 
@@ -274,7 +275,7 @@ def test_4h_converts_watch_to_enter_for_survivors_only(monkeypatch):
 def test_4h_unavailable_keeps_watch(monkeypatch):
     cfg = WyckoffMTFStrategy().default_config()
     _patch_db(monkeypatch, [{"symbol": "AAA", **_TICKER}], cfg)
-    monkeypatch.setattr(funnel, "save_signal", _async("id"))
+    monkeypatch.setattr(funnel, "save_signal", _async({"signal_id": "id", "created_new_signal": True, "deduplicated": False}))
 
     fake = _FakeFMP({"AAA": _daily_payload(_wyckoff_daily())}, payload_4h=None)
     summary = asyncio.run(
@@ -297,7 +298,7 @@ def test_no_4h_fetch_for_sma150(monkeypatch):
 
     cfg = Sma150BounceStrategy().default_config()
     _patch_db(monkeypatch, [{"symbol": "AAA", **_TICKER}], cfg)
-    monkeypatch.setattr(funnel, "save_signal", _async("id"))
+    monkeypatch.setattr(funnel, "save_signal", _async({"signal_id": "id", "created_new_signal": True, "deduplicated": False}))
 
     # 250 flat daily bars pass sma150's prefilter; verdict will be AVOID.
     dates = pd.date_range("2022-01-01", periods=250, freq="B")
@@ -320,7 +321,7 @@ def test_limit_bounds_4h_fetches(monkeypatch):
     cfg = WyckoffMTFStrategy().default_config()
     universe = [{"symbol": f"S{i}", **_TICKER} for i in range(3)]
     _patch_db(monkeypatch, universe, cfg)
-    monkeypatch.setattr(funnel, "save_signal", _async("id"))
+    monkeypatch.setattr(funnel, "save_signal", _async({"signal_id": "id", "created_new_signal": True, "deduplicated": False}))
 
     payload = _daily_payload(_wyckoff_daily())
     fake = _FakeFMP({t["symbol"]: payload for t in universe}, payload_4h=_4h_bars_newest_first())

@@ -28,11 +28,14 @@ async def scheduled_scan_job():
         # Use the configured MarketDataProvider (massive default, fmp fallback).
         provider = get_market_data_provider()
         
-        # Run scan batch
+        # Run scan batch. Phase 7B: scheduled scans get their own canonical
+        # scan-run identity (generated inside run_scan_batch) and their signals
+        # carry source_path='scheduled' provenance.
         result = await run_scan_batch(
             fmp=provider,
             batch_size=settings.SCAN_BATCH_SIZE,
-            pattern_code="sma150_bounce"
+            pattern_code="sma150_bounce",
+            source_path="scheduled",
         )
         
         if result["success"]:
