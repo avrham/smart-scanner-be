@@ -58,6 +58,10 @@ from app.workers.shadow.persistence import (
     finalize_shadow_run,
     persist_shadow_pair,
 )
+from app.workers.shadow.serialization import (
+    ShadowSerializationError,
+    normalize_json_safe,
+)
 from app.workers.strategies import StrategyContext, get_strategy
 
 
@@ -104,7 +108,10 @@ async def _resolve_arm(pattern_code: str, arm_code: str) -> Dict[str, Any]:
     """
     strategy = get_strategy(pattern_code)
     resolved = await resolve_pattern_config(pattern_code, strategy.default_config())
-    snapshot = sanitize_config(resolved)
+    # The persisted config snapshot crosses the same strict JSON boundary as
+    # every other shadow JSONB field. config_hash stays on the existing
+    # provenance path (sanitize + canonical JSON) — hashes are unchanged.
+    snapshot = normalize_json_safe(sanitize_config(resolved))
     return {
         "arm_code": arm_code,
         "strategy": strategy,
@@ -118,16 +125,23 @@ async def _resolve_arm(pattern_code: str, arm_code: str) -> Dict[str, Any]:
 
 
 def _bound_details(details: Dict[str, Any]) -> Dict[str, Any]:
-    """Bounded, deterministic details snapshot for one evaluation.
+    """Bounded, deterministic, JSON-SAFE details snapshot for one evaluation.
+
+    Order is load-bearing: raw strategy details are first normalized through
+    the strict shadow JSON boundary (pandas.Timestamp bounce dates become ISO
+    strings, numpy scalars become Python numbers, unsupported objects raise
+    ShadowSerializationError). The canonical original hash, the bounded
+    snapshot AND the evaluation fingerprint all derive from that SAME
+    normalized value — we never hash one representation and persist another.
 
     Returns {"snapshot", "original_sha256"}. Within bound: the snapshot is
-    the details verbatim. Over bound: optional keys are pruned via the
-    Phase 7B deterministic pruner (mandatory decision inputs survive) and a
-    reproducible `_snapshot_meta` records the original hash/size and pruned
+    the normalized details verbatim. Over bound: optional keys are pruned via
+    the Phase 7B deterministic pruner (mandatory decision inputs survive) and
+    a reproducible `_snapshot_meta` records the original hash/size and pruned
     keys. If mandatory content alone exceeds the bound, EvidenceTooLargeError
     propagates and the caller rejects the symbol's pair.
     """
-    details = details or {}
+    details = normalize_json_safe(details or {})
     original_json = canonical_json(details)
     original_sha = _sha256(original_json)
     if len(original_json.encode("utf-8")) <= MAX_DETAILS_SNAPSHOT_BYTES:
@@ -354,6 +368,18 @@ async def run_shadow_comparison(
                 persisted = await persist_shadow_pair(
                     run_id=run_id, pair=pair_record, evaluations=evaluations
                 )
+            except ShadowSerializationError as exc:
+                # Deterministic bounded rejection: the exception text carries
+                # only a machine-readable reason code and a key/index path —
+                # never the offending object's repr or a raw payload.
+                logger.warning(
+                    "Shadow details not JSON-safe for %s: %s", symbol, exc
+                )
+                rejected["details_not_json_safe"] += 1
+                rejected_symbols.setdefault(
+                    "details_not_json_safe", []
+                ).append(symbol)
+                continue
             except EvidenceTooLargeError:
                 rejected["details_snapshot_too_large"] += 1
                 rejected_symbols.setdefault(

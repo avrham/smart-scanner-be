@@ -29,6 +29,7 @@ from app.workers.shadow.constants import (
     MAX_TELEMETRY_BYTES,
 )
 from app.workers.shadow.fingerprints import disagreement_category
+from app.workers.shadow.serialization import normalize_json_safe, strict_json
 
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,16 @@ class ShadowIntegrityError(RuntimeError):
 
 
 def _bounded_telemetry(telemetry: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Serialize telemetry, deterministically dropping list payloads if the
-    bound is exceeded (scalar counts always survive)."""
+    """Serialize telemetry strictly, deterministically dropping list payloads
+    if the bound is exceeded (scalar counts always survive).
+
+    Telemetry crosses the same explicit normalization boundary as every other
+    shadow JSONB field: no default=str fallback that could silently stringify
+    an unexpected object into the frozen row."""
     if telemetry is None:
         return None
-    text = json.dumps(telemetry, default=str)
+    telemetry = normalize_json_safe(telemetry)
+    text = strict_json(telemetry)
     if len(text.encode("utf-8")) <= MAX_TELEMETRY_BYTES:
         return text
     scalars = {
@@ -51,7 +57,7 @@ def _bounded_telemetry(telemetry: Optional[Dict[str, Any]]) -> Optional[str]:
         if isinstance(v, (int, float, str, bool)) or v is None
     }
     scalars["telemetry_truncated"] = True
-    return json.dumps(scalars, default=str)
+    return strict_json(scalars)
 
 
 async def create_shadow_run(
@@ -81,7 +87,7 @@ async def create_shadow_run(
             EXPERIMENT_CODE,
             EXPERIMENT_VERSION,
             provider,
-            json.dumps(list(requested_symbols)),
+            strict_json([str(s) for s in requested_symbols]),
             requested_limit,
         )
         return str(run_id)
@@ -191,7 +197,7 @@ async def persist_shadow_pair(
                     pair["frame_bar_count"],
                     pair["frame_first_date"],
                     pair["frame_last_date"],
-                    json.dumps(pair["frame_snapshot"]),
+                    strict_json(pair["frame_snapshot"]),
                     pair["pair_fingerprint"],
                     pair["pair_fingerprint_version"],
                 )
@@ -216,12 +222,12 @@ async def persist_shadow_pair(
                         ev["strategy_version"],
                         ev["decision_policy_version"],
                         ev["config_hash"],
-                        json.dumps(ev["config_snapshot"]),
+                        strict_json(ev["config_snapshot"]),
                         ev["verdict"],
                         ev["score"],
                         ev["reason"],
                         ev["rejection_reason"],
-                        json.dumps(ev["details_snapshot"]),
+                        strict_json(ev["details_snapshot"]),
                         ev["evidence_original_sha256"],
                         ev["evaluation_fingerprint"],
                         ev["evaluation_fingerprint_version"],

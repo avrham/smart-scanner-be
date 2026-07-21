@@ -23,6 +23,11 @@ from app.workers.shadow.fingerprints import (
     disagreement_category,
 )
 from app.workers.shadow.runner import run_shadow_comparison
+from app.workers.shadow.serialization import (
+    ShadowSerializationError,
+    normalize_json_safe,
+    strict_json,
+)
 
 __all__ = [
     "CANDIDATE_ARM_CODE",
@@ -34,7 +39,10 @@ __all__ = [
     "FrameRejection",
     "MAX_SHADOW_SYMBOLS",
     "PAIR_FINGERPRINT_VERSION",
+    "ShadowSerializationError",
     "build_canonical_frame",
+    "normalize_json_safe",
+    "strict_json",
     "compute_evaluation_fingerprint",
     "compute_pair_fingerprint",
     "disagreement_category",
