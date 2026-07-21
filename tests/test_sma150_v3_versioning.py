@@ -326,8 +326,13 @@ class TestMigration008:
             assert f"'{key}'" in sql, key
             assert key in V3_DEFAULT_CONFIG
 
-    def test_no_migration_009_created(self):
-        assert not list(MIGRATIONS.glob("009_*"))
+    def test_phase8_created_no_migration_beyond_008(self):
+        """Phase 8 itself added only 008. Migration 009 is the separate
+        Phase 8.1A outcome-coverage migration; nothing beyond it exists."""
+        assert [p.name for p in MIGRATIONS.glob("009_*")] in (
+            [], ["009_watch_outcome_coverage.sql"]
+        )
+        assert not list(MIGRATIONS.glob("010_*"))
 
     def test_v3_defaults_copy_is_isolated(self):
         """default_config() returns an independent copy (mutation-safe)."""

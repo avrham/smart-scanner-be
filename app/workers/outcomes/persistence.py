@@ -28,14 +28,19 @@ async def get_signals_needing_outcomes(
     pattern_code: Optional[str] = None,
     include_recalc: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Return ENTER signals that have no calculated outcome yet.
+    """Return persisted ENTER and WATCH signals with no calculated outcome yet.
+
+    Phase 8.1A: WATCH joins outcome coverage. Eligibility reads ONLY the
+    immutable signals table, so a WATCH that was evaluated but never persisted
+    can never receive an outcome, and no verdict is ever inferred. AVOID stays
+    excluded (Phase 8.1B shadow evaluations will cover it separately).
 
     When include_recalc is True, also returns signals whose existing outcome is
     in a non-terminal/failed state ('pending', 'error', 'insufficient_data').
     """
     conn = await get_db_connection()
     try:
-        where = ["s.verdict = 'ENTER'"]
+        where = ["s.verdict IN ('ENTER', 'WATCH')"]
         params: List[Any] = []
 
         if include_recalc:
@@ -55,7 +60,7 @@ async def get_signals_needing_outcomes(
         # signal version they evaluate. Legacy signals have no provenance row
         # -> these fields stay None and the outcome keeps NULL provenance.
         query = f"""
-            SELECT s.id, s.symbol, s.pattern_code, s.snapshot_date,
+            SELECT s.id, s.symbol, s.pattern_code, s.verdict, s.snapshot_date,
                    s.created_at, s.details,
                    sp.scan_run_id, sp.strategy_code, sp.strategy_version,
                    sp.decision_policy_version, sp.config_hash,
@@ -81,6 +86,7 @@ async def get_signals_needing_outcomes(
                     "signal_id": str(r["id"]),
                     "symbol": r["symbol"],
                     "pattern_code": r["pattern_code"],
+                    "verdict": r["verdict"],
                     "snapshot_date": r["snapshot_date"],
                     "created_at": r["created_at"],
                     "details": details or {},
@@ -133,7 +139,8 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
                 hit_stop, hit_target, simulated_r,
                 outcome_status, calculation_version, created_at, updated_at,
                 scan_run_id, strategy_code, strategy_version,
-                decision_policy_version, config_hash, provenance_version
+                decision_policy_version, config_hash, provenance_version,
+                signal_verdict, reference_price_role, outcome_coverage_version
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6,
@@ -143,7 +150,8 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
                 $18, $19,
                 $20, $21, $22,
                 $23, $24, $25, $26,
-                $27, $28, $29, $30, $31, $32
+                $27, $28, $29, $30, $31, $32,
+                $33, $34, $35
             )
             ON CONFLICT (signal_id) DO UPDATE SET
                 symbol = EXCLUDED.symbol,
@@ -174,7 +182,10 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
                 strategy_version = EXCLUDED.strategy_version,
                 decision_policy_version = EXCLUDED.decision_policy_version,
                 config_hash = EXCLUDED.config_hash,
-                provenance_version = EXCLUDED.provenance_version
+                provenance_version = EXCLUDED.provenance_version,
+                signal_verdict = EXCLUDED.signal_verdict,
+                reference_price_role = EXCLUDED.reference_price_role,
+                outcome_coverage_version = EXCLUDED.outcome_coverage_version
             RETURNING id
         """
 
@@ -223,6 +234,9 @@ async def upsert_signal_outcome(outcome: Dict[str, Any]) -> str:
             outcome.get("decision_policy_version"),
             outcome.get("config_hash"),
             outcome.get("provenance_version"),
+            outcome.get("signal_verdict"),
+            outcome.get("reference_price_role"),
+            outcome.get("outcome_coverage_version"),
         )
         return str(result["id"])
     except Exception as exc:
@@ -288,6 +302,10 @@ def _row_to_dict(row) -> Dict[str, Any]:
         "decision_policy_version": row["decision_policy_version"],
         "config_hash": row["config_hash"],
         "provenance_version": row["provenance_version"],
+        # Phase 8.1A coverage identity (NULL only on legacy pre-009 rows).
+        "signal_verdict": row["signal_verdict"],
+        "reference_price_role": row["reference_price_role"],
+        "outcome_coverage_version": row["outcome_coverage_version"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -298,9 +316,25 @@ async def fetch_outcomes(
     symbol: Optional[str] = None,
     side: Optional[str] = None,
     status: Optional[str] = None,
+    verdict: Optional[str] = None,
+    strategy_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    outcome_coverage_version: Optional[str] = None,
+    reference_price_role: Optional[str] = None,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
-    """Fetch outcome rows with optional filters (for the read API + metrics)."""
+    """Fetch outcome rows with optional AND-composed filters (API + metrics).
+
+    verdict semantics (Phase 8.1A):
+      * 'ENTER'  -> ENTER rows PLUS legacy NULL-verdict rows. Legacy rows
+        (created before migration 009's backfill) can only be ENTER because
+        the Phase 2 worker selected exclusively ENTER signals — this keeps the
+        pre-8.1A effective behavior for existing consumers.
+      * 'WATCH'  -> strictly signal_verdict = 'WATCH'.
+      * 'ALL'/None -> no verdict filter.
+    """
     conn = await get_db_connection()
     try:
         where: List[str] = []
@@ -310,10 +344,25 @@ async def fetch_outcomes(
             ("symbol", symbol),
             ("side", side),
             ("outcome_status", status),
+            ("strategy_code", strategy_code),
+            ("strategy_version", strategy_version),
+            ("decision_policy_version", decision_policy_version),
+            ("config_hash", config_hash),
+            ("outcome_coverage_version", outcome_coverage_version),
+            ("reference_price_role", reference_price_role),
         ):
             if val is not None:
                 params.append(val)
                 where.append(f"{col} = ${len(params)}")
+
+        if verdict is not None and verdict != "ALL":
+            if verdict == "ENTER":
+                where.append(
+                    "(signal_verdict = 'ENTER' OR signal_verdict IS NULL)"
+                )
+            else:
+                params.append(verdict)
+                where.append(f"signal_verdict = ${len(params)}")
 
         params.append(limit)
         query = f"""
@@ -325,7 +374,8 @@ async def fetch_outcomes(
                    hit_stop, hit_target, simulated_r,
                    outcome_status, calculation_version, created_at, updated_at,
                    scan_run_id, strategy_code, strategy_version,
-                   decision_policy_version, config_hash, provenance_version
+                   decision_policy_version, config_hash, provenance_version,
+                   signal_verdict, reference_price_role, outcome_coverage_version
             FROM signal_outcomes
             {('WHERE ' + ' AND '.join(where)) if where else ''}
             ORDER BY signal_timestamp DESC

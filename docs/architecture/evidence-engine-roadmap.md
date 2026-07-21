@@ -119,7 +119,9 @@ documents, this section is authoritative.
   MFE/MAE, stop/target hits, `calculation_version='outcome.v1'`), pure
   calculator + baselines (same-ticker buy-hold, SPY, QQQ), aggregation
   metrics, `/api/outcomes*` endpoints, admin-triggered calculation only.
-  Outcomes are computed for ENTER only; WATCH is excluded.
+  **Updated in 8.1A:** outcomes cover persisted ENTER **and** WATCH signals
+  (migration 009, `outcome_coverage_version='candidate_outcomes.v1'`); WATCH
+  outcomes are candidate observations, not trades; AVOID stays excluded.
 - **Admin API** — `/api/admin/scan/start` (legacy + funnel + dry-run),
   `/tickers/refresh`, `/universe/sync`, `/market/daily-sync`,
   `/universe/enrich` (pre-7A: non-durable), `/outcomes/calculate`,
@@ -147,6 +149,7 @@ documents, this section is authoritative.
 | sma150 v3 strategy (8) | `strategies/sma150_v3.py::STRATEGY_VERSION` | `sma150.v3` |
 | sma150 v3 policy (8) | `signal_provenance.decision_policy_version` | `sma150_bounce.policy.v1` |
 | sma150 v3 ranking (8) | `details.ranking.ranking_version` | `sma150.v3.rank.v1` |
+| Outcome coverage (8.1A) | `signal_outcomes.outcome_coverage_version` | `candidate_outcomes.v1` |
 
 These remain SEPARATE identities by design: strategy version ≠ decision-card
 version ≠ outcome-calculation version ≠ decision-policy version ≠
@@ -502,16 +505,14 @@ reordered: bounce events stay chronological, declared timeframe sequences
 keep their order, trigger conditions keep their documented order, and
 ranking components are stable named keys.
 
-**Outcome coverage (honest current state)** — the outcome service selects
-`verdict = 'ENTER'` only (`get_signals_needing_outcomes`). Therefore:
-sma150.v3 **ENTER** signals flow through `outcome.v1` unchanged; **WATCH**
-signals are persisted with full immutable provenance but do **not** yet
-receive outcome rows. This means trigger false negatives (WATCH candidates
-that would have performed) and the value of waiting are currently
-unmeasured. Phase 8.1 adds outcome tracking for both ENTER and WATCH before
-any strategy-effectiveness conclusion is drawn. **No claim about v3
-effectiveness can be made until enough frozen outcomes exist for both
-verdicts.**
+**Outcome coverage (honest current state)** — as of Phase 8.1A the outcome
+service selects persisted `ENTER` **and** `WATCH` signals
+(`get_signals_needing_outcomes`); AVOID remains outside regular outcome
+coverage (Phase 8.1B shadow evaluations will cover paired AVOID decisions).
+sma150.v3 ENTER signals flow through `outcome.v1` unchanged; WATCH signals
+now also receive outcome rows measuring what happened after the candidate
+observation. **No claim about v3 effectiveness can be made until enough
+frozen outcomes exist for both verdicts.**
 
 **Registration/rollout**: migration `008_sma150_v3.sql` (additive,
 idempotent) registers `sma150_bounce_v3` **disabled by default**
@@ -525,21 +526,53 @@ pattern through the registry. v2 and v3 signals for the same symbol/date
 coexist as separate immutable signals (different strategy_version + policy
 ⇒ different fingerprints) with separate outcomes.
 
-### Phase 8.1 — candidate outcome coverage and v2/v3 shadow comparison *(NEXT — not implemented)*
+### Phase 8.1A — candidate outcome coverage for ENTER and WATCH *(COMPLETE)*
 
-Prerequisite for any effectiveness judgement of sma150.v3 (and any later
-strategy version):
+Persisted ENTER **and** WATCH signals now receive outcome coverage
+(`candidate_outcomes.v1`, migration `009_watch_outcome_coverage.sql`):
 
-- outcome rows for **both ENTER and WATCH** signals (WATCH outcomes measure
-  trigger false negatives and the value of waiting);
-- the signal `verdict` preserved on each outcome row;
+- **WATCH outcomes are NOT simulated trades.** A WATCH outcome's frozen
+  reference price is *the market price when the candidate was observed*
+  (`reference_price_role = 'candidate_observation'`), never an executed
+  entry, a recommended entry, a fill, or a later trigger price. No entry is
+  invented after the WATCH date; the reference date never moves forward.
+  ENTER outcomes keep `reference_price_role = 'entry_reference'`.
+- The return math is unchanged and shared: `calculation_version` stays
+  `outcome.v1` (coverage expansion is versioned separately as
+  `outcome_coverage_version = 'candidate_outcomes.v1'`). Incomplete
+  horizons stay `NULL` — never fabricated zeros or losses.
+- Each outcome row copies `signal_verdict` from the immutable signal (never
+  inferred from strategy name, score or return), plus the frozen
+  strategy/policy/config/provenance versions from Phase 7B.
+- Selection reads ONLY the immutable signals table: an evaluated-but-not-
+  persisted WATCH can never receive an outcome; AVOID remains excluded
+  from regular outcome coverage.
+- Metrics separate ENTER and WATCH. Neutral terminology for both
+  (`sample_count`, `completed_count`, `incomplete_count`,
+  `mean/median_return_pct`, `positive_return_rate`, `mean/median` MFE/MAE);
+  `win_rate` is TRADE terminology and is only emitted for samples with no
+  WATCH rows. **WATCH metrics are not trading-performance claims** — they
+  measure whether waiting (a failed confirmation) avoided losses or missed
+  gains.
+- `GET /api/outcomes` defaults to `verdict=ENTER` (existing consumers never
+  silently receive candidate observations); `WATCH` and `ALL` are explicit.
+  Filters AND-compose over strategy_code/version, decision_policy_version,
+  config_hash, coverage version and reference role.
+- **No conclusion about strategy superiority is valid without sufficient
+  samples for both verdicts, and no tuning has been performed.**
+
+### Phase 8.1B — v2/v3 frozen shadow comparison *(NEXT — not implemented)*
+
+Remaining prerequisite for any effectiveness judgement of sma150.v3:
+
+- frozen **paired shadow evaluations** of v2 versus v3 on the same
+  symbols/dates, including **AVOID decisions** (e.g. the live JBL case where
+  v2 said ENTER and v3 said AVOID for insufficient independent bounces) so
+  disagreements are measurable, not just coexisting signals;
 - metrics reported separately by `strategy_version`, `verdict`,
   `decision_policy_version` and `config_hash` — never pooled across
   versions or verdicts;
-- no historical inference and no fabricated provenance: only signals
-  persisted with real provenance get outcomes, from their snapshot forward;
-- v2 versus v3 **shadow comparison** on the frozen outcome data (same
-  symbols/dates where both versions produced signals);
+- no historical inference and no fabricated provenance;
 - **no parameter tuning** — observation only.
 
 ### Phase 9 — deterministic Wyckoff technical engine v2

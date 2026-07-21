@@ -83,7 +83,18 @@ def aggregate_outcomes(
 ) -> Dict[str, Any]:
     """Aggregate a flat list of outcome records for a single holding window.
 
-    Only records with a non-None return for `window` count toward the sample.
+    Only records with a non-None return for `window` count toward the
+    completed sample: incomplete rows (missing future bars) are counted in
+    `incomplete_count` and never pollute the completed-return averages.
+
+    Terminology (Phase 8.1A): the neutral fields (sample_count,
+    completed_count, incomplete_count, mean/median_return_pct,
+    positive_return_rate, mean/median mfe/mae) apply to BOTH ENTER and WATCH
+    outcomes. `win_rate` is TRADE terminology: it is only emitted when the
+    aggregated sample contains no WATCH rows (a WATCH outcome measures a
+    candidate observation, not an executed trade, so calling its positive
+    rate a "win rate" would misrepresent it). positive_return_rate is the
+    numerically identical, verdict-neutral measurement.
     """
     records = [
         rec
@@ -98,11 +109,25 @@ def aggregate_outcomes(
     maes = [rec["mae"] for rec in records if rec.get("mae") is not None]
 
     wins = sum(1 for r in returns if r > 0)
+    contains_watch = any(
+        rec.get("signal_verdict") == "WATCH" for rec in outcomes
+    )
 
-    return {
+    result = {
         "window": window_label(window),
         "sample_size": sample_size,
-        "win_rate": (wins / sample_size) if sample_size else None,
+        # Neutral, verdict-agnostic measurements (Phase 8.1A).
+        "sample_count": len(outcomes),
+        "completed_count": sample_size,
+        "incomplete_count": len(outcomes) - sample_size,
+        "mean_return_pct": _mean_or_none(returns),
+        "median_return_pct": _median_or_none(returns),
+        "positive_return_rate": (wins / sample_size) if sample_size else None,
+        "mean_mfe_pct": _mean_or_none(mfes),
+        "median_mfe_pct": _median_or_none(mfes),
+        "mean_mae_pct": _mean_or_none(maes),
+        "median_mae_pct": _median_or_none(maes),
+        # Pre-8.1A fields (backward compatibility).
         "avg_return": _mean_or_none(returns),
         "median_return": _median_or_none(returns),
         "avg_r": _mean_or_none(rs),
@@ -119,6 +144,11 @@ def aggregate_outcomes(
             records, window, _benchmark_getter("QQQ")
         ),
     }
+
+    # Trade terminology stays ENTER-only: never call a WATCH observation a win.
+    if not contains_watch:
+        result["win_rate"] = (wins / sample_size) if sample_size else None
+    return result
 
 
 def aggregate_all_windows(

@@ -18,6 +18,27 @@ HOLDING_WINDOWS: List[int] = [1, 3, 5, 10, 20]
 MAX_WINDOW: int = max(HOLDING_WINDOWS)
 CALCULATION_VERSION: str = "outcome.v1"
 
+# Phase 8.1A: outcome COVERAGE identity, separate from the calculation math.
+# The return formulas above are identical for ENTER and WATCH; what differs is
+# what the frozen reference price MEANS. An ENTER outcome's reference is the
+# decision-bar close used as the entry reference. A WATCH outcome's reference
+# is "the market price when the candidate was observed" — it is NOT an
+# executed/recommended entry and is never moved forward to a later trigger.
+OUTCOME_COVERAGE_VERSION: str = "candidate_outcomes.v1"
+
+REFERENCE_PRICE_ROLES: Dict[str, str] = {
+    "ENTER": "entry_reference",
+    "WATCH": "candidate_observation",
+}
+
+
+def reference_price_role_for_verdict(verdict: Optional[str]) -> Optional[str]:
+    """Reference-price role for a verdict; None for unknown/legacy (never
+    inferred from strategy name, score or return)."""
+    if verdict is None:
+        return None
+    return REFERENCE_PRICE_ROLES.get(str(verdict).upper())
+
 LONG = "LONG"
 SHORT = "SHORT"
 

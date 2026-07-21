@@ -29,11 +29,13 @@ from app.workers.outcomes.calculator import (
     CALCULATION_VERSION,
     HOLDING_WINDOWS,
     MAX_WINDOW,
+    OUTCOME_COVERAGE_VERSION,
     compute_buy_hold_returns,
     compute_forward_returns,
     compute_mfe_mae,
     compute_simulated_r,
     compute_stop_target_hits,
+    reference_price_role_for_verdict,
 )
 from app.workers.outcomes.persistence import (
     fetch_outcomes,
@@ -115,6 +117,12 @@ def build_outcome_from_frames(
     # signals without a provenance row keep NULLs (never inferred/faked).
     prov = signal.get("provenance") or {}
 
+    # Phase 8.1A: the verdict is copied from the immutable signal row ONLY.
+    # A WATCH outcome's reference price is the candidate-observation price —
+    # the same decision-bar close outcome.v1 already uses — never an invented
+    # later entry. Unknown verdict (legacy caller) stays None.
+    signal_verdict = signal.get("verdict")
+
     base_record: Dict[str, Any] = {
         "signal_id": signal["signal_id"],
         "symbol": signal["symbol"],
@@ -125,6 +133,9 @@ def build_outcome_from_frames(
         "decision_policy_version": prov.get("decision_policy_version"),
         "config_hash": prov.get("config_hash"),
         "provenance_version": prov.get("provenance_version"),
+        "signal_verdict": signal_verdict,
+        "reference_price_role": reference_price_role_for_verdict(signal_verdict),
+        "outcome_coverage_version": OUTCOME_COVERAGE_VERSION,
         "side": side if side in ("LONG", "SHORT") else "LONG",
         "signal_timestamp": signal_timestamp,
         "entry_price": None,
@@ -259,6 +270,11 @@ async def calculate_outcomes_for_signals(
                         "ret_by_window": {},
                         "outcome_status": "error",
                         "calculation_version": CALCULATION_VERSION,
+                        "signal_verdict": signal.get("verdict"),
+                        "reference_price_role": reference_price_role_for_verdict(
+                            signal.get("verdict")
+                        ),
+                        "outcome_coverage_version": OUTCOME_COVERAGE_VERSION,
                     }
                 )
             except Exception:

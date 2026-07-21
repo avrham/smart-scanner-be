@@ -256,8 +256,10 @@ def test_telemetry_includes_watch_saved_count(monkeypatch):
 # Outcome tracking compatibility
 # --------------------------------------------------------------------------- #
 
-def test_outcome_loader_only_selects_enter(monkeypatch):
-    """The Phase 2 loader must never treat WATCH candidates as entries."""
+def test_outcome_loader_selects_enter_and_watch_never_avoid(monkeypatch):
+    """Phase 8.1A: persisted ENTER and WATCH signals get outcome coverage;
+    AVOID stays excluded and WATCH is still never treated as a trade entry
+    (its outcome is a candidate observation, stamped via reference_price_role)."""
     captured = {}
 
     class _FakeConn:
@@ -273,4 +275,5 @@ def test_outcome_loader_only_selects_enter(monkeypatch):
     )
 
     asyncio.run(outcomes_persistence.get_signals_needing_outcomes())
-    assert "s.verdict = 'ENTER'" in captured["query"]
+    assert "s.verdict IN ('ENTER', 'WATCH')" in captured["query"]
+    assert "AVOID" not in captured["query"]

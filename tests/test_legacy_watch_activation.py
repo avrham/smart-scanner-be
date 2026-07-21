@@ -401,5 +401,11 @@ class TestUnchangedBehavior:
         assert unknown["strategy_version"] is None
         assert unknown["decision_policy_version"] is None
 
-    def test_no_migration_009_added(self):
-        assert not list(MIGRATIONS.glob("009_*"))
+    def test_activation_fix_added_no_schema_migration(self):
+        """The legacy activation fix itself required no migration. Migration
+        009 exists (Phase 8.1A outcome coverage) but must be the only one
+        after 008; the next boundary is 010."""
+        assert [p.name for p in MIGRATIONS.glob("009_*")] in (
+            [], ["009_watch_outcome_coverage.sql"]
+        )
+        assert not list(MIGRATIONS.glob("010_*"))
