@@ -21,6 +21,7 @@ from app.workers.provenance import (
     build_provenance,
     market_data_as_of_from_details,
     market_data_as_of_from_df,
+    sanitize_config,
 )
 from app.workers.scan_runs import create_scan_run, finalize_scan_run
 from app.workers.strategies import StrategyContext, get_strategy
@@ -86,6 +87,59 @@ def _liquidity_params(config: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
+def _strategy_identity(pattern_code: str) -> Dict[str, Any]:
+    """Safe strategy identity for telemetry, from the ACTUAL registered
+    strategy (never inferred from the pattern name). sma150_bounce keeps its
+    v2 adapter identity (sma150.v2 + the implicit legacy decision policy);
+    sma150_bounce_v3 reports sma150.v3 + sma150_bounce.policy.v1."""
+    try:
+        strategy = get_strategy(pattern_code)
+        return {
+            "pattern_code": pattern_code,
+            "strategy_version": getattr(strategy, "version", None),
+            "decision_policy_version": getattr(
+                strategy, "decision_policy_version", None
+            ),
+        }
+    except Exception:
+        return {
+            "pattern_code": pattern_code,
+            "strategy_version": None,
+            "decision_policy_version": None,
+        }
+
+
+# Bounded, decision-relevant config keys allowed into scan telemetry. Only
+# keys actually present in the resolved config are included (strategy-aware:
+# v2 and v3 expose different subsets). Never the full application settings.
+_CONFIG_SUMMARY_KEYS = (
+    # sma150.v2 keys (preserved where available)
+    "touch_tolerance_pct", "min_bounces", "min_avg_rebound_pct",
+    "min_volume_sma_ratio", "min_price", "score_threshold",
+    # shared / sma150.v3 keys
+    "sma_window", "min_history_bars", "max_close_above_sma_pct",
+    "max_close_below_sma_pct", "min_independent_bounces",
+    "min_median_rebound_pct", "min_sma_slope_pct",
+    "min_close_location_value", "min_trigger_volume_ratio",
+    "bar_completion_policy", "exchange_timezone", "session_close_time",
+)
+# Small nested dicts that are decision-relevant and safe.
+_CONFIG_SUMMARY_NESTED_KEYS = ("min_liquidity_filters",)
+
+
+def _safe_config_summary(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Deterministic, bounded, secret-free summary of the RESOLVED pattern
+    config (whitelist + sanitization; absent keys stay absent)."""
+    summary: Dict[str, Any] = {
+        k: config[k] for k in _CONFIG_SUMMARY_KEYS if k in config
+    }
+    for key in _CONFIG_SUMMARY_NESTED_KEYS:
+        nested = config.get(key)
+        if isinstance(nested, dict):
+            summary[key] = {k: nested[k] for k in sorted(nested)}
+    return sanitize_config(summary)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -137,10 +191,15 @@ async def process_single_symbol(
     scan_run_id: Optional[str] = None,
     source_path: str = "manual",  # documented no-scan-context path (direct call)
     provider_name: Optional[str] = None,
+    persist_watch_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Process a single symbol for pattern detection
-    
+
+    persist_watch_candidates: opt-in WATCH persistence for the legacy/manual
+    path (default False preserves existing behavior; the funnel has its own
+    flag). ENTER is always persisted; AVOID stays debug-only.
+
     Returns:
         dict: {
             "symbol": str,
@@ -248,10 +307,11 @@ async def process_single_symbol(
         # Mark as seen
         await mark_seen_today(symbol, scan_date)
         
-        # Save signal if ENTER or if debug mode enabled
+        # Save signal if ENTER, opt-in WATCH, or debug AVOID.
         should_save = (
-            result["verdict"] == "ENTER" or 
-            (settings.DEBUG_SAVE_AVOID and result["verdict"] == "AVOID")
+            result["verdict"] == "ENTER"
+            or (persist_watch_candidates and result["verdict"] == "WATCH")
+            or (settings.DEBUG_SAVE_AVOID and result["verdict"] == "AVOID")
         )
         
         if should_save:
@@ -320,10 +380,15 @@ async def process_single_symbol_with_data(
     scan_run_id: Optional[str] = None,
     source_path: str = "legacy",
     provider_name: Optional[str] = None,
+    persist_watch_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Process a single symbol for pattern detection using pre-fetched data
-    
+
+    persist_watch_candidates: opt-in WATCH persistence for the legacy/manual
+    path (default False preserves existing behavior; the funnel has its own
+    flag). ENTER is always persisted; AVOID stays debug-only.
+
     Returns:
         dict: {
             "symbol": str,
@@ -416,10 +481,11 @@ async def process_single_symbol_with_data(
         # Mark as seen
         await mark_seen_today(symbol, scan_date)
         
-        # Save signal if ENTER or if debug mode enabled
+        # Save signal if ENTER, opt-in WATCH, or debug AVOID.
         should_save = (
-            result["verdict"] == "ENTER" or 
-            (settings.DEBUG_SAVE_AVOID and result["verdict"] == "AVOID")
+            result["verdict"] == "ENTER"
+            or (persist_watch_candidates and result["verdict"] == "WATCH")
+            or (settings.DEBUG_SAVE_AVOID and result["verdict"] == "AVOID")
         )
         
         if should_save:
@@ -487,10 +553,17 @@ async def run_scan_batch(
     ignore_seen: bool = False,
     scan_id: Optional[str] = None,
     source_path: str = "legacy",
+    persist_watch_candidates: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete scan batch
-    
+
+    persist_watch_candidates: opt-in WATCH persistence for this legacy/manual
+    batch (default False — existing behavior; funnel scans are unaffected,
+    scheduled scans stay opted out unless they explicitly pass True). WATCH
+    is always EVALUATED and counted either way; the flag only controls
+    persistence through save_signal (with full Phase 7B provenance).
+
     Returns:
         dict: Summary statistics of the scan run
     """
@@ -548,7 +621,10 @@ async def run_scan_batch(
                     "total_evaluated": 0,
                     "scanned": 0,
                     "entered": 0,
+                    "watch_count": 0,
+                    "watch_saved_count": 0,
                     "avoided": 0,
+                    "rejected_count": 0,
                     "errors": 0,
                     "signals_created": 0,
                     "signals_deduplicated": 0,
@@ -603,6 +679,7 @@ async def run_scan_batch(
                     scan_run_id=scan_id,
                     source_path=source_path,
                     provider_name=provider_name,
+                    persist_watch_candidates=persist_watch_candidates,
                 )
         
         # Create tasks for all symbols
@@ -621,13 +698,19 @@ async def run_scan_batch(
         # Analyze results
         scanned_count = 0
         enter_count = 0
+        watch_count = 0
+        watch_saved_count = 0
         rejected_count = 0
         error_count = 0
         signals_created = 0
         signals_deduplicated = 0
         enter_signals = []
+        watch_signals = []
         rejection_reasons: Counter = Counter()
-        
+
+        # Bounded summary output: never full evidence bundles.
+        _WATCH_SIGNALS_CAP = 25
+
         for i, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Task failed for {selected_symbols[i]}: {result}")
@@ -639,20 +722,43 @@ async def run_scan_batch(
                 scanned_count += 1
                 
                 if result["result"]:
-                    # Phase 7B immutable-identity accounting: a repeated exact
-                    # signal is deduplicated, never counted as newly created.
-                    if "signal_created_new" in result["result"]:
+                    # Phase 7B immutable-identity accounting: only PERSISTED
+                    # results carry signal_created_new; a repeated exact signal
+                    # is deduplicated, never counted as newly created. An
+                    # evaluated-but-not-persisted WATCH carries neither and is
+                    # therefore never counted as linked.
+                    persisted = "signal_created_new" in result["result"]
+                    if persisted:
                         if result["result"]["signal_created_new"]:
                             signals_created += 1
                         else:
                             signals_deduplicated += 1
-                    if result["result"]["verdict"] == "ENTER":
+                    verdict = result["result"]["verdict"]
+                    if verdict == "ENTER":
                         enter_count += 1
                         enter_signals.append({
                             "symbol": result["symbol"],
                             "score": result["result"]["score"],
                             "reason": result["result"]["reason"]
                         })
+                    elif verdict == "WATCH":
+                        # WATCH is a distinct verdict, never a rejection.
+                        watch_count += 1
+                        if persisted:
+                            watch_saved_count += 1
+                        if len(watch_signals) < _WATCH_SIGNALS_CAP:
+                            watch_entry = {
+                                "symbol": result["symbol"],
+                                "score": result["result"]["score"],
+                                "reason": result["result"]["reason"],
+                            }
+                            if "signal_id" in result["result"]:
+                                watch_entry["signal_id"] = result["result"]["signal_id"]
+                            if persisted:
+                                watch_entry["signal_created_new"] = (
+                                    result["result"]["signal_created_new"]
+                                )
+                            watch_signals.append(watch_entry)
                     else:
                         rejected_count += 1
                         # Prefer the structured rejection_reason over free text.
@@ -681,25 +787,28 @@ async def run_scan_batch(
         # Minimal reject-telemetry foundation (persisted in pattern_runs.notes
         # as JSON). This is the lightweight precursor to the Phase 3 funnel; it
         # does not add a new schema.
+        strategy_identity = _strategy_identity(pattern_code)
         telemetry = {
             "pattern": pattern_code,
             "total_evaluated": len(selected_symbols),
             "scanned": scanned_count,
             "entered": enter_count,
+            "watch_count": watch_count,
+            "watch_saved_count": watch_saved_count,
+            "persist_watch_candidates": persist_watch_candidates,
             "avoided": rejected_count,
+            "rejected_count": rejected_count,
             "errors": error_count,
             "signals_created": signals_created,
             "signals_deduplicated": signals_deduplicated,
             "signals_linked": signals_created + signals_deduplicated,
             "top_rejection_reasons": dict(rejection_reasons.most_common(10)),
-            "config_used": {
-                k: config.get(k)
-                for k in (
-                    "touch_tolerance_pct", "min_bounces", "min_avg_rebound_pct",
-                    "min_volume_sma_ratio", "min_price", "score_threshold",
-                )
-            },
-            "score_version": "sma150.v2",
+            "config_used": _safe_config_summary(config),
+            # Dynamic strategy identity from the ACTUAL selected strategy
+            # (score_version kept for backward compatibility, now dynamic).
+            "strategy_version": strategy_identity["strategy_version"],
+            "decision_policy_version": strategy_identity["decision_policy_version"],
+            "score_version": strategy_identity["strategy_version"],
             "runtime_seconds": round(run_duration, 2),
         }
 
@@ -724,9 +833,12 @@ async def run_scan_batch(
             "telemetry": telemetry,
             "scanned_count": scanned_count,
             "enter_count": enter_count,
+            "watch_count": watch_count,
+            "watch_saved_count": watch_saved_count,
             "rejected_count": rejected_count,
             "error_count": error_count,
             "enter_signals": enter_signals,
+            "watch_signals": watch_signals,
             "batch_size": batch_size,
             "pattern_code": pattern_code,
             "started_at": run_start.isoformat(),
@@ -735,7 +847,7 @@ async def run_scan_batch(
         
         logger.info(
             f"📊 Scan batch completed: scanned={scanned_count}, "
-            f"enter={enter_count}, rejected={rejected_count}, "
+            f"enter={enter_count}, watch={watch_count}, rejected={rejected_count}, "
             f"errors={error_count}, duration={run_duration:.1f}s"
         )
         
@@ -743,6 +855,7 @@ async def run_scan_batch(
         logger.info(f"📋 Detailed breakdown:")
         logger.info(f"  - Symbols processed: {scanned_count}")
         logger.info(f"  - ENTER signals: {enter_count}")
+        logger.info(f"  - WATCH signals: {watch_count} (persisted: {watch_saved_count})")
         logger.info(f"  - Rejected (AVOID): {rejected_count}")
         logger.info(f"  - Errors: {error_count}")
         logger.info(f"  - Total symbols attempted: {len(selected_symbols)}")

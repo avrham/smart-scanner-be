@@ -52,8 +52,13 @@ async def start_scan(
         validate. Without dry_run it fetches history for liquidity survivors
         (bounded by `limit`) and evaluates the strategy.
 
-    persist_watch (funnel mode only): override Phase 5.2 WATCH persistence
-    (default true). Legacy mode ignores it.
+    persist_watch: controls WATCH persistence in BOTH funnel and legacy/manual
+    modes, defaulting to each mode's existing safe behavior:
+      * funnel  - Phase 5.2 WATCH persistence defaults to true; pass false to
+        override.
+      * legacy/manual - defaults to false (WATCH is evaluated and counted but
+        NOT persisted); requires an explicit persist_watch=true to persist
+        WATCH results through save_signal with full Phase 7B provenance.
     """
 
     chosen_batch_size = batch_size or settings.SCAN_BATCH_SIZE
@@ -126,6 +131,10 @@ async def start_scan(
 
     scan_id = str(uuid.uuid4())
 
+    # Legacy/manual WATCH persistence is opt-in: only an explicit
+    # persist_watch=true enables it (None/False preserve existing behavior).
+    legacy_persist_watch = persist_watch is True
+
     # Legacy scans also go through the configured MarketDataProvider.
     try:
         legacy_provider = get_market_data_provider()
@@ -146,7 +155,8 @@ async def start_scan(
                 pattern_code=pattern_code,
                 symbols=normalized_symbols,
                 ignore_seen=ignore_seen,
-                scan_id=scan_id
+                scan_id=scan_id,
+                persist_watch_candidates=legacy_persist_watch,
             )
             run_logger.info(
                 f"[ADMIN] scan finished: scanned={summary.get('scanned_count')}, enter={summary.get('enter_count')}, rejected={summary.get('rejected_count')}"
@@ -165,7 +175,8 @@ async def start_scan(
             pattern_code=pattern_code,
             symbols=normalized_symbols,
             ignore_seen=ignore_seen,
-            scan_id=scan_id
+            scan_id=scan_id,
+            persist_watch_candidates=legacy_persist_watch,
         )
         await event_bus.publish(scan_id, {"type": "finished", **summary})
         return {
