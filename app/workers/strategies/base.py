@@ -103,6 +103,10 @@ class Strategy(ABC):
 
     pattern_code: str = ""
     version: str = "unknown"
+    # How this strategy's decisions map to verdicts/persistence. Strategies
+    # with an explicit decision policy (e.g. sma150.v3) override this; the
+    # default names the implicit legacy policy used since Phase 7B.
+    decision_policy_version: str = "strategy_decision.v1"
     required_timeframes: List[str] = ["1d"]
     # Minimum daily bars the strategy needs. The funnel uses this to size the
     # (bounded) history fetch and the cheap prefilter. Kept as a simple attribute

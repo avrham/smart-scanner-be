@@ -60,11 +60,25 @@ MANDATORY_EVIDENCE_KEYS = frozenset({
     "market_data_as_of_missing_reason",
     "decision_card_evidence",   # holds trigger/confirmation/missing_data
     "strategy_evidence_identity",
+    # Phase 8: the normalized evidence.v1 bundle IS core decision evidence —
+    # it may never be pruned away from an immutable snapshot.
+    "evidence",
+    "evidence_version",
 })
 
 # Keys copied from StrategyResult.details / decision card when present.
 # Nothing is invented: absent keys stay absent.
 _DETAIL_EVIDENCE_KEYS = (
+    # Phase 8: normalized evidence.v1 bundle (deterministic, JSON-safe).
+    "evidence",
+    "evidence_version",
+    "setup_state",
+    "trigger_state",
+    "failed_confirmations",
+    "contradictions",
+    "invalidation",
+    "ranking",
+    "bounce_events",
     "score_components",
     "thresholds_used",
     "bounces_detail",
@@ -263,6 +277,27 @@ def _bound_evidence(
 # Market-data as-of
 # --------------------------------------------------------------------------- #
 
+def market_data_as_of_from_details(
+    details: Optional[Dict[str, Any]],
+) -> Optional[datetime]:
+    """Strategy-declared as-of (Phase 8): the latest COMPLETED bar the
+    strategy actually evaluated. Strategies that enforce completed-bar
+    semantics (sma150.v3) may have EXCLUDED a partial latest bar from the
+    provided dataframe, so their declared as-of overrides the raw frame's
+    last bar. Strategies that don't declare one (v2, wyckoff) return None
+    and callers fall back to market_data_as_of_from_df."""
+    iso = (details or {}).get("market_data_as_of")
+    if not iso or not isinstance(iso, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def market_data_as_of_from_df(df: Optional[pd.DataFrame]) -> Optional[datetime]:
     """Latest bar timestamp actually present in the evaluated dataframe (UTC).
 
@@ -360,8 +395,13 @@ def build_provenance(
     score_components: Optional[Dict[str, Any]] = None,
     decision_card: Optional[Dict[str, Any]] = None,
     market_data_as_of: Optional[datetime] = None,
+    decision_policy_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble the provenance dict persisted 1:1 with a signal.
+
+    `decision_policy_version` lets a strategy with an explicit policy (e.g.
+    sma150.v3 -> sma150_bounce.policy.v1) name it; None keeps the legacy
+    implicit policy (DECISION_POLICY_VERSION).
 
     external_observation_ids stays [] for internal-only signals (Phase 10
     readiness — never filled with placeholder IDs).
@@ -389,7 +429,7 @@ def build_provenance(
         "provider": provider,
         "strategy_code": strategy_code,
         "strategy_version": strategy_version,
-        "decision_policy_version": DECISION_POLICY_VERSION,
+        "decision_policy_version": decision_policy_version or DECISION_POLICY_VERSION,
         "provenance_version": PROVENANCE_VERSION,
         "config_hash": config_hash(snapshot),
         "config_snapshot": snapshot,

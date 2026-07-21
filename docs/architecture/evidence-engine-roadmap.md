@@ -143,6 +143,10 @@ documents, this section is authoritative.
 | Decision policy (7B) | `signal_provenance.decision_policy_version` | `strategy_decision.v1` |
 | Provenance record (7B) | `signal_provenance.provenance_version` | `provenance.v1` |
 | Fingerprint algorithm (7B) | `signals.signal_fingerprint_version` | `signal_fingerprint.v1` |
+| Evidence contract (8) | `evidence_snapshot.evidence.evidence_version` | `evidence.v1` |
+| sma150 v3 strategy (8) | `strategies/sma150_v3.py::STRATEGY_VERSION` | `sma150.v3` |
+| sma150 v3 policy (8) | `signal_provenance.decision_policy_version` | `sma150_bounce.policy.v1` |
+| sma150 v3 ranking (8) | `details.ranking.ranking_version` | `sma150.v3.rank.v1` |
 
 These remain SEPARATE identities by design: strategy version ≠ decision-card
 version ≠ outcome-calculation version ≠ decision-policy version ≠
@@ -387,18 +391,164 @@ each frozen with its own version identity.
   the frozen columns on `signal_outcomes` make per-version expectancy /
   baseline-delta reports simple aggregations.
 
-### Phase 8 — evidence contracts and sma150.v3
+### Phase 8 — evidence contracts and sma150.v3 *(COMPLETE — implemented contracts below)*
 
-- Introduce the normalized evidence contract (§6) and an evidence snapshot
-  persisted per signal.
-- Re-express sma150 checks as evidence features; ship as **`sma150.v3`**, a
-  new version beside `sma150.v2` (no silent replacement).
-- Separate hard filters from soft evidence explicitly in the funnel.
+**Normalized evidence contract `evidence.v1`**
+(`app/workers/strategies/evidence.py`): typed `EvidenceItem`
+(code, category, source_type, state, raw_value, normalized_value, unit,
+threshold, operator, required, timeframe, as_of, reason_code, metadata) and
+`EvidenceBundle` (evidence_version, strategy identity + decision policy,
+symbol, market_data_as_of, items, hard_filter_summary, setup_state,
+trigger_state, verdict, missing_data, contradictions, timeframe_summary,
+ranking_components, ranking_score). States:
+`pass|fail|positive|negative|neutral|unknown`; source types reserve
+`market_data|strategy|external|fundamental|event|risk` (external kinds are
+Phase 10 — never fabricated now). Serialization is deterministic (items
+sorted by category+code; lists sorted), JSON-safe by validation (non-JSON
+values are rejected, not coerced), raw values are never replaced by
+normalized ones, and unknown stays unknown. **No new table**: the bundle is
+persisted under the `evidence` key of the immutable
+`signal_provenance.evidence_snapshot` and is a MANDATORY evidence key
+(size pruning can never remove it), so it participates in the original
+pre-pruning evidence hash and the signal fingerprint.
+
+**`sma150_bounce_v3` / `sma150.v3`** (`app/workers/strategies/sma150_v3.py`)
+— registered SEPARATELY beside `sma150_bounce` (still `sma150.v2`,
+byte-identical behavior) with `decision_policy_version =
+sma150_bounce.policy.v1`. Four layers, in authority order:
+
+- **A. Data readiness** — configurable `min_history_bars` (200), SMA/slope/
+  volume-average availability. Insufficient history ⇒ `AVOID`,
+  `setup_state=unknown`, `trigger_state=unknown`,
+  `reason_code=insufficient_history`, unknown evidence (no fabricated zeros),
+  `ranking_score=NULL`.
+- **B. Setup validity** — (1) current proximity band: close within
+  `max_close_above_sma_pct` (3.0) above / `max_close_below_sma_pct` (1.0)
+  below the SMA-150; (2) **independent** historical bounce events:
+  contiguous in-band runs are one event; runs closer than the EFFECTIVE
+  separation `max(min_event_separation_bars=15, rebound_window_bars+1=11)`
+  merge into one cluster (rebound windows can never overlap); one
+  deterministic representative per cluster (min |distance to SMA|, earliest
+  bar on ties); events with incomplete rebound windows are EXCLUDED; at
+  least `min_independent_bounces` (2) required; (3) rebound quality gated on
+  the **median** rebound (`min_median_rebound_pct` 5.0) — median AND mean
+  persisted; per-event touch date/index/price, SMA, distance, max favorable
+  rebound, bars-to-max and age are persisted in `details.bounce_events`.
+  Setup failure ⇒ `AVOID`, `setup_state=invalid`; confirmations and score
+  can never override it.
+- **C. Entry confirmation** (all required for ENTER): close above SMA-150;
+  SMA slope over `slope_lookback_bars` (20) STRICTLY above
+  `min_sma_slope_pct` (0.0 — flat blocks ENTER); deterministic bullish
+  trigger (close > prior bar high [persisted as `trigger_level`] AND close >
+  open AND close-location value ≥ `min_close_location_value` 0.65 — a
+  zero-range bar is `unknown`, never a division by zero or a pass); volume
+  ratio = current volume / COMPLETED 20-bar average ≥
+  `min_trigger_volume_ratio` (1.20 — 1.07 fails). Valid setup + any
+  missing/failed confirmation ⇒ `WATCH` (`trigger_state=missing` or
+  `contradicted`); negative slope / close below SMA / bearish candle are
+  recorded as contradictions.
+- **D. Ranking `sma150.v3.rank.v1`** — ordering only, never authorization:
+  unweighted arithmetic mean of the fixed set {proximity_quality,
+  trend_quality, independent_bounce_quality, rebound_quality,
+  volume_quality, trigger_quality, bounce_recency_quality}, each an
+  explicit unit-tested [0,1] formula; recency is exponential decay
+  `0.5^(age_bars / recency_half_life_bars=126)`; score is NULL when any
+  component is unknown; raw + normalized values are both persisted; NOT a
+  probability; the v2 `score_threshold` does not exist in v3.
+
+**Deterministic invalidation** (no invented targets):
+`daily_close_below_sma150_pct` with `invalidation_below_sma_pct` (2.0);
+level, rule code and threshold persisted in `details.invalidation` and on
+the decision card. **Decision card** gains ADDITIVE v3 fields (setup/trigger
+states, slope, median/mean rebound, trigger conditions, failed
+confirmations, contradictions, invalidation rule, ranking components) —
+v2/wyckoff cards unchanged.
+
+**Known regression case (JBL-like)** — price ~2.3% above a declining SMA,
+3 v2-counted bounces (2 clustered), strong rebounds, volume ratio ~1.07, no
+trigger: v2 says ENTER; v3 says **WATCH** naming the trend, volume and
+trigger gaps (regression-tested).
+
+**Completed-daily-bar policy `ny_session_close.v1`** — a provider daily
+aggregate may represent the still-open US session (Massive incremental
+top-ups fetch through "today"; provider bars are never assumed completed).
+v3 evaluates COMPLETED bars only: explicit caller/provider metadata wins
+when present; otherwise a bar dated before the current exchange-session
+date (America/New_York) is completed, a bar dated today is completed only
+at/after the configured session close (16:00 — never a bare wall-clock
+check; early-close days are conservatively treated as incomplete until the
+regular close, which can only exclude, never include a partial bar). A
+partial latest bar is EXCLUDED (one safe deterministic exclusion) and the
+prior completed bar becomes the trigger bar; if completion still cannot be
+proven (future-dated bar, corrupt feed), readiness is unknown and the
+verdict is `AVOID` with `reason_code=unconfirmed_bar_completion`. The
+volume baseline already excludes the trigger bar; slope, bounce and rebound
+windows use completed bars only; `market_data_as_of` is the latest
+COMPLETED bar actually evaluated (the strategy declares it in
+`details.market_data_as_of` and both funnel and legacy provenance builders
+prefer it over the raw frame). Policy config (`bar_completion_policy`,
+`exchange_timezone`, `session_close_time`) lives in the strategy config —
+persisted per signal via the config snapshot — and the per-evaluation
+decision is recorded as the `latest_bar_completion` evidence item (with
+`trigger_bar_date` and `volume_baseline_end_date`). sma150.v2 is untouched
+by this policy.
+
+**Evidence ordering rules** — evidence items serialize sorted by the FULL
+identity key `(category, code, source_type, timeframe, as_of)`; duplicate
+identities are rejected (never silently collapsed — the same check on 1d
+and 4h is two items). Only SET-LIKE lists are sorted (`missing_data`,
+`contradictions`, external observation ids); semantic sequences are never
+reordered: bounce events stay chronological, declared timeframe sequences
+keep their order, trigger conditions keep their documented order, and
+ranking components are stable named keys.
+
+**Outcome coverage (honest current state)** — the outcome service selects
+`verdict = 'ENTER'` only (`get_signals_needing_outcomes`). Therefore:
+sma150.v3 **ENTER** signals flow through `outcome.v1` unchanged; **WATCH**
+signals are persisted with full immutable provenance but do **not** yet
+receive outcome rows. This means trigger false negatives (WATCH candidates
+that would have performed) and the value of waiting are currently
+unmeasured. Phase 8.1 adds outcome tracking for both ENTER and WATCH before
+any strategy-effectiveness conclusion is drawn. **No claim about v3
+effectiveness can be made until enough frozen outcomes exist for both
+verdicts.**
+
+**Registration/rollout**: migration `008_sma150_v3.sql` (additive,
+idempotent) registers `sma150_bounce_v3` **disabled by default**
+(`is_enabled=false`) with its full default config; manual/explicit scans can
+select it via the registry; the scheduled default pattern is unchanged. The
+config seed uses `ON CONFLICT DO NOTHING`: a rerun never resets
+operator-modified v3 configuration (002-style `DO UPDATE` is reserved for
+explicit corrections of live values). The legacy scan path keeps its direct
+v2 call for `sma150_bounce` and routes any other explicitly selected
+pattern through the registry. v2 and v3 signals for the same symbol/date
+coexist as separate immutable signals (different strategy_version + policy
+⇒ different fingerprints) with separate outcomes.
+
+### Phase 8.1 — candidate outcome coverage and v2/v3 shadow comparison *(NEXT — not implemented)*
+
+Prerequisite for any effectiveness judgement of sma150.v3 (and any later
+strategy version):
+
+- outcome rows for **both ENTER and WATCH** signals (WATCH outcomes measure
+  trigger false negatives and the value of waiting);
+- the signal `verdict` preserved on each outcome row;
+- metrics reported separately by `strategy_version`, `verdict`,
+  `decision_policy_version` and `config_hash` — never pooled across
+  versions or verdicts;
+- no historical inference and no fabricated provenance: only signals
+  persisted with real provenance get outcomes, from their snapshot forward;
+- v2 versus v3 **shadow comparison** on the frozen outcome data (same
+  symbols/dates where both versions produced signals);
+- **no parameter tuning** — observation only.
 
 ### Phase 9 — deterministic Wyckoff technical engine v2
 
 - New, separately versioned **`wyckoff_mtf.v2`**; v1 remains registered and
   untouched. Full requirements in §5.
+- Emits `evidence.v1` bundles (the Phase 8 contract); daily setup vs. 4H
+  trigger separation preserved; explicit `UNKNOWN_PHASE` and
+  `AMBIGUOUS_STRUCTURE` states.
 
 ### Phase 10 — external signal intake (AI Edge, Lorentzian, ...)
 

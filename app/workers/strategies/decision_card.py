@@ -87,10 +87,64 @@ def _risk_notes(result: StrategyResult) -> List[str]:
     return notes
 
 
+def _evidence_v1_extension(result: StrategyResult) -> Dict[str, Any]:
+    """Additive card fields for strategies that emit an evidence.v1 bundle
+    (Phase 8, sma150.v3). Everything is read from the bundle/details the
+    strategy already produced — nothing is invented, no targets, no prose.
+    Strategies without a bundle get no extra fields (v2 cards unchanged)."""
+    details = result.details or {}
+    bundle = details.get("evidence")
+    if not isinstance(bundle, dict) or bundle.get("evidence_version") is None:
+        return {}
+
+    ranking = details.get("ranking") or {}
+    invalidation = details.get("invalidation") or {}
+    return {
+        "evidence_version": bundle.get("evidence_version"),
+        "decision_policy_version": bundle.get("decision_policy_version"),
+        "setup_state": bundle.get("setup_state"),
+        "trigger_state": bundle.get("trigger_state"),
+        "market_data_as_of": bundle.get("market_data_as_of"),
+        "current_price": details.get("current_price"),
+        "sma_value": details.get("sma_value"),
+        "proximity_pct": details.get("proximity_pct"),
+        "sma_slope_pct": details.get("sma_slope_pct"),
+        "independent_bounce_count": details.get("bounce_count"),
+        "median_rebound_pct": details.get("median_rebound_pct"),
+        "mean_rebound_pct": details.get("avg_rebound_pct"),
+        "volume_ratio": details.get("vol_ratio"),
+        "trigger_level": details.get("trigger_level"),
+        "trigger_conditions": [
+            {
+                "code": item.get("code"),
+                "state": item.get("state"),
+                "raw_value": item.get("raw_value"),
+                "threshold": item.get("threshold"),
+                "operator": item.get("operator"),
+                "reason_code": item.get("reason_code"),
+            }
+            for item in bundle.get("items", [])
+            if item.get("category") == "confirmation"
+        ],
+        "failed_confirmations": list(details.get("failed_confirmations") or []),
+        "contradictions": list(bundle.get("contradictions") or []),
+        "invalidation_rule": {
+            "rule_code": invalidation.get("rule_code"),
+            "threshold_pct": invalidation.get("threshold_pct"),
+            "level": invalidation.get("level"),
+        },
+        "ranking_score": ranking.get("score"),
+        "ranking_components": dict(ranking.get("components") or {}),
+        "ranking_version": ranking.get("ranking_version"),
+    }
+
+
 def build_decision_card(result: StrategyResult) -> Dict[str, Any]:
     """Build a deterministic decision card from a StrategyResult.
 
     Never invents prices/direction: fields the strategy did not set stay None.
+    Strategies emitting an evidence.v1 bundle gain ADDITIVE fields (v3);
+    existing card fields and v2/wyckoff cards are unchanged.
     """
     side = result.side.value if result.side else StrategySide.UNKNOWN.value
     setup = result.setup_type or "unknown_setup"
@@ -98,7 +152,7 @@ def build_decision_card(result: StrategyResult) -> Dict[str, Any]:
     if result.side not in (None, StrategySide.UNKNOWN):
         title = f"{result.decision.value}: {result.symbol} {side} {setup}"
 
-    return {
+    card = {
         "card_version": CARD_VERSION,
         "title": title,
         "decision": result.decision.value,
@@ -121,3 +175,5 @@ def build_decision_card(result: StrategyResult) -> Dict[str, Any]:
         "raw_evidence": dict(result.score_components or {}),
         "strategy_version": result.strategy_version,
     }
+    card.update(_evidence_v1_extension(result))
+    return card

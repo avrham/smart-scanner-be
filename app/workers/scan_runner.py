@@ -17,16 +17,65 @@ from app.workers.patterns.sma150 import evaluate_sma150_bounce, DEFAULT_CONFIG, 
 from app.workers.patterns.config import resolve_pattern_config
 from app.workers.indicators import to_dataframe, validate_dataframe
 from app.workers.tickers import load_candidate_pool, select_random_batch, filter_by_liquidity
-from app.workers.provenance import build_provenance, market_data_as_of_from_df
+from app.workers.provenance import (
+    build_provenance,
+    market_data_as_of_from_details,
+    market_data_as_of_from_df,
+)
 from app.workers.scan_runs import create_scan_run, finalize_scan_run
+from app.workers.strategies import StrategyContext, get_strategy
 from app.config import settings
 from app.utils.events import event_bus
 import pandas as pd
 
 
 def _resolve_default_config(pattern_code: str) -> Dict[str, Any]:
-    """Safe defaults per pattern (Phase 1 only supports sma150_bounce)."""
-    return DEFAULT_CONFIG.copy()
+    """Safe defaults per pattern.
+
+    sma150_bounce keeps its direct v2 defaults (unchanged behavior); any other
+    explicitly selected pattern uses its registered strategy's defaults.
+    """
+    if pattern_code == "sma150_bounce":
+        return DEFAULT_CONFIG.copy()
+    try:
+        return get_strategy(pattern_code).default_config()
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+
+def _evaluate_pattern(
+    symbol: str,
+    df: pd.DataFrame,
+    pattern_code: str,
+    config: Dict[str, Any],
+    scan_run_id: Optional[str],
+) -> tuple:
+    """Evaluate one symbol on the legacy path.
+
+    sma150_bounce keeps its DIRECT v2 evaluator call (byte-identical
+    behavior). Any other explicitly selected pattern (e.g. sma150_bounce_v3)
+    goes through the strategy registry — the minimum safe integration for
+    Phase 8. Returns (legacy result dict, decision_policy_version or None).
+    """
+    if pattern_code == "sma150_bounce":
+        return evaluate_sma150_bounce(symbol, df, config), None
+
+    strategy = get_strategy(pattern_code)  # raises UnknownStrategyError
+    context = StrategyContext(
+        symbol=symbol,
+        pattern_code=pattern_code,
+        config=config,
+        scanner_mode="legacy",
+        scan_run_id=scan_run_id,
+    )
+    result = strategy.evaluate(df, context)
+    legacy = {
+        "verdict": result.verdict,
+        "score": result.score,
+        "reason": result.reason,
+        "details": result.details,
+    }
+    return legacy, getattr(strategy, "decision_policy_version", None)
 
 
 def _liquidity_params(config: Dict[str, Any]) -> Dict[str, float]:
@@ -48,10 +97,12 @@ def _legacy_provenance(
     scan_run_id: Optional[str],
     source_path: str,
     provider_name: Optional[str],
+    decision_policy_version: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Provenance for the legacy sma150 dict-result path (Phase 7B).
+    """Provenance for the legacy dict-result path (Phase 7B).
 
-    strategy_version comes from the evaluator's own score_version (sma150.v2);
+    strategy_version comes from the evaluator's own score_version (sma150.v2
+    for the direct path; the strategy's version for registry patterns);
     market_data_as_of from the latest bar actually evaluated. Nothing is
     inferred from timestamps or pattern names beyond what the evaluator emits.
     """
@@ -66,7 +117,13 @@ def _legacy_provenance(
         strategy_config=config,
         details=details,
         score_components=details.get("score_components"),
-        market_data_as_of=market_data_as_of_from_df(df),
+        # Same completion policy as the funnel path: prefer the strategy's
+        # declared completed-bar as-of (v3), fall back to the frame (v2).
+        market_data_as_of=(
+            market_data_as_of_from_details(details)
+            or market_data_as_of_from_df(df)
+        ),
+        decision_policy_version=decision_policy_version,
     )
 
 
@@ -175,11 +232,10 @@ async def process_single_symbol(
         # Run pattern detection
         try:
             logger.info(f"🔍 Running pattern detection for {symbol}...")
-            if pattern_code == "sma150_bounce":
-                result = evaluate_sma150_bounce(symbol, df, config)
-                logger.info(f"🔍 {symbol}: {result['verdict']} (score: {result.get('score', 'N/A'):.3f}, reason: {result.get('reason', 'N/A')})")
-            else:
-                raise ValueError(f"Unknown pattern code: {pattern_code}")
+            result, policy_version = _evaluate_pattern(
+                symbol, df, pattern_code, config, scan_run_id
+            )
+            logger.info(f"🔍 {symbol}: {result['verdict']} (score: {result.get('score') if result.get('score') is not None else 'N/A'}, reason: {result.get('reason', 'N/A')})")
         except Exception as e:
             logger.error(f"❌ Pattern detection error for {symbol}: {str(e)}")
             return {
@@ -211,6 +267,7 @@ async def process_single_symbol(
                     provenance=_legacy_provenance(
                         result, pattern_code, config, df,
                         scan_run_id, source_path, provider_name,
+                        decision_policy_version=policy_version,
                     ),
                 )
 
@@ -220,7 +277,7 @@ async def process_single_symbol(
                 # Log ENTER signals
                 if result["verdict"] == "ENTER":
                     logger.info(
-                        f"🎯 ENTER signal for {symbol}: score={result['score']:.3f}, "
+                        f"🎯 ENTER signal for {symbol}: score={result['score']}, "
                         f"reason={result['reason']}"
                     )
                 
@@ -343,11 +400,10 @@ async def process_single_symbol_with_data(
         # Run pattern detection
         try:
             logger.info(f"🔍 Running pattern detection for {symbol}...")
-            if pattern_code == "sma150_bounce":
-                result = evaluate_sma150_bounce(symbol, df, config)
-                logger.info(f"🔍 {symbol}: {result['verdict']} (score: {result.get('score', 'N/A'):.3f}, reason: {result.get('reason', 'N/A')})")
-            else:
-                raise ValueError(f"Unknown pattern code: {pattern_code}")
+            result, policy_version = _evaluate_pattern(
+                symbol, df, pattern_code, config, scan_run_id
+            )
+            logger.info(f"🔍 {symbol}: {result['verdict']} (score: {result.get('score') if result.get('score') is not None else 'N/A'}, reason: {result.get('reason', 'N/A')})")
         except Exception as e:
             logger.error(f"❌ Pattern detection error for {symbol}: {str(e)}")
             return {
@@ -379,6 +435,7 @@ async def process_single_symbol_with_data(
                     provenance=_legacy_provenance(
                         result, pattern_code, config, df,
                         scan_run_id, source_path, provider_name,
+                        decision_policy_version=policy_version,
                     ),
                 )
 
@@ -388,7 +445,7 @@ async def process_single_symbol_with_data(
                 # Log ENTER signals
                 if result["verdict"] == "ENTER":
                     logger.info(
-                        f"🎯 ENTER signal for {symbol}: score={result['score']:.3f}, "
+                        f"🎯 ENTER signal for {symbol}: score={result['score']}, "
                         f"reason={result['reason']}"
                     )
                 

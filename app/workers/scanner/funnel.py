@@ -42,7 +42,11 @@ from app.workers.persistence import (
     save_signal,
     was_seen_today,
 )
-from app.workers.provenance import build_provenance, market_data_as_of_from_df
+from app.workers.provenance import (
+    build_provenance,
+    market_data_as_of_from_details,
+    market_data_as_of_from_df,
+)
 from app.workers.scan_runs import create_scan_run, finalize_scan_run
 from app.config import settings
 from app.utils.events import event_bus
@@ -515,7 +519,16 @@ async def _run_funnel_stages(
             scanner_settings=scanner_settings,
             details=details,
             score_components=result.score_components,
-            market_data_as_of=market_data_as_of_from_df(df),
+            # Phase 8: a strategy enforcing completed-bar semantics declares
+            # the as-of of the bar it ACTUALLY evaluated (a partial latest
+            # bar may have been excluded); fall back to the frame otherwise.
+            market_data_as_of=(
+                market_data_as_of_from_details(details)
+                or market_data_as_of_from_df(df)
+            ),
+            # Phase 8: strategies with an explicit decision policy (sma150.v3)
+            # name it; None keeps the legacy implicit policy.
+            decision_policy_version=getattr(strategy, "decision_policy_version", None),
         )
 
     for ticker in bounded:
