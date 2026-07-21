@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.deps import get_db
-from app.routers import public, admin, outcomes
+from app.routers import public, admin, outcomes, shadow
 from app.utils.logging import setup_logging
 from app.workers.scheduler import start_scheduler
 
@@ -53,6 +53,7 @@ app.add_middleware(
 
 app.include_router(public.router, prefix="/api", tags=["public"])
 app.include_router(outcomes.router, prefix="/api", tags=["outcomes"])
+app.include_router(shadow.router, prefix="/api", tags=["shadow"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 

@@ -514,6 +514,69 @@ async def calculate_outcomes(
     return {"message": "Outcome calculation completed", **summary}
 
 
+@router.post("/shadow/sma150/compare")
+async def shadow_sma150_compare(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+    symbols: Any = Body(...),
+    run_in_background: bool = Body(False),
+):
+    """Phase 8.1B1: frozen paired shadow evaluation of sma150.v2 vs sma150.v3.
+
+    Evaluates BOTH strategies on the exact same canonical completed OHLCV
+    frame (one fetch per symbol) and persists one immutable pair per exact
+    comparison input, preserving ENTER, WATCH and AVOID. Shadow evaluations
+    are never normal signals, never receive outcomes, and never change
+    strategy enablement or the scheduler.
+
+    Request: explicit symbols only (max 25), no universe scans. Synchronous
+    by default (smoke-test friendly); run_in_background=true uses the
+    in-process BackgroundTasks pattern (no resumable-execution claim).
+    """
+    from app.workers.shadow.runner import (
+        ShadowRequestError,
+        normalize_shadow_symbols,
+        run_shadow_comparison,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        normalized = normalize_shadow_symbols(symbols)
+    except ShadowRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    run_id = str(uuid.uuid4())
+
+    if run_in_background:
+        async def _run() -> None:
+            try:
+                summary = await run_shadow_comparison(
+                    provider, normalized, run_id=run_id
+                )
+                logger.info(
+                    "[ADMIN] shadow run %s finished: status=%s",
+                    run_id, summary.get("status"),
+                )
+            except Exception as exc:
+                logger.error("[ADMIN] shadow run %s failed: %s", run_id, exc)
+
+        background_tasks.add_task(_run)
+        return {
+            "message": "Shadow comparison enqueued",
+            "run_id": run_id,
+            "requested_count": len(normalized),
+        }
+
+    summary = await run_shadow_comparison(provider, normalized, run_id=run_id)
+    return {"message": "Shadow comparison completed", **summary}
+
+
 @router.get("/status")
 async def get_status(
     _: str = Depends(get_worker_token),

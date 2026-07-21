@@ -147,6 +147,7 @@ def build_jbl_like_frame(
     end_prox_pct: float = 2.3,
     vol_ratio: float = 1.07,
     overshoot_pct: float = 8.0,
+    touch_events: Sequence[int] = (300, 330, 338),
 ) -> pd.DataFrame:
     """Declining-SMA geometry with bounce rallies from below.
 
@@ -171,8 +172,6 @@ def build_jbl_like_frame(
         if t < 340:
             return 130.0 - (t - 260) * 0.30       # steep decline to 106
         return 106.0 - (t - 340) * 0.05           # gentle decline
-
-    touch_events = (300, 330, 338)
 
     for t in range(n - 6):  # last 6 bars engineered below
         if t in overrides:

@@ -508,7 +508,8 @@ ranking components are stable named keys.
 **Outcome coverage (honest current state)** — as of Phase 8.1A the outcome
 service selects persisted `ENTER` **and** `WATCH` signals
 (`get_signals_needing_outcomes`); AVOID remains outside regular outcome
-coverage (Phase 8.1B shadow evaluations will cover paired AVOID decisions).
+coverage (Phase 8.1B1 shadow evaluations record paired AVOID *decisions*;
+their paired *outcomes* arrive in 8.1B2).
 sma150.v3 ENTER signals flow through `outcome.v1` unchanged; WATCH signals
 now also receive outcome rows measuring what happened after the candidate
 observation. **No claim about v3 effectiveness can be made until enough
@@ -561,14 +562,77 @@ Persisted ENTER **and** WATCH signals now receive outcome coverage
 - **No conclusion about strategy superiority is valid without sufficient
   samples for both verdicts, and no tuning has been performed.**
 
-### Phase 8.1B — v2/v3 frozen shadow comparison *(NEXT — not implemented)*
+### Phase 8.1B — v2/v3 frozen shadow comparison *(B1 COMPLETE, B2 pending)*
 
-Remaining prerequisite for any effectiveness judgement of sma150.v3:
+Two substeps. Only B1 is implemented; **Phase 8.1B is NOT fully complete**
+until B2 lands.
 
-- frozen **paired shadow evaluations** of v2 versus v3 on the same
-  symbols/dates, including **AVOID decisions** (e.g. the live JBL case where
-  v2 said ENTER and v3 said AVOID for insufficient independent bounces) so
-  disagreements are measurable, not just coexisting signals;
+#### Phase 8.1B1 — frozen paired decisions *(COMPLETE)*
+
+Admin-triggered, bounded shadow runner
+(`experiment_code = sma150_v2_vs_v3`, `experiment_version =
+sma150_shadow.v1`, migration `010_sma150_shadow_evaluations.sql`) that
+answers exactly: *given the exact same completed OHLCV frame, resolved at
+the same time, what decision did v2 make and what decision did v3 make?*
+
+- **Both arms evaluate the exact same completed OHLCV snapshot.** One
+  provider fetch per symbol; the frame is normalized once (chronological
+  regardless of provider ordering, duplicate dates rejected,
+  malformed/non-finite OHLCV rejected —
+  `frame_snapshot_version = daily_ohlcv_snapshot.v1`) and ONE
+  `ny_session_close.v1` completed-bar decision is applied before either arm
+  runs: a partial current-session bar is excluded for BOTH arms (before the
+  depth cap), unknown completion honestly rejects the pair, and
+  `market_data_as_of` is the last canonical completed bar. v2 can never see
+  a partial bar v3 does not see.
+- **History depth is derived, not assumed.** A bar only joins the bounce
+  lookback once its SMA-150 is valid, so the full configured lookback needs
+  `(sma_window − 1) + lookback + 1` completed bars — **515** with both
+  arms' defaults. The runner derives the shared requirement from both
+  resolved configs (maximum of the two arms), keeps the UNCAPPED
+  `desired_history_bars` separate from the hard-capped (600)
+  `requested_history_bars`, fetches a small margin for possible partial-bar
+  exclusion, and records `desired_history_bars`, `requested_history_bars`,
+  `available_completed_bars`, `history_depth_capped` and
+  `history_depth_complete` per symbol in run telemetry. Completeness is
+  judged against the DESIRED depth: a filled 600-bar cap never reports a
+  complete 800-bar lookback. A provider with less history is recorded
+  honestly (both arms still evaluate the same available frame; their own
+  readiness rules decide) — full configured lookback is never claimed when
+  it was unavailable.
+- **Shadow evaluations include AVOID and are NOT normal signals.** No
+  `save_signal`, no `signals`/`signal_provenance`/`scan_run_signals`/
+  `signal_outcomes` writes, no candidate UI exposure, no scheduler entry.
+  ENTER, WATCH and AVOID persist verbatim (v2 is never normalized into v3
+  semantics; missing v2 evidence.v1 stays explicitly absent; ranking score
+  never changes a verdict).
+- **Immutable paired identity.** One `strategy_shadow_pairs` row per exact
+  comparison input (`pair_fingerprint` = experiment + symbol + timeframe +
+  provider + frame hash + snapshot date + as-of + BOTH arm
+  code/version/policy/config-hash identities — run_id excluded;
+  `shadow_pair_fingerprint.v1`), one `strategy_shadow_evaluations` row per
+  arm (`shadow_evaluation_fingerprint.v1`), and
+  `strategy_shadow_run_pairs` occurrence links: a repeated exact comparison
+  reuses the frozen pair/evaluations and adds only a link. No UPDATE path
+  exists for frozen rows.
+- Configs are resolved once per run from the real registry strategies +
+  operator `pattern_configs` (respected, never modified), sanitized with
+  the existing secret-removal policy and hashed deterministically. v3
+  remains **disabled** for ordinary scans.
+- APIs: `POST /api/admin/shadow/sma150/compare` (explicit symbols, max 25,
+  synchronous or background); `GET /api/shadow/runs/{run_id}`,
+  `GET /api/shadow/pairs` (AND-composed filters, summaries only),
+  `GET /api/shadow/pairs/{pair_id}` (bounded frozen frame + both
+  evaluation snapshots).
+- Verdict combinations are labeled deterministically (`same_enter`, ...,
+  `v2_enter_v3_avoid`, ...). **Disagreement is not automatically
+  improvement**; no parameter tuning occurred; **no effectiveness claim is
+  valid before B2 paired outcomes and sufficient samples.**
+
+#### Phase 8.1B2 — paired outcomes and comparison metrics *(NEXT — not implemented)*
+
+- outcome calculation for frozen shadow pairs (including what happened
+  after paired AVOID decisions) and disagreement-resolution measurement;
 - metrics reported separately by `strategy_version`, `verdict`,
   `decision_policy_version` and `config_hash` — never pooled across
   versions or verdicts;

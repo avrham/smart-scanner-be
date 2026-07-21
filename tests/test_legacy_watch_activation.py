@@ -403,9 +403,12 @@ class TestUnchangedBehavior:
 
     def test_activation_fix_added_no_schema_migration(self):
         """The legacy activation fix itself required no migration. Migration
-        009 exists (Phase 8.1A outcome coverage) but must be the only one
-        after 008; the next boundary is 010."""
+        009 (Phase 8.1A outcome coverage) and 010 (Phase 8.1B1 shadow
+        evaluations) exist as known phases; the next boundary is 011."""
         assert [p.name for p in MIGRATIONS.glob("009_*")] in (
             [], ["009_watch_outcome_coverage.sql"]
         )
-        assert not list(MIGRATIONS.glob("010_*"))
+        assert [p.name for p in MIGRATIONS.glob("010_*")] in (
+            [], ["010_sma150_shadow_evaluations.sql"]
+        )
+        assert not list(MIGRATIONS.glob("011_*"))

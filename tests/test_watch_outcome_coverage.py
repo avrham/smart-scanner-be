@@ -61,9 +61,13 @@ class TestMigration009:
             if not line.lstrip().startswith("--")
         )
 
-    def test_migration_file_exists_and_no_010(self):
+    def test_migration_file_exists_and_boundary(self):
         assert MIGRATION_009.exists()
-        assert not list(MIGRATIONS.glob("010_*"))
+        # 010 is the separate Phase 8.1B1 shadow migration; nothing beyond it.
+        assert [p.name for p in MIGRATIONS.glob("010_*")] in (
+            [], ["010_sma150_shadow_evaluations.sql"]
+        )
+        assert not list(MIGRATIONS.glob("011_*"))
 
     def test_migration_is_additive_and_idempotent(self):
         sql = self._statements()
