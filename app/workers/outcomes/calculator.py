@@ -11,7 +11,7 @@ Conventions:
     (we never invent data).
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 HOLDING_WINDOWS: List[int] = [1, 3, 5, 10, 20]
@@ -38,6 +38,36 @@ def reference_price_role_for_verdict(verdict: Optional[str]) -> Optional[str]:
     if verdict is None:
         return None
     return REFERENCE_PRICE_ROLES.get(str(verdict).upper())
+
+
+def extract_numeric_level(value: Any) -> Optional[float]:
+    """Outcome-compatible scalar from a strategy risk field. Deterministic.
+
+    Strategies may express risk either as a plain numeric level (e.g. the
+    Wyckoff 4H stop/invalidation) or as structured metadata — sma150.v3
+    persists invalidation as {"rule_code", "threshold_pct", "level"}. The
+    signal_outcomes.invalidation column is scalar NUMERIC, so:
+
+      * numeric scalar          -> preserved as float
+      * dict with numeric level -> that level
+      * dict without a numeric level, booleans, strings, anything else -> None
+
+    Never stringifies the object, never coerces booleans into numbers and
+    never raises: a strategy using structured risk metadata must not be able
+    to fail outcome persistence. The strategy's persisted details keep the
+    full structured object untouched.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        level = value.get("level")
+        if isinstance(level, bool):
+            return None
+        if isinstance(level, (int, float)):
+            return float(level)
+    return None
 
 LONG = "LONG"
 SHORT = "SHORT"

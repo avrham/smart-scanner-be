@@ -35,6 +35,7 @@ from app.workers.outcomes.calculator import (
     compute_mfe_mae,
     compute_simulated_r,
     compute_stop_target_hits,
+    extract_numeric_level,
     reference_price_role_for_verdict,
 )
 from app.workers.outcomes.persistence import (
@@ -109,7 +110,13 @@ def build_outcome_from_frames(
     side = (details.get("side") or "LONG").upper()
     stop_price = details.get("stop_price")
     target_price = details.get("target_price")
-    invalidation = details.get("invalidation")
+    # sma150.v3 persists invalidation as a structured object ({"rule_code",
+    # "threshold_pct", "level"}); the outcome column is scalar NUMERIC. Store
+    # only the compatible numeric level (or None) — the signal's structured
+    # evidence stays untouched in details. Audited: stop_price/target_price
+    # are only ever numeric-or-None today (Wyckoff scalars; v2/v3 set none),
+    # so they keep their direct pass-through.
+    invalidation = extract_numeric_level(details.get("invalidation"))
     snapshot_date = _as_date(signal.get("snapshot_date"))
     signal_timestamp = signal.get("created_at") or signal.get("snapshot_date")
 
@@ -259,11 +266,27 @@ async def calculate_outcomes_for_signals(
             summary["errors"] += 1
             logger.error("Outcome calculation failed for %s: %s", symbol, exc)
             try:
+                # The error row must carry the SAME frozen identity as any
+                # other outcome row: provenance copied from the signal's
+                # provenance record (NULLs preserved for legacy signals —
+                # never inferred from pattern_code), plus the Phase 8.1A
+                # verdict/reference-role/coverage identity. A later
+                # include_recalc rerun repairs this row in place via the
+                # ON CONFLICT (signal_id) upsert.
+                err_prov = signal.get("provenance") or {}
                 await upsert_signal_outcome(
                     {
                         "signal_id": signal["signal_id"],
                         "symbol": symbol,
                         "pattern_code": signal.get("pattern_code"),
+                        "scan_run_id": err_prov.get("scan_run_id"),
+                        "strategy_code": err_prov.get("strategy_code"),
+                        "strategy_version": err_prov.get("strategy_version"),
+                        "decision_policy_version": err_prov.get(
+                            "decision_policy_version"
+                        ),
+                        "config_hash": err_prov.get("config_hash"),
+                        "provenance_version": err_prov.get("provenance_version"),
                         "side": "LONG",
                         "signal_timestamp": signal.get("created_at")
                         or signal.get("snapshot_date"),
