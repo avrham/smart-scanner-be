@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 class FMPProvider(MarketDataProvider):
     name = "fmp"
+    # get_daily_bars below is a latest-600 filter, NOT true range retrieval:
+    # a range older than the most recent ~600 bars would silently lose bars.
+    # Phase 8.1B2 outcome calculation therefore rejects FMP pairs honestly
+    # (provider_range_unsupported) instead of risking misaligned forward bars.
+    supports_bounded_daily_range = False
 
     def __init__(self, client: Optional[FMPClient] = None):
         self.client = client or FMPClient(

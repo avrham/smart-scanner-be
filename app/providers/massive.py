@@ -57,6 +57,10 @@ def _parse_provider_ts(value: Any) -> Optional[datetime]:
 
 class MassiveProvider(MarketDataProvider):
     name = "massive"
+    # get_daily_bars maps directly onto Massive aggregates over an explicit
+    # [from_date, to_date] window — genuine bounded range retrieval, so old
+    # shadow pairs remain calculable after they leave any latest-N window.
+    supports_bounded_daily_range = True
 
     def __init__(self, client: Optional[MassiveClient] = None):
         self.client = client or MassiveClient(api_key=settings.MASSIVE_API_KEY)

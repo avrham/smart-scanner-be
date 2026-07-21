@@ -211,6 +211,36 @@ async def get_local_daily_bars(symbol: str, limit: int = 600) -> List[Dict[str, 
         await release_db_connection(conn)
 
 
+async def get_local_daily_bars_range(
+    symbol: str,
+    from_date: date,
+    to_date: date,
+) -> List[Dict[str, Any]]:
+    """Locally stored bars for one symbol within [from_date, to_date]
+    (ascending). Bounded date-range read for the Phase 8.1B2 read-through
+    cache: unlike get_local_daily_bars (latest-N), an old range stays
+    readable no matter how much newer history exists. Callers must never
+    assume the local range is COMPLETE — missing sessions are simply absent.
+    """
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT symbol, trading_date, open, high, low, close, volume, vwap,
+                   transaction_count
+            FROM daily_bars
+            WHERE symbol = $1 AND trading_date >= $2 AND trading_date <= $3
+            ORDER BY trading_date ASC
+            """,
+            symbol,
+            from_date,
+            to_date,
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await release_db_connection(conn)
+
+
 async def get_latest_bar_date(symbol: str) -> Optional[date]:
     conn = await get_db_connection()
     try:

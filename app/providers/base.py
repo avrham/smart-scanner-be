@@ -19,6 +19,13 @@ class MarketDataProvider(ABC):
 
     name: str = "unknown"
 
+    # Whether get_daily_bars performs REAL bounded date-range retrieval
+    # (arbitrary historical [from_date, to_date] windows) rather than
+    # filtering a fixed latest-N payload. Phase 8.1B2 outcome calculation
+    # requires True: an old range served from a latest-N shim would silently
+    # lose bars and corrupt forward-bar alignment. Conservative default.
+    supports_bounded_daily_range: bool = False
+
     # ---- discovery / ingestion ---- #
 
     @abstractmethod
