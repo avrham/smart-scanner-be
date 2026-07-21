@@ -562,12 +562,14 @@ Persisted ENTER **and** WATCH signals now receive outcome coverage
 - **No conclusion about strategy superiority is valid without sufficient
   samples for both verdicts, and no tuning has been performed.**
 
-### Phase 8.1B — v2/v3 frozen shadow comparison *(B1 COMPLETE, B2 pending)*
+### Phase 8.1B — v2/v3 frozen shadow comparison *(B1 COMPLETE + live-validated; B2 implemented, migration unapplied, live validation pending)*
 
-Two substeps. Only B1 is implemented; **Phase 8.1B is NOT fully complete**
-until B2 lands.
+Two substeps. B1 is complete and live-validated. B2 is implemented in code
+with migration `011_shadow_pair_outcomes.sql` **created but unapplied** until
+explicitly approved. **Do not mark B2 live-validated** until a bounded smoke
+run against the frozen live pairs succeeds after migration apply.
 
-#### Phase 8.1B1 — frozen paired decisions *(COMPLETE)*
+#### Phase 8.1B1 — frozen paired decisions *(COMPLETE + live-validated)*
 
 Admin-triggered, bounded shadow runner
 (`experiment_code = sma150_v2_vs_v3`, `experiment_version =
@@ -629,15 +631,67 @@ the same time, what decision did v2 make and what decision did v3 make?*
   improvement**; no parameter tuning occurred; **no effectiveness claim is
   valid before B2 paired outcomes and sufficient samples.**
 
-#### Phase 8.1B2 — paired outcomes and comparison metrics *(NEXT — not implemented)*
+#### Phase 8.1B2 — paired market-path outcomes and neutral comparison metrics *(implemented; migration unapplied; live validation pending)*
 
-- outcome calculation for frozen shadow pairs (including what happened
-  after paired AVOID decisions) and disagreement-resolution measurement;
-- metrics reported separately by `strategy_version`, `verdict`,
-  `decision_policy_version` and `config_hash` — never pooled across
-  versions or verdicts;
-- no historical inference and no fabricated provenance;
-- **no parameter tuning** — observation only.
+Migration: `011_shadow_pair_outcomes.sql` (tables
+`strategy_shadow_pair_outcomes`, `strategy_shadow_outcome_runs`). Additive
+only; migration 010 is unchanged. **Not applied live until approved.**
+
+- **One market-path outcome per frozen pair** (never per arm). Both arms
+  share the same forward path; control/candidate return deltas are never
+  calculated or exposed. Failed B1 runs with no pairs are structurally
+  excluded from selection.
+- **Neutral reference semantics.** Reference price is exclusively the close
+  of the last bar of the frozen B1 `frame_snapshot`
+  (`reference_price_role = paired_decision_observation`) — identical for
+  ENTER, WATCH and AVOID. A re-fetched snapshot close may only set
+  `reference_revision_detected`; it never replaces the frozen close.
+- **Reference continuity gate.** New horizons are calculated only when the
+  bounded provider range contains the exact snapshot-date bar AND its close
+  matches the frozen reference within tolerance. A missing bar rejects with
+  `snapshot_bar_missing`; a diverging close (split / provider revision)
+  rejects with `reference_revision_detected` — a revised forward price
+  scale is never combined with an incompatible frozen reference, so a stock
+  split can never surface as a bogus return. Previously frozen horizons and
+  a partial/complete status are never erased by these rejections.
+- **Math vs coverage.** Holding-window / MFE-MAE / benchmark math reuses
+  `calculation_version = outcome.v1`. Coverage identity is
+  `outcome_coverage_version = shadow_pair_outcomes.v1` with forward frame
+  `shadow_forward_bars.v1`. No stop/target/R, no same-ticker buy-and-hold
+  baseline (tautological with the pair return), no signal_outcomes writes.
+- **Forward provider continuity.** Forward bars come from the frozen pair
+  provider via bounded date-range retrieval (`FORWARD_CALENDAR_CAP_DAYS =
+  45`). Mismatch → `provider_mismatch`; latest-N-only providers →
+  `provider_range_unsupported`. Cross-provider continuation is out of
+  contract for v1.
+- **Write-once horizon maturation.** NULL horizons may fill; calculated
+  horizons freeze — enforced both in the merge layer and in the UPDATE
+  statement itself (`COALESCE(column, incoming)`, `GREATEST` bar counts,
+  identity columns absent from the SET list, `ON CONFLICT DO NOTHING`
+  insert race handling), so concurrent maturation writers cannot lose or
+  overwrite each other's matured values. MFE/MAE update only when completed
+  forward bar count increases AND stay monotonic (MFE never shrinks, MAE
+  never becomes less adverse; violations keep the stored value and record a
+  bounded, de-duplicated revision note). Benchmark returns merge per
+  benchmark per horizon. Status:
+  `pending_forward_bars` → `partial` → `complete` (or `error`). Complete
+  never regresses, and an operational error never erases a partial or
+  complete state. Outcome fingerprint is stable across maturation.
+- **Neutral resolution metrics** (`shadow_pair_resolution_metrics.v1`).
+  Mandatory grouping identity (experiment + both arm strategy/policy/config
+  identities and verdicts + disagreement category + calculation/coverage/
+  forward-frame versions + forward provider) — never pooled. Canonical
+  rate term is `positive_return_rate` (never `win_rate`). Neutral bands
+  (1D/3D ±0.5%, 5D/10D/20D ±1.0%) are metrics-layer only. Action-
+  divergent categories derive an arm-neutral `enter_arm`; WATCH/AVOID
+  disagreements and agreements are `action_resolvable=false`. **No
+  superiority / winner / improvement / promote / disable claims and no
+  parameter tuning.**
+- **APIs:** `POST /api/admin/shadow/outcomes/calculate` (worker-token,
+  bounded selectors, sync or background); `GET /api/shadow/outcomes`,
+  `GET /api/shadow/outcomes/metrics`, `GET /api/shadow/outcomes/{pair_id}`.
+- **v3 remains disabled** for ordinary scans. No scheduler entry. No UI
+  candidate exposure. Isolation from signals / signal_outcomes preserved.
 
 ### Phase 9 — deterministic Wyckoff technical engine v2
 
