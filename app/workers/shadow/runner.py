@@ -62,6 +62,7 @@ from app.workers.shadow.serialization import (
     ShadowSerializationError,
     normalize_json_safe,
 )
+from app.workers.shadow.typed_values import ShadowPersistenceTypeError
 from app.workers.strategies import StrategyContext, get_strategy
 
 
@@ -384,6 +385,19 @@ async def run_shadow_comparison(
                 rejected["details_snapshot_too_large"] += 1
                 rejected_symbols.setdefault(
                     "details_snapshot_too_large", []
+                ).append(symbol)
+                continue
+            except ShadowPersistenceTypeError as exc:
+                # Deterministic application-level type failure at the typed
+                # persistence boundary — never collapsed into pair_error.
+                # Logs only the symbol, safe reason code and field name.
+                logger.error(
+                    "Shadow persistence type error for %s: %s (field %s)",
+                    symbol, exc.reason_code, exc.field,
+                )
+                rejected["persistence_type_error"] += 1
+                rejected_symbols.setdefault(
+                    "persistence_type_error", []
                 ).append(symbol)
                 continue
             except ShadowIntegrityError as exc:

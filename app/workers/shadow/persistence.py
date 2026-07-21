@@ -30,6 +30,15 @@ from app.workers.shadow.constants import (
 )
 from app.workers.shadow.fingerprints import disagreement_category
 from app.workers.shadow.serialization import normalize_json_safe, strict_json
+from app.workers.shadow.typed_values import (
+    ShadowPersistenceTypeError,
+    as_bool_param,
+    as_date_param,
+    as_int_param,
+    as_score_param,
+    as_utc_datetime_param,
+    as_uuid_param,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -83,12 +92,13 @@ async def create_shadow_run(
             VALUES ($1, $2, $3, 'running', $4, $5, $6, NOW(), NOW(), NOW())
             ON CONFLICT (id) DO NOTHING
             """,
-            uuid_lib.UUID(str(run_id)),
+            as_uuid_param(run_id, "run_id"),
             EXPERIMENT_CODE,
             EXPERIMENT_VERSION,
             provider,
             strict_json([str(s) for s in requested_symbols]),
-            requested_limit,
+            None if requested_limit is None
+            else as_int_param(requested_limit, "requested_limit"),
         )
         return str(run_id)
     finally:
@@ -118,7 +128,7 @@ async def finalize_shadow_run(
                 updated_at = NOW()
             WHERE id = $1
             """,
-            uuid_lib.UUID(str(run_id)),
+            as_uuid_param(run_id, "run_id"),
             status,
             _bounded_telemetry(telemetry),
             error_code,
@@ -184,19 +194,27 @@ async def persist_shadow_pair(
                             $12, $13, $14, $15, $16, $17, NOW())
                     """,
                     pair_id,
-                    uuid_lib.UUID(str(run_id)),
+                    as_uuid_param(run_id, "origin_run_id"),
                     pair["experiment_code"],
                     pair["experiment_version"],
                     pair["symbol"],
                     pair["timeframe"],
                     pair["provider"],
-                    pair["snapshot_date"],
-                    pair["market_data_as_of"],
+                    # asyncpg's DATE codec requires datetime.date (an ISO
+                    # string raises "'str' object has no attribute
+                    # 'toordinal'" — the live pair_error). The canonical
+                    # frame keeps ISO strings for hashing/JSON; conversion
+                    # to the driver type happens ONLY here, at the typed
+                    # persistence boundary.
+                    as_date_param(pair["snapshot_date"], "snapshot_date"),
+                    as_utc_datetime_param(
+                        pair["market_data_as_of"], "market_data_as_of"
+                    ),
                     pair["frame_snapshot_version"],
                     pair["frame_hash"],
-                    pair["frame_bar_count"],
-                    pair["frame_first_date"],
-                    pair["frame_last_date"],
+                    as_int_param(pair["frame_bar_count"], "frame_bar_count"),
+                    as_date_param(pair["frame_first_date"], "frame_first_date"),
+                    as_date_param(pair["frame_last_date"], "frame_last_date"),
                     strict_json(pair["frame_snapshot"]),
                     pair["pair_fingerprint"],
                     pair["pair_fingerprint_version"],
@@ -224,7 +242,7 @@ async def persist_shadow_pair(
                         ev["config_hash"],
                         strict_json(ev["config_snapshot"]),
                         ev["verdict"],
-                        ev["score"],
+                        as_score_param(ev["score"], "score"),
                         ev["reason"],
                         ev["rejection_reason"],
                         strict_json(ev["details_snapshot"]),
@@ -243,9 +261,9 @@ async def persist_shadow_pair(
                 VALUES ($1, $2, $3, NOW())
                 ON CONFLICT (run_id, pair_id) DO NOTHING
                 """,
-                uuid_lib.UUID(str(run_id)),
-                pair_id,
-                created_new,
+                as_uuid_param(run_id, "run_id"),
+                as_uuid_param(pair_id, "pair_id"),
+                as_bool_param(created_new, "created_new_pair"),
             )
 
         return {"pair_id": str(pair_id), "created_new_pair": created_new}

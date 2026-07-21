@@ -28,6 +28,7 @@ from app.workers.shadow.serialization import (
     normalize_json_safe,
     strict_json,
 )
+from app.workers.shadow.typed_values import ShadowPersistenceTypeError
 
 __all__ = [
     "CANDIDATE_ARM_CODE",
@@ -39,6 +40,7 @@ __all__ = [
     "FrameRejection",
     "MAX_SHADOW_SYMBOLS",
     "PAIR_FINGERPRINT_VERSION",
+    "ShadowPersistenceTypeError",
     "ShadowSerializationError",
     "build_canonical_frame",
     "normalize_json_safe",
