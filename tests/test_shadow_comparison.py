@@ -192,8 +192,12 @@ class TestMigration010:
     def test_migration_file_exists_with_exact_name(self):
         assert MIGRATION_010.exists()
 
-    def test_no_migration_011(self):
-        assert not list(MIGRATIONS_DIR.glob("011_*"))
+    def test_exactly_migration_011_no_012(self):
+        # Phase 8.1B2 adds exactly ONE new migration; 010 stays untouched.
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("011_*"))] == [
+            "011_shadow_pair_outcomes.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("012_*"))
 
     def test_additive_and_idempotent(self):
         sql = self._statements()

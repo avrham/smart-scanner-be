@@ -402,13 +402,15 @@ class TestUnchangedBehavior:
         assert unknown["decision_policy_version"] is None
 
     def test_activation_fix_added_no_schema_migration(self):
-        """The legacy activation fix itself required no migration. Migration
-        009 (Phase 8.1A outcome coverage) and 010 (Phase 8.1B1 shadow
-        evaluations) exist as known phases; the next boundary is 011."""
-        assert [p.name for p in MIGRATIONS.glob("009_*")] in (
-            [], ["009_watch_outcome_coverage.sql"]
-        )
-        assert [p.name for p in MIGRATIONS.glob("010_*")] in (
-            [], ["010_sma150_shadow_evaluations.sql"]
-        )
-        assert not list(MIGRATIONS.glob("011_*"))
+        """The legacy activation fix itself required no migration. Migrations
+        009–011 are known later phases; the next boundary is 012."""
+        assert [p.name for p in MIGRATIONS.glob("009_*")] == [
+            "009_watch_outcome_coverage.sql"
+        ]
+        assert [p.name for p in MIGRATIONS.glob("010_*")] == [
+            "010_sma150_shadow_evaluations.sql"
+        ]
+        assert [p.name for p in sorted(MIGRATIONS.glob("011_*"))] == [
+            "011_shadow_pair_outcomes.sql"
+        ]
+        assert not list(MIGRATIONS.glob("012_*"))

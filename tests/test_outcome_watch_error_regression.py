@@ -401,11 +401,14 @@ class TestNoBehaviorDrift:
         assert CALCULATION_VERSION == "outcome.v1"
         assert OUTCOME_COVERAGE_VERSION == "candidate_outcomes.v1"
 
-    def test_no_migration_011(self):
-        """010 is the separate Phase 8.1B1 shadow-evaluations migration;
-        nothing beyond it exists."""
+    def test_exactly_migration_011_no_012(self):
+        """010 is Phase 8.1B1; 011 is Phase 8.1B2 pair outcomes; nothing
+        beyond 011 exists yet."""
         migrations = Path(__file__).resolve().parents[1] / "app" / "db" / "migrations"
-        assert [p.name for p in migrations.glob("010_*")] in (
-            [], ["010_sma150_shadow_evaluations.sql"]
-        )
-        assert not list(migrations.glob("011_*"))
+        assert [p.name for p in migrations.glob("010_*")] == [
+            "010_sma150_shadow_evaluations.sql"
+        ]
+        assert [p.name for p in sorted(migrations.glob("011_*"))] == [
+            "011_shadow_pair_outcomes.sql"
+        ]
+        assert not list(migrations.glob("012_*"))

@@ -327,16 +327,18 @@ class TestMigration008:
             assert key in V3_DEFAULT_CONFIG
 
     def test_phase8_created_no_migration_beyond_008(self):
-        """Phase 8 itself added only 008. Migrations 009 (Phase 8.1A) and
-        010 (Phase 8.1B1) are separate known phases; nothing beyond them
-        exists."""
-        assert [p.name for p in MIGRATIONS.glob("009_*")] in (
-            [], ["009_watch_outcome_coverage.sql"]
-        )
-        assert [p.name for p in MIGRATIONS.glob("010_*")] in (
-            [], ["010_sma150_shadow_evaluations.sql"]
-        )
-        assert not list(MIGRATIONS.glob("011_*"))
+        """Phase 8 itself added only 008. Migrations 009–011 are separate
+        known later phases; nothing beyond 011 exists."""
+        assert [p.name for p in MIGRATIONS.glob("009_*")] == [
+            "009_watch_outcome_coverage.sql"
+        ]
+        assert [p.name for p in MIGRATIONS.glob("010_*")] == [
+            "010_sma150_shadow_evaluations.sql"
+        ]
+        assert [p.name for p in sorted(MIGRATIONS.glob("011_*"))] == [
+            "011_shadow_pair_outcomes.sql"
+        ]
+        assert not list(MIGRATIONS.glob("012_*"))
 
     def test_v3_defaults_copy_is_isolated(self):
         """default_config() returns an independent copy (mutation-safe)."""
