@@ -577,6 +577,101 @@ async def shadow_sma150_compare(
     return {"message": "Shadow comparison completed", **summary}
 
 
+@router.post("/shadow/outcomes/calculate")
+async def shadow_outcomes_calculate(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+    pair_ids: Optional[List[str]] = Body(None),
+    symbols: Optional[List[str]] = Body(None),
+    run_id: Optional[str] = Body(None),
+    pending: bool = Body(False),
+    limit: Optional[int] = Body(None),
+    include_recalc: bool = Body(False),
+    run_in_background: bool = Body(False),
+):
+    """Phase 8.1B2: bounded market-path outcome calculation for frozen B1
+    shadow pairs.
+
+    Exactly ONE outcome per pair (never per arm). Requires at least one
+    selector (pair_ids / symbols / run_id) or pending=true — there is no
+    unbounded all-history mode. Selectors AND-compose; limit defaults to 50
+    with a hard cap of 200. Forward data must come from the frozen pair's
+    provider (provider_mismatch otherwise) via bounded date-range retrieval
+    (provider_range_unsupported otherwise). Synchronous by default
+    (smoke-test friendly); run_in_background=true uses the in-process
+    BackgroundTasks pattern (no resumable-execution claim). Never scheduled;
+    never touches signals/signal_outcomes; never enables v3.
+    """
+    from app.workers.shadow.outcomes.service import (
+        ShadowOutcomeRequestError,
+        normalize_outcome_request,
+        run_shadow_outcome_calculation,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        request = normalize_outcome_request(
+            pair_ids=pair_ids,
+            symbols=symbols,
+            run_id=run_id,
+            pending=pending,
+            limit=limit,
+            include_recalc=include_recalc,
+        )
+    except ShadowOutcomeRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    outcome_run_id = str(uuid.uuid4())
+
+    if run_in_background:
+        async def _run() -> None:
+            try:
+                summary = await run_shadow_outcome_calculation(
+                    provider,
+                    pair_ids=request["pair_ids"] or None,
+                    symbols=request["symbols"] or None,
+                    run_id=request["run_id"],
+                    pending=request["pending"],
+                    limit=request["limit"],
+                    include_recalc=request["include_recalc"],
+                    outcome_run_id=outcome_run_id,
+                )
+                logger.info(
+                    "[ADMIN] shadow outcome run %s finished: status=%s",
+                    outcome_run_id, summary.get("status"),
+                )
+            except Exception as exc:
+                logger.error(
+                    "[ADMIN] shadow outcome run %s failed: %s",
+                    outcome_run_id, exc,
+                )
+
+        background_tasks.add_task(_run)
+        return {
+            "message": "Shadow outcome calculation enqueued",
+            "outcome_run_id": outcome_run_id,
+            "limit": request["limit"],
+        }
+
+    summary = await run_shadow_outcome_calculation(
+        provider,
+        pair_ids=request["pair_ids"] or None,
+        symbols=request["symbols"] or None,
+        run_id=request["run_id"],
+        pending=request["pending"],
+        limit=request["limit"],
+        include_recalc=request["include_recalc"],
+        outcome_run_id=outcome_run_id,
+    )
+    return {"message": "Shadow outcome calculation completed", **summary}
+
+
 @router.get("/status")
 async def get_status(
     _: str = Depends(get_worker_token),
