@@ -27,14 +27,17 @@ evidence snapshot. Unknown stays unknown; nothing is fabricated.
 
 import logging
 import statistics
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 from app.workers.indicators import sma, validate_dataframe
+from app.workers.strategies.bar_completion import (
+    BAR_COMPLETION_POLICY,
+    assess_latest_bar_completion as _assess_latest_bar_completion_impl,
+)
 from app.workers.strategies.base import (
     Strategy,
     StrategyContext,
@@ -58,10 +61,11 @@ DECISION_POLICY_VERSION = "sma150_bounce.policy.v1"
 # never be confused with v1 rankings. NOT a probability.
 RANKING_VERSION = "sma150.v3.rank.v1"
 INVALIDATION_RULE_CODE = "daily_close_below_sma150_pct"
-# Completed-daily-bar policy (versioned; persisted in config snapshot +
-# evidence). A daily aggregate returned by a provider may represent the
-# still-open US session; v3 must never confirm a trigger on a partial bar.
-BAR_COMPLETION_POLICY = "ny_session_close.v1"
+# Completed-daily-bar policy (ny_session_close.v1): the implementation now
+# lives in app.workers.strategies.bar_completion (extracted in Phase 9A so
+# wyckoff_mtf.v2 can share it). BAR_COMPLETION_POLICY is re-exported above;
+# assess_latest_bar_completion below preserves this module's import surface
+# AND its injectable `_utc_now` clock, byte-for-byte in behavior.
 
 # All decision-relevant values are configurable; DB pattern_configs override
 # these defaults via the existing resolver. No magic constants in the logic.
@@ -127,7 +131,7 @@ def _utc_now() -> datetime:
 
 
 # --------------------------------------------------------------------------- #
-# Completed-daily-bar policy (ny_session_close.v1)
+# Completed-daily-bar policy (ny_session_close.v1) — shared implementation
 # --------------------------------------------------------------------------- #
 
 def assess_latest_bar_completion(
@@ -138,62 +142,21 @@ def assess_latest_bar_completion(
     explicit_completed: Optional[bool] = None,
     now_utc: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Decide whether the LATEST daily bar is a completed session bar.
+    """Compatibility surface for the shared ny_session_close.v1 policy.
 
-    Deterministic rules, in priority order:
-      1. explicit caller/provider metadata (`explicit_completed`) wins;
-      2. a bar dated strictly BEFORE the current exchange-session date is
-         completed (past sessions cannot still be open);
-      3. a bar dated ON the current exchange-session date is completed only
-         at/after the configured session close in the exchange timezone
-         (never a bare wall-clock check — timezone + session close always
-         apply; early-close days are treated conservatively as incomplete
-         until the regular close, which can only exclude, never include);
-      4. a future-dated bar (or an unusable policy input) is UNKNOWN — the
-         caller must refuse rather than guess.
-
-    Returns {"state": "completed"|"partial"|"unknown", "reason": str,
-             "bar_date": ISO date or None, "policy": BAR_COMPLETION_POLICY}.
+    The implementation was extracted verbatim to
+    `app.workers.strategies.bar_completion` (Phase 9A). This wrapper keeps
+    the exact public signature and return contract, and keeps THIS module's
+    injectable `_utc_now` clock authoritative for its callers (tests pin
+    `sma150_v3._utc_now` to freeze the evaluation time).
     """
-    result: Dict[str, Any] = {"policy": BAR_COMPLETION_POLICY, "bar_date": None}
-
-    if df is None or len(df) == 0 or "date" not in getattr(df, "columns", []):
-        result.update(state="unknown", reason="no_bars")
-        return result
-    try:
-        bar_date: date = pd.to_datetime(df.iloc[-1]["date"]).date()
-    except Exception:
-        result.update(state="unknown", reason="unparseable_bar_date")
-        return result
-    result["bar_date"] = bar_date.isoformat()
-
-    if explicit_completed is True:
-        result.update(state="completed", reason="explicit_metadata")
-        return result
-    if explicit_completed is False:
-        result.update(state="partial", reason="explicit_metadata")
-        return result
-
-    try:
-        tz = ZoneInfo(exchange_timezone)
-        close_hour, close_minute = (
-            int(p) for p in str(session_close_time).split(":")[:2]
-        )
-    except Exception:
-        result.update(state="unknown", reason="invalid_completion_policy")
-        return result
-
-    now_exchange = (now_utc or _utc_now()).astimezone(tz)
-    if bar_date < now_exchange.date():
-        result.update(state="completed", reason="prior_session_date")
-    elif bar_date == now_exchange.date():
-        if (now_exchange.hour, now_exchange.minute) >= (close_hour, close_minute):
-            result.update(state="completed", reason="after_session_close")
-        else:
-            result.update(state="partial", reason="session_in_progress")
-    else:
-        result.update(state="unknown", reason="future_dated_bar")
-    return result
+    return _assess_latest_bar_completion_impl(
+        df,
+        exchange_timezone=exchange_timezone,
+        session_close_time=session_close_time,
+        explicit_completed=explicit_completed,
+        now_utc=now_utc if now_utc is not None else _utc_now(),
+    )
 
 
 def _completion_item(
