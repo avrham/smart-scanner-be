@@ -17,6 +17,7 @@ import pandas as pd
 
 from app.workers.strategies.wyckoff_v2.constants import (
     AGGREGATION_VERSION,
+    PHASE_CANDIDATE_VERSION,
     RANGE_CANDIDATE_VERSION,
     RANGE_DETECTION_VERSION,
     READINESS_VERSION,
@@ -330,10 +331,384 @@ class RangeDetectionResult:
         return _json_safe(payload, "RangeDetectionResult")
 
 
+# --------------------------------------------------------------------------- #
+# Phase 9B contracts
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class HTFContextResult:
+    """Higher-timeframe context from completed monthly/weekly periods only."""
+
+    htf_context_version: str
+    as_of_date: str
+    monthly_bias: str
+    monthly_sma: Optional[float]
+    monthly_slope_pct: Optional[float]
+    monthly_trend_quality: Optional[float]
+    monthly_window_structure: str
+    monthly_window_raw: Dict[str, Optional[float]]
+    weekly_bias: str
+    weekly_sma: Optional[float]
+    weekly_slope_pct: Optional[float]
+    weekly_trend_quality: Optional[float]
+    weekly_window_structure: str
+    weekly_window_raw: Dict[str, Optional[float]]
+    htf_alignment: str
+    contradiction_codes: Tuple[str, ...]
+    missing_data: Tuple[str, ...]
+    config_used: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "htf_context_version": self.htf_context_version,
+            "as_of_date": self.as_of_date,
+            "monthly_bias": self.monthly_bias,
+            "monthly_sma": _require_finite(self.monthly_sma, "monthly_sma"),
+            "monthly_slope_pct": _require_finite(
+                self.monthly_slope_pct, "monthly_slope_pct"
+            ),
+            "monthly_trend_quality": _require_finite(
+                self.monthly_trend_quality, "monthly_trend_quality"
+            ),
+            "monthly_window_structure": self.monthly_window_structure,
+            "monthly_window_raw": {
+                k: _require_finite(v, f"monthly_window_raw.{k}")
+                for k, v in self.monthly_window_raw.items()
+            },
+            "weekly_bias": self.weekly_bias,
+            "weekly_sma": _require_finite(self.weekly_sma, "weekly_sma"),
+            "weekly_slope_pct": _require_finite(
+                self.weekly_slope_pct, "weekly_slope_pct"
+            ),
+            "weekly_trend_quality": _require_finite(
+                self.weekly_trend_quality, "weekly_trend_quality"
+            ),
+            "weekly_window_structure": self.weekly_window_structure,
+            "weekly_window_raw": {
+                k: _require_finite(v, f"weekly_window_raw.{k}")
+                for k, v in self.weekly_window_raw.items()
+            },
+            "htf_alignment": self.htf_alignment,
+            "contradiction_codes": list(self.contradiction_codes),
+            "missing_data": list(self.missing_data),
+            "config_used": dict(self.config_used),
+        }
+        return _json_safe(payload, "HTFContextResult")
+
+
+@dataclass(frozen=True)
+class EffortResultMeasurement:
+    """Causal effort-vs-result measurement for one completed daily bar."""
+
+    effort_result_version: str
+    date: str
+    index: int
+    timeframe: str
+    atr: Optional[float]
+    price_spread: Optional[float]
+    spread_atr_ratio: Optional[float]
+    close_location_value: Optional[float]
+    previous_close: Optional[float]
+    directional_result_pct: Optional[float]
+    directional_result_atr_ratio: Optional[float]
+    volume: Optional[float]
+    relative_volume: Optional[float]
+    volume_baseline_mean: Optional[float]
+    volume_baseline_usable_bars: int
+    effort_state: str
+    result_state: str
+    effort_result_state: str
+    missing_data: Tuple[str, ...]
+    raw_components: Dict[str, Optional[float]]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "effort_result_version": self.effort_result_version,
+            "date": self.date,
+            "index": int(self.index),
+            "timeframe": self.timeframe,
+            "atr": _require_finite(self.atr, "atr"),
+            "price_spread": _require_finite(self.price_spread, "price_spread"),
+            "spread_atr_ratio": _require_finite(
+                self.spread_atr_ratio, "spread_atr_ratio"
+            ),
+            "close_location_value": _require_finite(
+                self.close_location_value, "close_location_value"
+            ),
+            "previous_close": _require_finite(
+                self.previous_close, "previous_close"
+            ),
+            "directional_result_pct": _require_finite(
+                self.directional_result_pct, "directional_result_pct"
+            ),
+            "directional_result_atr_ratio": _require_finite(
+                self.directional_result_atr_ratio,
+                "directional_result_atr_ratio",
+            ),
+            "volume": _require_finite(self.volume, "volume"),
+            "relative_volume": _require_finite(
+                self.relative_volume, "relative_volume"
+            ),
+            "volume_baseline_mean": _require_finite(
+                self.volume_baseline_mean, "volume_baseline_mean"
+            ),
+            "volume_baseline_usable_bars": int(self.volume_baseline_usable_bars),
+            "effort_state": self.effort_state,
+            "result_state": self.result_state,
+            "effort_result_state": self.effort_result_state,
+            "missing_data": list(self.missing_data),
+            "raw_components": {
+                k: _require_finite(v, f"raw_components.{k}")
+                for k, v in self.raw_components.items()
+            },
+        }
+        return _json_safe(payload, "EffortResultMeasurement")
+
+
+@dataclass(frozen=True)
+class EventCandidate:
+    """One Wyckoff event candidate (never claimed as textbook certainty)."""
+
+    event_candidate_version: str
+    candidate_id: str
+    range_candidate_id: str
+    family: str
+    event_code: str
+    event_label: str
+    date: str
+    index: int
+    timeframe: str
+    as_of_date: str
+    price: float
+    level: Optional[float]
+    direction: str
+    status: str
+    confirmation_status: str
+    confirmation_end_date: Optional[str]
+    range_relationship: str
+    effort_result: Dict[str, Any]
+    required_gate_results: Dict[str, bool]
+    confidence_components: Dict[str, Optional[float]]
+    confidence: Optional[float]
+    supporting_candidate_ids: Tuple[str, ...]
+    contradicting_candidate_ids: Tuple[str, ...]
+    reason_codes: Tuple[str, ...]
+    usable_for_structure: bool
+    metadata: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "event_candidate_version": self.event_candidate_version,
+            "candidate_id": self.candidate_id,
+            "range_candidate_id": self.range_candidate_id,
+            "family": self.family,
+            "event_code": self.event_code,
+            "event_label": self.event_label,
+            "date": self.date,
+            "index": int(self.index),
+            "timeframe": self.timeframe,
+            "as_of_date": self.as_of_date,
+            "price": _require_finite(self.price, "price"),
+            "level": _require_finite(self.level, "level"),
+            "direction": self.direction,
+            "status": self.status,
+            "confirmation_status": self.confirmation_status,
+            "confirmation_end_date": self.confirmation_end_date,
+            "range_relationship": self.range_relationship,
+            "effort_result": dict(self.effort_result),
+            "required_gate_results": {
+                str(k): bool(v) for k, v in self.required_gate_results.items()
+            },
+            "confidence_components": {
+                k: _require_finite(v, f"confidence_components.{k}")
+                for k, v in self.confidence_components.items()
+            },
+            "confidence": _require_finite(self.confidence, "confidence"),
+            "supporting_candidate_ids": list(self.supporting_candidate_ids),
+            "contradicting_candidate_ids": list(self.contradicting_candidate_ids),
+            "reason_codes": list(self.reason_codes),
+            "usable_for_structure": bool(self.usable_for_structure),
+            "metadata": dict(self.metadata),
+        }
+        return _json_safe(payload, "EventCandidate")
+
+
+@dataclass(frozen=True)
+class EventDetectionResult:
+    """Result of wyckoff_events.v1 candidate detection for one range."""
+
+    event_detection_version: str
+    as_of_date: str
+    range_candidate_id: str
+    candidates: Tuple[EventCandidate, ...]
+    candidates_by_code: Dict[str, Tuple[EventCandidate, ...]]
+    rejection_reason_counts: Dict[str, int]
+    candidates_truncated: bool
+    config_used: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "event_detection_version": self.event_detection_version,
+            "as_of_date": self.as_of_date,
+            "range_candidate_id": self.range_candidate_id,
+            "candidates": [c.to_dict() for c in self.candidates],
+            "candidates_by_code": {
+                str(k): [c.to_dict() for c in v]
+                for k, v in self.candidates_by_code.items()
+            },
+            "rejection_reason_counts": {
+                str(k): int(v) for k, v in self.rejection_reason_counts.items()
+            },
+            "candidates_truncated": bool(self.candidates_truncated),
+            "config_used": dict(self.config_used),
+        }
+        return _json_safe(payload, "EventDetectionResult")
+
+
+@dataclass(frozen=True)
+class StructureClassificationResult:
+    """Accumulation / distribution / unknown from usable confirmed events."""
+
+    phase_classification_version: str
+    as_of_date: str
+    range_candidate_id: str
+    classification: str
+    state: str
+    accumulation_event_types: Tuple[str, ...]
+    distribution_event_types: Tuple[str, ...]
+    accumulation_candidate_ids: Tuple[str, ...]
+    distribution_candidate_ids: Tuple[str, ...]
+    accumulation_confirmed_type_count: int
+    distribution_confirmed_type_count: int
+    accumulation_signature_events: Tuple[str, ...]
+    distribution_signature_events: Tuple[str, ...]
+    contradiction_codes: Tuple[str, ...]
+    reason_codes: Tuple[str, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "phase_classification_version": self.phase_classification_version,
+            "as_of_date": self.as_of_date,
+            "range_candidate_id": self.range_candidate_id,
+            "classification": self.classification,
+            "state": self.state,
+            "accumulation_event_types": list(self.accumulation_event_types),
+            "distribution_event_types": list(self.distribution_event_types),
+            "accumulation_candidate_ids": list(self.accumulation_candidate_ids),
+            "distribution_candidate_ids": list(self.distribution_candidate_ids),
+            "accumulation_confirmed_type_count": int(
+                self.accumulation_confirmed_type_count
+            ),
+            "distribution_confirmed_type_count": int(
+                self.distribution_confirmed_type_count
+            ),
+            "accumulation_signature_events": list(
+                self.accumulation_signature_events
+            ),
+            "distribution_signature_events": list(
+                self.distribution_signature_events
+            ),
+            "contradiction_codes": list(self.contradiction_codes),
+            "reason_codes": list(self.reason_codes),
+        }
+        return _json_safe(payload, "StructureClassificationResult")
+
+
+@dataclass(frozen=True)
+class PhaseCandidate:
+    """One cumulative Wyckoff phase candidate (A–E)."""
+
+    phase_candidate_version: str
+    candidate_id: str
+    structure: str
+    phase: str
+    ordinal: int
+    status: str
+    as_of_date: str
+    required_event_codes: Tuple[str, ...]
+    supporting_candidate_ids: Tuple[str, ...]
+    contradicting_candidate_ids: Tuple[str, ...]
+    missing_event_codes: Tuple[str, ...]
+    required_gate_codes: Tuple[str, ...]
+    passed_gate_codes: Tuple[str, ...]
+    missing_gate_codes: Tuple[str, ...]
+    failed_gate_codes: Tuple[str, ...]
+    sequence_valid: bool
+    confidence_components: Dict[str, Optional[float]]
+    confidence: Optional[float]
+    reason_codes: Tuple[str, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "phase_candidate_version": self.phase_candidate_version,
+            "candidate_id": self.candidate_id,
+            "structure": self.structure,
+            "phase": self.phase,
+            "ordinal": int(self.ordinal),
+            "status": self.status,
+            "as_of_date": self.as_of_date,
+            "required_event_codes": list(self.required_event_codes),
+            "supporting_candidate_ids": list(self.supporting_candidate_ids),
+            "contradicting_candidate_ids": list(
+                self.contradicting_candidate_ids
+            ),
+            "missing_event_codes": list(self.missing_event_codes),
+            "required_gate_codes": list(self.required_gate_codes),
+            "passed_gate_codes": list(self.passed_gate_codes),
+            "missing_gate_codes": list(self.missing_gate_codes),
+            "failed_gate_codes": list(self.failed_gate_codes),
+            "sequence_valid": bool(self.sequence_valid),
+            "confidence_components": {
+                k: _require_finite(v, f"confidence_components.{k}")
+                for k, v in self.confidence_components.items()
+            },
+            "confidence": _require_finite(self.confidence, "confidence"),
+            "reason_codes": list(self.reason_codes),
+        }
+        return _json_safe(payload, "PhaseCandidate")
+
+
+@dataclass(frozen=True)
+class PhaseClassificationResult:
+    """Cumulative Phase A–E candidates with highest-supported selection."""
+
+    phase_classification_version: str
+    as_of_date: str
+    structure_classification: StructureClassificationResult
+    selected_phase: Optional[str]
+    selected_phase_status: Optional[str]
+    phase_state: str
+    candidates: Tuple[PhaseCandidate, ...]
+    reason_codes: Tuple[str, ...]
+    config_used: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "phase_classification_version": self.phase_classification_version,
+            "as_of_date": self.as_of_date,
+            "structure_classification": self.structure_classification.to_dict(),
+            "selected_phase": self.selected_phase,
+            "selected_phase_status": self.selected_phase_status,
+            "phase_state": self.phase_state,
+            "candidates": [c.to_dict() for c in self.candidates],
+            "reason_codes": list(self.reason_codes),
+            "config_used": dict(self.config_used),
+        }
+        return _json_safe(payload, "PhaseClassificationResult")
+
+
 # Re-export version constants for callers that import from models.
 __all__ = [
     "AGGREGATION_VERSION",
     "CompletedAggregationResult",
+    "EffortResultMeasurement",
+    "EventCandidate",
+    "EventDetectionResult",
+    "HTFContextResult",
+    "PHASE_CANDIDATE_VERSION",
+    "PhaseCandidate",
+    "PhaseClassificationResult",
     "PriceZone",
     "RANGE_CANDIDATE_VERSION",
     "RANGE_DETECTION_VERSION",
@@ -341,5 +716,6 @@ __all__ = [
     "RangeCandidate",
     "RangeDetectionResult",
     "ReadinessResult",
+    "StructureClassificationResult",
     "TouchInteraction",
 ]
