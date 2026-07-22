@@ -562,12 +562,12 @@ Persisted ENTER **and** WATCH signals now receive outcome coverage
 - **No conclusion about strategy superiority is valid without sufficient
   samples for both verdicts, and no tuning has been performed.**
 
-### Phase 8.1B — v2/v3 frozen shadow comparison *(B1 COMPLETE + live-validated; B2 implemented, migration unapplied, live validation pending)*
+### Phase 8.1B — v2/v3 frozen shadow comparison *(B1 COMPLETE + live-validated; B2 COMPLETE — live-validated)*
 
-Two substeps. B1 is complete and live-validated. B2 is implemented in code
-with migration `011_shadow_pair_outcomes.sql` **created but unapplied** until
-explicitly approved. **Do not mark B2 live-validated** until a bounded smoke
-run against the frozen live pairs succeeds after migration apply.
+Two substeps, both complete and live-validated. Migration
+`011_shadow_pair_outcomes.sql` has been **applied successfully** and a
+bounded smoke run against the two frozen live pairs succeeded (see the B2
+live-validation record below).
 
 #### Phase 8.1B1 — frozen paired decisions *(COMPLETE + live-validated)*
 
@@ -631,11 +631,12 @@ the same time, what decision did v2 make and what decision did v3 make?*
   improvement**; no parameter tuning occurred; **no effectiveness claim is
   valid before B2 paired outcomes and sufficient samples.**
 
-#### Phase 8.1B2 — paired market-path outcomes and neutral comparison metrics *(implemented; migration unapplied; live validation pending)*
+#### Phase 8.1B2 — paired market-path outcomes and neutral comparison metrics *(COMPLETE — live-validated)*
 
 Migration: `011_shadow_pair_outcomes.sql` (tables
 `strategy_shadow_pair_outcomes`, `strategy_shadow_outcome_runs`). Additive
-only; migration 010 is unchanged. **Not applied live until approved.**
+only; migration 010 is unchanged. **Applied successfully** (the migration
+file itself was not modified).
 
 - **One market-path outcome per frozen pair** (never per arm). Both arms
   share the same forward path; control/candidate return deltas are never
@@ -692,6 +693,81 @@ only; migration 010 is unchanged. **Not applied live until approved.**
   `GET /api/shadow/outcomes/metrics`, `GET /api/shadow/outcomes/{pair_id}`.
 - **v3 remains disabled** for ordinary scans. No scheduler entry. No UI
   candidate exposure. Isolation from signals / signal_outcomes preserved.
+
+##### B2 live-validation record
+
+**Admin authentication (configuration-driven; no authentication code change
+was required).** The existing worker-token protection was enabled via
+configuration (`REQUIRE_WORKER_TOKEN=true` with `WORKER_TOKEN` configured —
+the token value is never persisted or documented) and validated against
+`POST /api/admin/shadow/outcomes/calculate`:
+
+- request without a token → HTTP 401;
+- request with an incorrect token → HTTP 401;
+- request with the valid token → HTTP 200.
+
+**Live pair outcomes.** Both frozen B1 pairs matured against real Massive
+forward data:
+
+- **DHR** pair `382cd0ed-af93-4356-9a13-164ddd7586cb`
+  (control `sma150.v2` = ENTER, candidate `sma150.v3` = WATCH,
+  disagreement category `v2_enter_v3_watch`):
+  outcome `c11710d8-b766-47ca-b601-d238a937d455`, fingerprint
+  `653aa71b149647edd2aac90118fb5bb9b9fcc0492d8d6c1d533cbf33b9114cfa`,
+  frozen reference price `201.11`
+  (`reference_price_role = paired_decision_observation`), forward provider
+  `massive`, first forward date `2026-07-21`, `available_forward_bars = 1`,
+  1D return `-10.989010989011%`, SPY 1D `0.8341306310555243%`, QQQ 1D
+  `1.8547251673706406%`, status `partial`,
+  `reference_revision_detected = false`, `error_code = NULL`.
+  The neutral metrics layer classified this single observation as
+  `action_resolvable = true`, `enter_arm = control`,
+  `non_enter_action_favorable`, `avoided_downside_rate = 1.0`. **This is
+  one observation and is not evidence of strategy superiority.**
+- **JBL** pair `e01a479f-f39c-4def-86f3-9468462d9474`
+  (control `sma150.v2` = AVOID, candidate `sma150.v3` = AVOID,
+  disagreement category `same_avoid`):
+  outcome `737ca1f0-27bb-41e7-8fdd-a24702d7edaf`, fingerprint
+  `fa9b4b293993652e20c4cadf7ab35e754c98fa4d4c3f48e15cd9cf0fdfb4ffb8`,
+  frozen reference price `305.91`
+  (`reference_price_role = paired_decision_observation`), forward provider
+  `massive`, first forward date `2026-07-21`, `available_forward_bars = 1`,
+  1D return `4.256153770716871%`, SPY 1D `0.8341306310555243%`, QQQ 1D
+  `1.8547251673706406%`, status `partial`,
+  `reference_revision_detected = false`, `error_code = NULL`.
+  `same_avoid` is an **agreement** observation: both arms made the same
+  decision, so it cannot identify an arm winner.
+
+**Maturation behavior (observed live).** Both rows initially persisted as
+`outcome_status = pending_forward_bars` with `available_forward_bars = 0`
+and all horizons NULL. After Massive exposed the completed `2026-07-21`
+session, the next calculation matured both rows to
+`outcome_status = partial`, `available_forward_bars = 1`,
+`first_forward_date = last_forward_date = forward_data_as_of = 2026-07-21`,
+1D populated, 3D/5D/10D/20D still NULL, MFE/MAE populated with
+`mfe_mae_bar_count = 1`, and SPY/QQQ 1D populated. **NULL longer horizons
+are expected maturation state, not failures.** `completed_count` remains
+zero until the full 20D horizon matures, while the 1D metrics sample count
+is already one per group.
+
+**Idempotency (observed live).** An immediate repeat calculation preserved
+for both pairs the same `outcome_id`, the same `outcome_fingerprint`, the
+same frozen reference price, the same 1D return, the same
+`forward_bars_hash` and the same `benchmark_returns` — the repeat reused
+the existing canonical row and did not create another outcome. The
+`forward_bars_hash_superseded` diagnostic observed during the 0-bar → 1-bar
+maturation is expected evidence of normal forward-sequence maturation, not
+a reference revision.
+
+**Boundaries preserved after live validation.** Exactly one market-path
+outcome exists per pair, never per arm; no control-return minus
+candidate-return metric exists; ENTER/WATCH/AVOID decisions remain frozen
+from B1; no normal `signals`/`signal_outcomes` writes occur; no historical
+pair inference occurs; no same-ticker tautological baseline is exposed;
+metrics use neutral terminology and emit no superiority conclusion; no
+tuning occurred; v3 remains disabled for ordinary scans; no scheduler entry
+exists; 3D/5D/10D/20D maturation will happen only when real completed bars
+become available.
 
 ### Phase 9 — deterministic Wyckoff technical engine v2
 
