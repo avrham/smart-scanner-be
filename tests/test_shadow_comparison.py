@@ -200,7 +200,12 @@ class TestMigration010:
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("012_*"))] == [
             "012_wyckoff_mtf_v2.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("013_*"))
+        # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code CHECK
+        # extension only); nothing later exists.
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("013_*"))] == [
+            "013_wyckoff_v2_shadow_arms.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("014_*"))
         sql = (MIGRATIONS_DIR / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
         assert "strategy_shadow" not in sql.lower()
         assert "wyckoff_mtf_v2" in sql

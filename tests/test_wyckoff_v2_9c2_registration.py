@@ -102,8 +102,12 @@ class TestRegistryRegistration:
 class TestMigration012:
     def test_file_exists_exact_name(self):
         assert MIGRATION_012.exists()
-        assert not list(MIGRATIONS.glob("013_*"))
-
+        # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code
+        # CHECK extension only); nothing later exists.
+        assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
+            "013_wyckoff_v2_shadow_arms.sql"
+        ]
+        assert not list(MIGRATIONS.glob("014_*"))
     def test_registers_canonical_identifier_disabled(self):
         sql = MIGRATION_012.read_text(encoding="utf-8")
         stmts = _sql_statements()

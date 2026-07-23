@@ -66,7 +66,12 @@ def test_registry_keeps_v1_and_may_include_v2():
 def test_migration_012_is_wyckoff_v2_only():
     files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
     assert "012_wyckoff_mtf_v2.sql" in files
-    assert not any(name.startswith("013_") for name in files)
+    # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code CHECK
+    # extension only); nothing later exists.
+    assert [n for n in files if n.startswith("013_")] == [
+        "013_wyckoff_v2_shadow_arms.sql"
+    ]
+    assert not any(name.startswith("014_") for name in files)
     assert "011_shadow_pair_outcomes.sql" in files
     sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
     assert "wyckoff_mtf_v2" in sql

@@ -105,14 +105,48 @@ def compute_evaluation_fingerprint(
     return _sha256(canonical_json(payload))
 
 
-def disagreement_category(control_verdict: str, candidate_verdict: str) -> str:
+# Historical sma150 arm codes keep their historical category labels; every
+# other (Phase 9D experiment) arm code maps to a neutral positional label.
+_ARM_CATEGORY_LABELS = {
+    "control_v2": "v2",
+    "candidate_v3": "v3",
+}
+
+
+def category_label_for_arm(arm_code: str) -> str:
+    """Deterministic category label for one persisted arm code.
+
+    'control_v2'/'candidate_v3' keep the historical 'v2'/'v3' labels so
+    existing sma150 categories are byte-identical; any other arm code maps to
+    its neutral positional role ('control_*' -> 'control',
+    'candidate_*' -> 'candidate').
+    """
+    label = _ARM_CATEGORY_LABELS.get(arm_code)
+    if label is not None:
+        return label
+    if (arm_code or "").startswith("control"):
+        return "control"
+    if (arm_code or "").startswith("candidate"):
+        return "candidate"
+    return "unknown"
+
+
+def disagreement_category(
+    control_verdict: str,
+    candidate_verdict: str,
+    *,
+    control_label: str = "v2",
+    candidate_label: str = "v3",
+) -> str:
     """Deterministic verdict-combination label (control first).
 
     'same_enter' / 'same_watch' / 'same_avoid' on agreement, otherwise e.g.
-    'v2_enter_v3_avoid'. A label is never an improvement/regression claim.
+    'v2_enter_v3_avoid' (sma150 experiment, historical labels) or
+    'control_enter_candidate_avoid' (Phase 9D experiments). A label is never
+    an improvement/regression claim.
     """
     c = (control_verdict or "").lower()
     x = (candidate_verdict or "").lower()
     if c == x:
         return f"same_{c}"
-    return f"v2_{c}_v3_{x}"
+    return f"{control_label}_{c}_{candidate_label}_{x}"

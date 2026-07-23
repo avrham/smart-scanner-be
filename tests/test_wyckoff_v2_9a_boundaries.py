@@ -74,7 +74,12 @@ def test_no_v2_replaces_v1_identity():
 def test_migration_012_is_wyckoff_v2_only():
     paths = sorted(MIGRATIONS.glob("012_*"))
     assert [p.name for p in paths] == ["012_wyckoff_mtf_v2.sql"]
-    assert not list(MIGRATIONS.glob("013_*"))
+    # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code
+    # CHECK extension only); nothing later exists.
+    assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
+        "013_wyckoff_v2_shadow_arms.sql"
+    ]
+    assert not list(MIGRATIONS.glob("014_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
     sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
     assert "wyckoff_mtf_v2" in sql

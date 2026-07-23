@@ -27,19 +27,14 @@ from app.workers.provenance import (
     sanitize_config,
 )
 from app.workers.shadow.constants import (
-    CANDIDATE_ARM_CODE,
-    CANDIDATE_PATTERN_CODE,
-    CONTROL_ARM_CODE,
-    CONTROL_PATTERN_CODE,
     EVALUATION_FINGERPRINT_VERSION,
-    EXPERIMENT_CODE,
-    EXPERIMENT_VERSION,
     FRAME_FETCH_MARGIN_BARS,
     FRAME_HARD_CAP_BARS,
     MAX_DETAILS_SNAPSHOT_BYTES,
     MAX_SHADOW_SYMBOLS,
     PAIR_FINGERPRINT_VERSION,
 )
+from app.workers.shadow.experiments import DEFAULT_EXPERIMENT, ShadowExperiment
 from app.workers.shadow.fingerprints import (
     compute_evaluation_fingerprint,
     compute_pair_fingerprint,
@@ -166,14 +161,19 @@ def _evaluate_arm(
     *,
     latest_bar_completed: bool,
     now_utc: Optional[datetime] = None,
+    data_meta_extras: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Evaluate one arm on ITS OWN copy of the canonical frame.
 
     The returned verdict/score/reason/details are persisted verbatim — v2 is
     never normalized into v3 semantics, AVOID is never converted, missing
     scores stay None, and missing evidence.v1 (v2) stays absent.
+
+    `data_meta_extras` carries an experiment's per-arm completion vocabulary
+    (e.g. wyckoff_mtf.v2 reads explicit_completed/as_of_date); the default
+    keys below are never removed or overridden by extras.
     """
-    data_meta: Dict[str, Any] = {}
+    data_meta: Dict[str, Any] = dict(data_meta_extras or {})
     if latest_bar_completed:
         # Only set after the shared runner PROVED the canonical last bar is
         # completed (build_canonical_frame rejects anything unproven).
@@ -211,6 +211,7 @@ async def run_shadow_comparison(
     *,
     run_id: Optional[str] = None,
     now_utc: Optional[datetime] = None,
+    experiment: Optional[ShadowExperiment] = None,
 ) -> Dict[str, Any]:
     """Run one bounded shadow comparison over an explicit symbol list.
 
@@ -218,16 +219,32 @@ async def run_shadow_comparison(
     finalizes the run as 'failed'; a run whose every symbol was honestly
     rejected for data readiness still completes with an explicit terminal
     reason. Returns the bounded run summary.
+
+    `experiment` selects the declared comparison protocol; omitted, the
+    historical sma150 v2-vs-v3 experiment runs unchanged. Whatever the
+    experiment, running it never enables a strategy, never creates a signal,
+    watch, alert, notification or decision card, and never touches ranking.
     """
+    experiment = experiment or DEFAULT_EXPERIMENT
     normalized = normalize_shadow_symbols(symbols)
     run_id = run_id or str(uuid.uuid4())
     provider_name = getattr(provider, "name", None) or "unknown"
+
+    def _category(control_verdict: str, candidate_verdict: str) -> str:
+        return disagreement_category(
+            control_verdict,
+            candidate_verdict,
+            control_label=experiment.control_category_label,
+            candidate_label=experiment.candidate_category_label,
+        )
 
     await create_shadow_run(
         run_id,
         provider=provider_name,
         requested_symbols=normalized,
         requested_limit=len(normalized),
+        experiment_code=experiment.experiment_code,
+        experiment_version=experiment.experiment_version,
     )
 
     counts = Counter()
@@ -238,8 +255,12 @@ async def run_shadow_comparison(
     pair_summaries: List[Dict[str, Any]] = []
 
     try:
-        control = await _resolve_arm(CONTROL_PATTERN_CODE, CONTROL_ARM_CODE)
-        candidate = await _resolve_arm(CANDIDATE_PATTERN_CODE, CANDIDATE_ARM_CODE)
+        control = await _resolve_arm(
+            experiment.control_pattern_code, experiment.control_arm_code
+        )
+        candidate = await _resolve_arm(
+            experiment.candidate_pattern_code, experiment.candidate_arm_code
+        )
 
         # Shared canonical history depth, DERIVED once per run from both
         # resolved configs (SMA warm-up counted). The UNCAPPED desired value
@@ -250,10 +271,14 @@ async def run_shadow_comparison(
         # never shrink an otherwise-full completed frame where the provider
         # has the data.
         desired_bars = desired_history_bars(
-            control["config"], candidate["config"]
+            control["config"], candidate["config"],
+            control_fn=experiment.control_history_bars,
+            candidate_fn=experiment.candidate_history_bars,
         )
         requested_history_bars = shared_required_history_bars(
-            control["config"], candidate["config"]
+            control["config"], candidate["config"],
+            control_fn=experiment.control_history_bars,
+            candidate_fn=experiment.candidate_history_bars,
         )
         history_depth_capped = desired_bars > FRAME_HARD_CAP_BARS
         fetch_bars = requested_history_bars + FRAME_FETCH_MARGIN_BARS
@@ -302,10 +327,20 @@ async def run_shadow_comparison(
                 control_eval = _evaluate_arm(
                     control, frame, run_id,
                     latest_bar_completed=True, now_utc=now_utc,
+                    data_meta_extras=(
+                        experiment.control_data_meta_extras(frame)
+                        if experiment.control_data_meta_extras is not None
+                        else None
+                    ),
                 )
                 candidate_eval = _evaluate_arm(
                     candidate, frame, run_id,
                     latest_bar_completed=True, now_utc=now_utc,
+                    data_meta_extras=(
+                        experiment.candidate_data_meta_extras(frame)
+                        if experiment.candidate_data_meta_extras is not None
+                        else None
+                    ),
                 )
 
                 pair_fingerprint = compute_pair_fingerprint(
@@ -317,6 +352,8 @@ async def run_shadow_comparison(
                     market_data_as_of=frame.market_data_as_of,
                     control_identity=control,
                     candidate_identity=candidate,
+                    experiment_code=experiment.experiment_code,
+                    experiment_version=experiment.experiment_version,
                 )
 
                 evaluations = []
@@ -349,8 +386,8 @@ async def run_shadow_comparison(
                     })
 
                 pair_record = {
-                    "experiment_code": EXPERIMENT_CODE,
-                    "experiment_version": EXPERIMENT_VERSION,
+                    "experiment_code": experiment.experiment_code,
+                    "experiment_version": experiment.experiment_version,
                     "symbol": symbol,
                     "timeframe": frame.timeframe,
                     "provider": provider_name,
@@ -425,7 +462,7 @@ async def run_shadow_comparison(
                 counts["agreement_count"] += 1
             else:
                 counts["disagreement_count"] += 1
-            categories[disagreement_category(cv, xv)] += 1
+            categories[_category(cv, xv)] += 1
 
             pair_summaries.append({
                 "symbol": symbol,
@@ -434,12 +471,12 @@ async def run_shadow_comparison(
                 "control_verdict": cv,
                 "candidate_verdict": xv,
                 "agreement": cv == xv,
-                "disagreement_category": disagreement_category(cv, xv),
+                "disagreement_category": _category(cv, xv),
             })
 
         telemetry: Dict[str, Any] = {
-            "experiment_code": EXPERIMENT_CODE,
-            "experiment_version": EXPERIMENT_VERSION,
+            "experiment_code": experiment.experiment_code,
+            "experiment_version": experiment.experiment_version,
             "requested_count": len(normalized),
             # Canonical history-depth contract (derived, bounded scalars).
             "desired_history_bars": desired_bars,

@@ -102,9 +102,29 @@ def required_history_bars_v2(config: Dict[str, Any]) -> int:
     )
 
 
+def required_history_bars_wyckoff_v2(config: Dict[str, Any]) -> int:
+    """Completed daily bars wyckoff_mtf.v2 needs for its FULL configured
+    lookback.
+
+    Reuses the strategy's own canonical request-planning derivation
+    (derive_history_requirement — monthly/weekly period targets, daily
+    structure window, margin) instead of duplicating the arithmetic here.
+    """
+    # Local import: readiness is a pure module, imported lazily so the shadow
+    # frame layer never forces wyckoff imports for sma150-only comparisons.
+    from app.workers.strategies.wyckoff_v2.readiness import (
+        derive_history_requirement,
+    )
+
+    return int(derive_history_requirement(config)["desired_history_bars"])
+
+
 def desired_history_bars(
     control_config: Dict[str, Any],
     candidate_config: Dict[str, Any],
+    *,
+    control_fn=required_history_bars_v2,
+    candidate_fn=required_history_bars_v3,
 ) -> int:
     """The UNCAPPED shared requirement: the larger of the two arms.
 
@@ -114,16 +134,22 @@ def desired_history_bars(
     it — depth completeness is always judged against THIS number, so a
     600-bar cap filled to the brim can never masquerade as a complete
     800-bar lookback.
+
+    The per-arm derivations default to the sma150 experiment's; a shadow
+    experiment supplies its own (see app.workers.shadow.experiments).
     """
     return max(
-        required_history_bars_v2(control_config),
-        required_history_bars_v3(candidate_config),
+        control_fn(control_config),
+        candidate_fn(candidate_config),
     )
 
 
 def shared_required_history_bars(
     control_config: Dict[str, Any],
     candidate_config: Dict[str, Any],
+    *,
+    control_fn=required_history_bars_v2,
+    candidate_fn=required_history_bars_v3,
 ) -> int:
     """The EFFECTIVE canonical depth: the desired requirement, hard-capped.
 
@@ -133,7 +159,12 @@ def shared_required_history_bars(
     separately by desired_history_bars.
     """
     return min(
-        desired_history_bars(control_config, candidate_config),
+        desired_history_bars(
+            control_config,
+            candidate_config,
+            control_fn=control_fn,
+            candidate_fn=candidate_fn,
+        ),
         FRAME_HARD_CAP_BARS,
     )
 

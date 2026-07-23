@@ -74,8 +74,12 @@ class TestMigration009:
         assert [p.name for p in sorted(MIGRATIONS.glob("012_*"))] == [
             "012_wyckoff_mtf_v2.sql"
         ]
-        assert not list(MIGRATIONS.glob("013_*"))
-
+        # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code
+        # CHECK extension only); nothing later exists.
+        assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
+            "013_wyckoff_v2_shadow_arms.sql"
+        ]
+        assert not list(MIGRATIONS.glob("014_*"))
     def test_migration_is_additive_and_idempotent(self):
         sql = self._statements()
         assert sql.count("ADD COLUMN IF NOT EXISTS") == 3

@@ -34,7 +34,10 @@ from app.workers.shadow.constants import (
     CANDIDATE_ARM_CODE,
     CONTROL_ARM_CODE,
 )
-from app.workers.shadow.fingerprints import disagreement_category
+from app.workers.shadow.fingerprints import (
+    category_label_for_arm,
+    disagreement_category,
+)
 from app.workers.shadow.outcomes.constants import (
     BENCHMARK_SYMBOLS,
     MAX_ERROR_TEXT_LEN,
@@ -847,16 +850,21 @@ async def upsert_pair_outcome(record: Dict[str, Any]) -> Dict[str, Any]:
 # Read queries (bounded; list responses never include full B1 snapshots)
 # --------------------------------------------------------------------------- #
 
+# Arm joins are POSITIONAL: every declared experiment persists exactly one
+# 'control*' and one 'candidate*' arm per pair (migration 010/013 CHECK), so
+# the prefix join stays unique. The real arm codes are selected and echoed.
 _OUTCOME_LIST_SQL = """
     SELECT p.id AS pair_id, p.experiment_code, p.experiment_version,
            p.symbol, p.timeframe, p.provider AS pair_provider,
            p.snapshot_date, p.frame_hash, p.frame_bar_count,
            p.pair_fingerprint, p.pair_fingerprint_version,
+           c.arm_code AS control_arm_code,
            c.strategy_code AS control_strategy_code,
            c.strategy_version AS control_strategy_version,
            c.decision_policy_version AS control_decision_policy_version,
            c.config_hash AS control_config_hash,
            c.verdict AS control_verdict,
+           x.arm_code AS candidate_arm_code,
            x.strategy_code AS candidate_strategy_code,
            x.strategy_version AS candidate_strategy_version,
            x.decision_policy_version AS candidate_decision_policy_version,
@@ -876,10 +884,10 @@ _OUTCOME_LIST_SQL = """
     FROM strategy_shadow_pair_outcomes o
     JOIN strategy_shadow_pairs p ON p.id = o.pair_id
     JOIN strategy_shadow_evaluations c
-      ON c.pair_id = p.id AND c.arm_code = '{control}'
+      ON c.pair_id = p.id AND c.arm_code LIKE 'control%'
     JOIN strategy_shadow_evaluations x
-      ON x.pair_id = p.id AND x.arm_code = '{candidate}'
-""".format(control=CONTROL_ARM_CODE, candidate=CANDIDATE_ARM_CODE)
+      ON x.pair_id = p.id AND x.arm_code LIKE 'candidate%'
+"""
 
 
 def _outcome_fields(row: Any) -> Dict[str, Any]:
@@ -936,6 +944,10 @@ def _relative_returns(row: Any) -> Dict[str, Dict[str, Optional[float]]]:
 def _outcome_list_item(row: Any) -> Dict[str, Any]:
     control_verdict = row["control_verdict"]
     candidate_verdict = row["candidate_verdict"]
+    # Historical callers/fakes may omit the arm-code columns; the sma150
+    # arms are the only rows that can predate arm-code selection.
+    control_arm = row["control_arm_code"] or CONTROL_ARM_CODE
+    candidate_arm = row["candidate_arm_code"] or CANDIDATE_ARM_CODE
     return {
         "pair": {
             "pair_id": str(row["pair_id"]),
@@ -949,7 +961,7 @@ def _outcome_list_item(row: Any) -> Dict[str, Any]:
             "frame_bar_count": row["frame_bar_count"],
         },
         "control": {
-            "arm_code": CONTROL_ARM_CODE,
+            "arm_code": control_arm,
             "strategy_code": row["control_strategy_code"],
             "strategy_version": row["control_strategy_version"],
             "decision_policy_version": row["control_decision_policy_version"],
@@ -957,7 +969,7 @@ def _outcome_list_item(row: Any) -> Dict[str, Any]:
             "verdict": control_verdict,
         },
         "candidate": {
-            "arm_code": CANDIDATE_ARM_CODE,
+            "arm_code": candidate_arm,
             "strategy_code": row["candidate_strategy_code"],
             "strategy_version": row["candidate_strategy_version"],
             "decision_policy_version": row["candidate_decision_policy_version"],
@@ -966,7 +978,10 @@ def _outcome_list_item(row: Any) -> Dict[str, Any]:
         },
         "agreement": control_verdict == candidate_verdict,
         "disagreement_category": disagreement_category(
-            control_verdict, candidate_verdict
+            control_verdict,
+            candidate_verdict,
+            control_label=category_label_for_arm(control_arm),
+            candidate_label=category_label_for_arm(candidate_arm),
         ),
         "outcome": _outcome_fields(row),
         "relative_returns": _relative_returns(row),
@@ -978,6 +993,9 @@ async def fetch_pair_outcomes(
     pair_id: Optional[str] = None,
     symbol: Optional[str] = None,
     run_id: Optional[str] = None,
+    experiment_code: Optional[str] = None,
+    control_strategy_code: Optional[str] = None,
+    candidate_strategy_code: Optional[str] = None,
     outcome_status: Optional[str] = None,
     forward_provider: Optional[str] = None,
     control_verdict: Optional[str] = None,
@@ -1014,6 +1032,12 @@ async def fetch_pair_outcomes(
             "WHERE run_id = ${n})",
             as_uuid_param(run_id, "run_id"),
         )
+    if experiment_code is not None:
+        _add("p.experiment_code = ${n}", experiment_code)
+    if control_strategy_code is not None:
+        _add("c.strategy_code = ${n}", control_strategy_code)
+    if candidate_strategy_code is not None:
+        _add("x.strategy_code = ${n}", candidate_strategy_code)
     if outcome_status is not None:
         _add("o.outcome_status = ${n}", outcome_status)
     if forward_provider is not None:
@@ -1023,10 +1047,18 @@ async def fetch_pair_outcomes(
     if candidate_verdict is not None:
         _add("x.verdict = ${n}", candidate_verdict.upper())
     if disagreement_category_filter is not None:
+        # SQL twin of fingerprints.disagreement_category: historical sma150
+        # arm codes keep 'v2'/'v3' labels; other arm codes map to neutral
+        # positional labels.
         _add(
             "(CASE WHEN c.verdict = x.verdict "
             "THEN 'same_' || lower(c.verdict) "
-            "ELSE 'v2_' || lower(c.verdict) || '_v3_' || lower(x.verdict) "
+            "ELSE (CASE WHEN c.arm_code = 'control_v2' "
+            "THEN 'v2' ELSE 'control' END)"
+            " || '_' || lower(c.verdict) || '_' || "
+            "(CASE WHEN x.arm_code = 'candidate_v3' "
+            "THEN 'v3' ELSE 'candidate' END)"
+            " || '_' || lower(x.verdict) "
             "END) = ${n}",
             disagreement_category_filter,
         )
@@ -1107,8 +1139,14 @@ async def fetch_pair_outcome_detail(pair_id: str) -> Optional[Dict[str, Any]]:
 
         evaluations: Dict[str, Dict[str, Any]] = {}
         verdicts: Dict[str, str] = {}
+        arm_codes: Dict[str, str] = {}
         for ev in eval_rows:
             verdicts[ev["arm_code"]] = ev["verdict"]
+            # Positional roles: exactly one control* and one candidate* arm
+            # per pair (arm-code CHECK constraint), any experiment.
+            for role in ("control", "candidate"):
+                if str(ev["arm_code"]).startswith(role):
+                    arm_codes[role] = ev["arm_code"]
             evaluations[ev["arm_code"]] = {
                 "arm_code": ev["arm_code"],
                 "strategy_code": ev["strategy_code"],
@@ -1136,8 +1174,10 @@ async def fetch_pair_outcome_detail(pair_id: str) -> Optional[Dict[str, Any]]:
                 "calculated_at": outcome_row["calculated_at"],
             }
 
-        control_verdict = verdicts.get(CONTROL_ARM_CODE)
-        candidate_verdict = verdicts.get(CANDIDATE_ARM_CODE)
+        control_arm = arm_codes.get("control", CONTROL_ARM_CODE)
+        candidate_arm = arm_codes.get("candidate", CANDIDATE_ARM_CODE)
+        control_verdict = verdicts.get(control_arm)
+        candidate_verdict = verdicts.get(candidate_arm)
         return {
             "pair_id": str(pair_row["id"]),
             "origin_run_id": (
@@ -1167,7 +1207,12 @@ async def fetch_pair_outcome_detail(pair_id: str) -> Optional[Dict[str, Any]]:
                 else None
             ),
             "disagreement_category": (
-                disagreement_category(control_verdict, candidate_verdict)
+                disagreement_category(
+                    control_verdict,
+                    candidate_verdict,
+                    control_label=category_label_for_arm(control_arm),
+                    candidate_label=category_label_for_arm(candidate_arm),
+                )
                 if control_verdict and candidate_verdict
                 else None
             ),

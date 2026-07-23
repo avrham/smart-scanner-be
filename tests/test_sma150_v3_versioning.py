@@ -342,8 +342,12 @@ class TestMigration008:
         assert [p.name for p in sorted(MIGRATIONS.glob("012_*"))] == [
             "012_wyckoff_mtf_v2.sql"
         ]
-        assert not list(MIGRATIONS.glob("013_*"))
-
+        # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code
+        # CHECK extension only); nothing later exists.
+        assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
+            "013_wyckoff_v2_shadow_arms.sql"
+        ]
+        assert not list(MIGRATIONS.glob("014_*"))
     def test_v3_defaults_copy_is_isolated(self):
         """default_config() returns an independent copy (mutation-safe)."""
         strategy = get_strategy("sma150_bounce_v3")

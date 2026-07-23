@@ -47,7 +47,12 @@ def _git_diff(*paths: str) -> str:
 
 def test_migration_012_exists_for_v2_only():
     assert (MIGRATIONS / "012_wyckoff_mtf_v2.sql").exists()
-    assert not list(MIGRATIONS.glob("013_*"))
+    # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code
+    # CHECK extension only); nothing later exists.
+    assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
+        "013_wyckoff_v2_shadow_arms.sql"
+    ]
+    assert not list(MIGRATIONS.glob("014_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
 
 

@@ -28,7 +28,10 @@ from app.workers.shadow.constants import (
     MAX_ERROR_TEXT_LEN,
     MAX_TELEMETRY_BYTES,
 )
-from app.workers.shadow.fingerprints import disagreement_category
+from app.workers.shadow.fingerprints import (
+    category_label_for_arm,
+    disagreement_category,
+)
 from app.workers.shadow.serialization import normalize_json_safe, strict_json
 from app.workers.shadow.typed_values import (
     ShadowPersistenceTypeError,
@@ -75,10 +78,13 @@ async def create_shadow_run(
     provider: Optional[str],
     requested_symbols: List[str],
     requested_limit: Optional[int] = None,
+    experiment_code: str = EXPERIMENT_CODE,
+    experiment_version: str = EXPERIMENT_VERSION,
 ) -> str:
     """Create the canonical shadow-run row at start (status='running').
 
-    Idempotent on id (ON CONFLICT DO NOTHING).
+    Idempotent on id (ON CONFLICT DO NOTHING). The experiment identity
+    defaults to the historical sma150 experiment for existing callers.
     """
     conn = await get_db_connection()
     try:
@@ -93,8 +99,8 @@ async def create_shadow_run(
             ON CONFLICT (id) DO NOTHING
             """,
             as_uuid_param(run_id, "run_id"),
-            EXPERIMENT_CODE,
-            EXPERIMENT_VERSION,
+            experiment_code,
+            experiment_version,
             provider,
             strict_json([str(s) for s in requested_symbols]),
             None if requested_limit is None
@@ -318,12 +324,17 @@ async def fetch_shadow_run(run_id: str) -> Optional[Dict[str, Any]]:
         await release_db_connection(conn)
 
 
+# Arm joins are POSITIONAL: every declared experiment persists exactly one
+# 'control*' and one 'candidate*' arm per pair (migration 010/013 CHECK), so
+# the prefix join stays unique. The real arm codes are selected and echoed —
+# never rewritten to the sma150 constants.
 _PAIR_LIST_SQL = """
     SELECT p.id, p.origin_run_id, p.experiment_code, p.experiment_version,
            p.symbol, p.timeframe, p.provider, p.snapshot_date,
            p.market_data_as_of, p.frame_snapshot_version, p.frame_hash,
            p.frame_bar_count, p.frame_first_date, p.frame_last_date,
            p.pair_fingerprint, p.pair_fingerprint_version, p.created_at,
+           c.arm_code AS control_arm_code,
            c.strategy_code AS control_strategy_code,
            c.strategy_version AS control_strategy_version,
            c.decision_policy_version AS control_decision_policy_version,
@@ -332,6 +343,7 @@ _PAIR_LIST_SQL = """
            c.score AS control_score,
            c.reason AS control_reason,
            c.rejection_reason AS control_rejection_reason,
+           x.arm_code AS candidate_arm_code,
            x.strategy_code AS candidate_strategy_code,
            x.strategy_version AS candidate_strategy_version,
            x.decision_policy_version AS candidate_decision_policy_version,
@@ -342,16 +354,20 @@ _PAIR_LIST_SQL = """
            x.rejection_reason AS candidate_rejection_reason
     FROM strategy_shadow_pairs p
     JOIN strategy_shadow_evaluations c
-      ON c.pair_id = p.id AND c.arm_code = '{control}'
+      ON c.pair_id = p.id AND c.arm_code LIKE 'control%'
     JOIN strategy_shadow_evaluations x
-      ON x.pair_id = p.id AND x.arm_code = '{candidate}'
-""".format(control=CONTROL_ARM_CODE, candidate=CANDIDATE_ARM_CODE)
+      ON x.pair_id = p.id AND x.arm_code LIKE 'candidate%'
+"""
 
 
 def _pair_summary(row: Any) -> Dict[str, Any]:
     """Bounded pair summary (never the full frame/details snapshots)."""
     control_verdict = row["control_verdict"]
     candidate_verdict = row["candidate_verdict"]
+    # Historical callers/fakes may omit the arm-code columns; the sma150
+    # arms are the only rows that can predate arm-code selection.
+    control_arm = row["control_arm_code"] or CONTROL_ARM_CODE
+    candidate_arm = row["candidate_arm_code"] or CANDIDATE_ARM_CODE
     return {
         "pair_id": str(row["id"]),
         "origin_run_id": str(row["origin_run_id"]) if row["origin_run_id"] else None,
@@ -366,7 +382,7 @@ def _pair_summary(row: Any) -> Dict[str, Any]:
         "frame_hash": row["frame_hash"],
         "frame_bar_count": row["frame_bar_count"],
         "control": {
-            "arm_code": CONTROL_ARM_CODE,
+            "arm_code": control_arm,
             "strategy_code": row["control_strategy_code"],
             "strategy_version": row["control_strategy_version"],
             "decision_policy_version": row["control_decision_policy_version"],
@@ -377,7 +393,7 @@ def _pair_summary(row: Any) -> Dict[str, Any]:
             "rejection_reason": row["control_rejection_reason"],
         },
         "candidate": {
-            "arm_code": CANDIDATE_ARM_CODE,
+            "arm_code": candidate_arm,
             "strategy_code": row["candidate_strategy_code"],
             "strategy_version": row["candidate_strategy_version"],
             "decision_policy_version": row["candidate_decision_policy_version"],
@@ -389,16 +405,36 @@ def _pair_summary(row: Any) -> Dict[str, Any]:
         },
         "agreement": control_verdict == candidate_verdict,
         "disagreement_category": disagreement_category(
-            control_verdict, candidate_verdict
+            control_verdict,
+            candidate_verdict,
+            control_label=category_label_for_arm(control_arm),
+            candidate_label=category_label_for_arm(candidate_arm),
         ),
         "created_at": row["created_at"],
     }
+
+
+# Deterministic SQL twin of fingerprints.disagreement_category: historical
+# sma150 arm codes keep 'v2'/'v3' labels, every other arm code maps to its
+# neutral positional label.
+_CATEGORY_CASE_SQL = (
+    "(CASE WHEN c.verdict = x.verdict "
+    "THEN 'same_' || lower(c.verdict) "
+    "ELSE (CASE WHEN c.arm_code = 'control_v2' THEN 'v2' ELSE 'control' END)"
+    " || '_' || lower(c.verdict) || '_' || "
+    "(CASE WHEN x.arm_code = 'candidate_v3' THEN 'v3' ELSE 'candidate' END)"
+    " || '_' || lower(x.verdict) "
+    "END)"
+)
 
 
 async def fetch_shadow_pairs(
     *,
     run_id: Optional[str] = None,
     symbol: Optional[str] = None,
+    experiment_code: Optional[str] = None,
+    control_strategy_code: Optional[str] = None,
+    candidate_strategy_code: Optional[str] = None,
     control_verdict: Optional[str] = None,
     candidate_verdict: Optional[str] = None,
     agreement: Optional[bool] = None,
@@ -425,6 +461,12 @@ async def fetch_shadow_pairs(
         )
     if symbol is not None:
         _add("p.symbol = ${n}", symbol.upper())
+    if experiment_code is not None:
+        _add("p.experiment_code = ${n}", experiment_code)
+    if control_strategy_code is not None:
+        _add("c.strategy_code = ${n}", control_strategy_code)
+    if candidate_strategy_code is not None:
+        _add("x.strategy_code = ${n}", candidate_strategy_code)
     if control_verdict is not None:
         _add("c.verdict = ${n}", control_verdict.upper())
     if candidate_verdict is not None:
@@ -435,10 +477,7 @@ async def fetch_shadow_pairs(
         )
     if disagreement_category_filter is not None:
         _add(
-            "(CASE WHEN c.verdict = x.verdict "
-            "THEN 'same_' || lower(c.verdict) "
-            "ELSE 'v2_' || lower(c.verdict) || '_v3_' || lower(x.verdict) "
-            "END) = ${n}",
+            _CATEGORY_CASE_SQL + " = ${n}",
             disagreement_category_filter,
         )
     if control_strategy_version is not None:
@@ -511,8 +550,14 @@ async def fetch_shadow_pair_detail(pair_id: str) -> Optional[Dict[str, Any]]:
 
         evaluations = {}
         verdicts: Dict[str, str] = {}
+        arm_codes: Dict[str, str] = {}
         for ev in eval_rows:
             verdicts[ev["arm_code"]] = ev["verdict"]
+            # Positional roles: exactly one control* and one candidate* arm
+            # per pair (arm-code CHECK constraint), any experiment.
+            for role in ("control", "candidate"):
+                if str(ev["arm_code"]).startswith(role):
+                    arm_codes[role] = ev["arm_code"]
             evaluations[ev["arm_code"]] = {
                 "arm_code": ev["arm_code"],
                 "strategy_code": ev["strategy_code"],
@@ -531,8 +576,10 @@ async def fetch_shadow_pair_detail(pair_id: str) -> Optional[Dict[str, Any]]:
                 "created_at": ev["created_at"],
             }
 
-        control_verdict = verdicts.get(CONTROL_ARM_CODE)
-        candidate_verdict = verdicts.get(CANDIDATE_ARM_CODE)
+        control_arm = arm_codes.get("control", CONTROL_ARM_CODE)
+        candidate_arm = arm_codes.get("candidate", CANDIDATE_ARM_CODE)
+        control_verdict = verdicts.get(control_arm)
+        candidate_verdict = verdicts.get(candidate_arm)
         return {
             "pair_id": str(pair_row["id"]),
             "origin_run_id": (
@@ -560,7 +607,12 @@ async def fetch_shadow_pair_detail(pair_id: str) -> Optional[Dict[str, Any]]:
                 else None
             ),
             "disagreement_category": (
-                disagreement_category(control_verdict, candidate_verdict)
+                disagreement_category(
+                    control_verdict,
+                    candidate_verdict,
+                    control_label=category_label_for_arm(control_arm),
+                    candidate_label=category_label_for_arm(candidate_arm),
+                )
                 if control_verdict and candidate_verdict
                 else None
             ),
@@ -574,5 +626,161 @@ async def fetch_shadow_pair_detail(pair_id: str) -> Optional[Dict[str, Any]]:
             ],
             "created_at": pair_row["created_at"],
         }
+    finally:
+        await release_db_connection(conn)
+
+
+def _run_summary(row: Any) -> Dict[str, Any]:
+    return {
+        "run_id": str(row["id"]),
+        "experiment_code": row["experiment_code"],
+        "experiment_version": row["experiment_version"],
+        "status": row["status"],
+        "provider": row["provider"],
+        "requested_symbols": _maybe_json(row["requested_symbols"]),
+        "requested_limit": row["requested_limit"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "error_code": row["error_code"],
+        "created_at": row["created_at"],
+    }
+
+
+async def fetch_shadow_runs(
+    *,
+    experiment_code: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Bounded newest-first shadow-run summaries (Phase 9D6).
+
+    List rows never include telemetry or error text — use fetch_shadow_run
+    for one run's bounded detail. Filters AND-compose.
+    """
+    where: List[str] = []
+    params: List[Any] = []
+
+    def _add(clause: str, value: Any) -> None:
+        params.append(value)
+        where.append(clause.format(n=len(params)))
+
+    if experiment_code is not None:
+        _add("experiment_code = ${n}", experiment_code)
+    if status is not None:
+        _add("status = ${n}", status)
+
+    params.append(int(limit))
+    query = (
+        """
+        SELECT id, experiment_code, experiment_version, status, provider,
+               requested_symbols, requested_limit, started_at, finished_at,
+               error_code, created_at
+        FROM strategy_shadow_runs
+        """
+        + (("WHERE " + " AND ".join(where)) if where else "")
+        + f" ORDER BY started_at DESC LIMIT ${len(params)}"
+    )
+
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(query, *params)
+        return [_run_summary(r) for r in rows]
+    finally:
+        await release_db_connection(conn)
+
+
+# Bounded per-evaluation record for strategy-filtered shadow metrics
+# (Phase 9D5/9D6). Deliberately extracts ONLY compact JSONB sub-documents
+# (the policy record, the readiness status and the evidence item categories)
+# — never the full details or frame snapshots.
+_STRATEGY_EVALUATION_SQL = """
+    SELECT e.id, e.pair_id, e.arm_code, e.strategy_code, e.strategy_version,
+           e.decision_policy_version, e.config_hash, e.verdict, e.score,
+           e.reason, e.rejection_reason, e.created_at,
+           e.details_snapshot->'policy' AS policy,
+           e.details_snapshot->'readiness'->>'status' AS readiness_status,
+           jsonb_path_query_array(
+               e.details_snapshot, '$.evidence.items[*].category'
+           ) AS evidence_categories,
+           p.symbol, p.snapshot_date, p.experiment_code, p.experiment_version,
+           p.provider,
+           (o.id IS NOT NULL) AS has_outcome,
+           o.outcome_status AS outcome_status
+    FROM strategy_shadow_evaluations e
+    JOIN strategy_shadow_pairs p ON p.id = e.pair_id
+    LEFT JOIN strategy_shadow_pair_outcomes o ON o.pair_id = p.id
+"""
+
+
+def _evaluation_record(row: Any) -> Dict[str, Any]:
+    categories = _maybe_json(row["evidence_categories"])
+    return {
+        "evaluation_id": str(row["id"]),
+        "pair_id": str(row["pair_id"]),
+        "arm_code": row["arm_code"],
+        "strategy_code": row["strategy_code"],
+        "strategy_version": row["strategy_version"],
+        "decision_policy_version": row["decision_policy_version"],
+        "config_hash": row["config_hash"],
+        "verdict": row["verdict"],
+        "score": row["score"],
+        "reason": row["reason"],
+        "rejection_reason": row["rejection_reason"],
+        "policy": _maybe_json(row["policy"]),
+        "readiness_status": row["readiness_status"],
+        "evidence_categories": categories if isinstance(categories, list) else [],
+        "symbol": row["symbol"],
+        "snapshot_date": row["snapshot_date"],
+        "experiment_code": row["experiment_code"],
+        "experiment_version": row["experiment_version"],
+        "provider": row["provider"],
+        "has_outcome": bool(row["has_outcome"]),
+        "outcome_status": row["outcome_status"],
+        "created_at": row["created_at"],
+    }
+
+
+async def fetch_strategy_shadow_evaluations(
+    *,
+    strategy_code: str,
+    symbol: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    experiment_code: Optional[str] = None,
+    limit: int = 500,
+) -> List[Dict[str, Any]]:
+    """Bounded newest-first per-evaluation records for ONE strategy code.
+
+    Read-only aggregation source for the strategy shadow metrics — never
+    returns full details or frame snapshots and never mutates anything.
+    """
+    where: List[str] = []
+    params: List[Any] = []
+
+    def _add(clause: str, value: Any) -> None:
+        params.append(value)
+        where.append(clause.format(n=len(params)))
+
+    _add("e.strategy_code = ${n}", strategy_code)
+    if symbol is not None:
+        _add("p.symbol = ${n}", symbol.upper())
+    if strategy_version is not None:
+        _add("e.strategy_version = ${n}", strategy_version)
+    if decision_policy_version is not None:
+        _add("e.decision_policy_version = ${n}", decision_policy_version)
+    if experiment_code is not None:
+        _add("p.experiment_code = ${n}", experiment_code)
+
+    params.append(int(limit))
+    query = (
+        _STRATEGY_EVALUATION_SQL
+        + "WHERE " + " AND ".join(where)
+        + f" ORDER BY e.created_at DESC LIMIT ${len(params)}"
+    )
+
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(query, *params)
+        return [_evaluation_record(r) for r in rows]
     finally:
         await release_db_connection(conn)

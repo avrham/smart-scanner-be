@@ -60,3 +60,14 @@ DISAGREEMENT_CATEGORIES = (
     "v2_avoid_v3_enter",
     "v2_avoid_v3_watch",
 )
+
+# Neutral positional labels used by Phase 9D experiments (any experiment
+# whose arms are not the historical sma150 'control_v2'/'candidate_v3').
+GENERIC_DISAGREEMENT_CATEGORIES = (
+    "control_enter_candidate_watch",
+    "control_enter_candidate_avoid",
+    "control_watch_candidate_enter",
+    "control_watch_candidate_avoid",
+    "control_avoid_candidate_enter",
+    "control_avoid_candidate_watch",
+)

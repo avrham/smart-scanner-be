@@ -278,7 +278,16 @@ def _group_metrics(
     ]
 
     category = identity.get("disagreement_category")
-    action_divergent = category in ACTION_DIVERGENT_CATEGORIES
+    control_verdict = identity.get("control_verdict")
+    candidate_verdict = identity.get("candidate_verdict")
+    # Verdict-derived classification (Phase 9D): identical to the historical
+    # label-based check for sma150 categories (every ACTION_DIVERGENT /
+    # POLICY_STATE label is itself derived from the frozen verdicts) and
+    # correct for any declared experiment's neutral labels.
+    action_divergent = (
+        category in ACTION_DIVERGENT_CATEGORIES
+        or derive_enter_arm(control_verdict, candidate_verdict) is not None
+    )
 
     result: Dict[str, Any] = {
         **identity,
@@ -297,12 +306,19 @@ def _group_metrics(
     if action_divergent:
         result["action_resolvable"] = True
         result["enter_arm"] = derive_enter_arm(
-            identity.get("control_verdict"), identity.get("candidate_verdict")
+            control_verdict, candidate_verdict
         )
         result["resolution_by_window"] = [
             _resolution_for_window(rows, w) for w in HOLDING_WINDOWS
         ]
-    elif category in POLICY_STATE_CATEGORIES:
+    elif (
+        category in POLICY_STATE_CATEGORIES
+        or (
+            control_verdict is not None
+            and candidate_verdict is not None
+            and control_verdict != candidate_verdict
+        )
+    ):
         # Neither arm acted: price movement is context only; no arm winner
         # may be derived from a WATCH-vs-AVOID state disagreement.
         result["action_resolvable"] = False
