@@ -993,6 +993,7 @@ async def fetch_pair_outcomes(
     pair_id: Optional[str] = None,
     symbol: Optional[str] = None,
     run_id: Optional[str] = None,
+    campaign_id: Optional[str] = None,
     experiment_code: Optional[str] = None,
     control_strategy_code: Optional[str] = None,
     candidate_strategy_code: Optional[str] = None,
@@ -1031,6 +1032,14 @@ async def fetch_pair_outcomes(
             "p.id IN (SELECT pair_id FROM strategy_shadow_run_pairs "
             "WHERE run_id = ${n})",
             as_uuid_param(run_id, "run_id"),
+        )
+    if campaign_id is not None:
+        _add(
+            "EXISTS (SELECT 1 FROM strategy_shadow_run_pairs rp2 "
+            "JOIN strategy_shadow_runs r2 ON r2.id = rp2.run_id "
+            "WHERE rp2.pair_id = p.id "
+            "AND r2.telemetry->'campaign'->>'campaign_id' = ${n})",
+            str(campaign_id),
         )
     if experiment_code is not None:
         _add("p.experiment_code = ${n}", experiment_code)

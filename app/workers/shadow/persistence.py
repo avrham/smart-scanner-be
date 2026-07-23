@@ -15,7 +15,7 @@ Immutability contract (mirrors the Phase 7B signal semantics):
 import json
 import logging
 import uuid as uuid_lib
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.workers.persistence import get_db_connection, release_db_connection
@@ -708,7 +708,12 @@ _STRATEGY_EVALUATION_SQL = """
            p.frame_snapshot_version AS daily_frame_contract_version,
            p.provider,
            (o.id IS NOT NULL) AS has_outcome,
-           o.outcome_status AS outcome_status
+           o.outcome_status AS outcome_status,
+           (SELECT jsonb_agg(DISTINCT r.telemetry->'campaign'->>'campaign_id')
+            FROM strategy_shadow_run_pairs rp
+            JOIN strategy_shadow_runs r ON r.id = rp.run_id
+            WHERE rp.pair_id = p.id
+              AND r.telemetry->'campaign' IS NOT NULL) AS campaign_ids
     FROM strategy_shadow_evaluations e
     JOIN strategy_shadow_pairs p ON p.id = e.pair_id
     LEFT JOIN strategy_shadow_pair_outcomes o ON o.pair_id = p.id
@@ -742,6 +747,11 @@ def _evaluation_record(row: Any) -> Dict[str, Any]:
         "provider": row["provider"],
         "has_outcome": bool(row["has_outcome"]),
         "outcome_status": row["outcome_status"],
+        "campaign_ids": (
+            [c for c in (_maybe_json(row["campaign_ids"]) or []) if c]
+            if isinstance(_maybe_json(row["campaign_ids"]), list)
+            else []
+        ),
         "created_at": row["created_at"],
     }
 
@@ -753,6 +763,10 @@ async def fetch_strategy_shadow_evaluations(
     strategy_version: Optional[str] = None,
     decision_policy_version: Optional[str] = None,
     experiment_code: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[date] = None,
+    max_snapshot_date: Optional[date] = None,
     limit: int = 500,
 ) -> List[Dict[str, Any]]:
     """Bounded newest-first per-evaluation records for ONE strategy code.
@@ -776,6 +790,22 @@ async def fetch_strategy_shadow_evaluations(
         _add("e.decision_policy_version = ${n}", decision_policy_version)
     if experiment_code is not None:
         _add("p.experiment_code = ${n}", experiment_code)
+    if config_hash is not None:
+        _add("e.config_hash = ${n}", config_hash)
+    if campaign_id is not None:
+        _add(
+            "EXISTS (SELECT 1 FROM strategy_shadow_run_pairs rp2 "
+            "JOIN strategy_shadow_runs r2 ON r2.id = rp2.run_id "
+            "WHERE rp2.pair_id = p.id "
+            "AND r2.telemetry->'campaign'->>'campaign_id' = ${n})",
+            str(campaign_id),
+        )
+    if min_snapshot_date is not None:
+        _add("p.snapshot_date >= ${n}",
+             as_date_param(min_snapshot_date, "min_snapshot_date"))
+    if max_snapshot_date is not None:
+        _add("p.snapshot_date <= ${n}",
+             as_date_param(max_snapshot_date, "max_snapshot_date"))
 
     params.append(int(limit))
     query = (
