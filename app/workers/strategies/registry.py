@@ -52,6 +52,7 @@ def _register_defaults() -> None:
     from app.workers.strategies.sma150_adapter import Sma150BounceStrategy
     from app.workers.strategies.sma150_v3 import Sma150BounceV3Strategy
     from app.workers.strategies.wyckoff import WyckoffMTFStrategy
+    from app.workers.strategies.wyckoff_v2.strategy import WyckoffMTFV2Strategy
 
     if "sma150_bounce" not in _REGISTRY:
         register_strategy(Sma150BounceStrategy())
@@ -61,6 +62,11 @@ def _register_defaults() -> None:
         register_strategy(Sma150BounceV3Strategy())
     if "wyckoff_mtf" not in _REGISTRY:
         register_strategy(WyckoffMTFStrategy())
+    # Phase 9C2: wyckoff_mtf_v2 is a SEPARATE strategy code — never an alias
+    # or upgrade of wyckoff_mtf (v1). Package import of wyckoff_v2 alone must
+    # not register; only this registry path may.
+    if "wyckoff_mtf_v2" not in _REGISTRY:
+        register_strategy(WyckoffMTFV2Strategy())
 
 
 _register_defaults()

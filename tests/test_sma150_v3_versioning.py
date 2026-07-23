@@ -105,9 +105,10 @@ class TestWyckoffUnchanged:
         assert strategy.version == "wyckoff_mtf.v1"
         assert strategy.decision_policy_version == LEGACY_POLICY
 
-    def test_registry_lists_exactly_three_strategies(self):
+    def test_registry_lists_exactly_four_strategies(self):
+        # Phase 9C2 adds wyckoff_mtf_v2 as a separate code; v1 stays listed.
         assert list_strategies() == [
-            "sma150_bounce", "sma150_bounce_v3", "wyckoff_mtf"
+            "sma150_bounce", "sma150_bounce_v3", "wyckoff_mtf", "wyckoff_mtf_v2"
         ]
 
 
@@ -327,8 +328,8 @@ class TestMigration008:
             assert key in V3_DEFAULT_CONFIG
 
     def test_phase8_created_no_migration_beyond_008(self):
-        """Phase 8 itself added only 008. Migrations 009–011 are separate
-        known later phases; nothing beyond 011 exists."""
+        """Phase 8 itself added only 008. Migrations 009–012 are separate
+        known later phases; nothing beyond 012 exists."""
         assert [p.name for p in MIGRATIONS.glob("009_*")] == [
             "009_watch_outcome_coverage.sql"
         ]
@@ -338,7 +339,10 @@ class TestMigration008:
         assert [p.name for p in sorted(MIGRATIONS.glob("011_*"))] == [
             "011_shadow_pair_outcomes.sql"
         ]
-        assert not list(MIGRATIONS.glob("012_*"))
+        assert [p.name for p in sorted(MIGRATIONS.glob("012_*"))] == [
+            "012_wyckoff_mtf_v2.sql"
+        ]
+        assert not list(MIGRATIONS.glob("013_*"))
 
     def test_v3_defaults_copy_is_isolated(self):
         """default_config() returns an independent copy (mutation-safe)."""

@@ -63,14 +63,18 @@ class TestMigration009:
 
     def test_migration_file_exists_and_boundary(self):
         assert MIGRATION_009.exists()
-        # 010 is Phase 8.1B1; 011 is Phase 8.1B2; nothing beyond 011.
+        # 010 is Phase 8.1B1; 011 is Phase 8.1B2; 012 is Phase 9C2;
+        # nothing beyond 012.
         assert [p.name for p in MIGRATIONS.glob("010_*")] == [
             "010_sma150_shadow_evaluations.sql"
         ]
         assert [p.name for p in sorted(MIGRATIONS.glob("011_*"))] == [
             "011_shadow_pair_outcomes.sql"
         ]
-        assert not list(MIGRATIONS.glob("012_*"))
+        assert [p.name for p in sorted(MIGRATIONS.glob("012_*"))] == [
+            "012_wyckoff_mtf_v2.sql"
+        ]
+        assert not list(MIGRATIONS.glob("013_*"))
 
     def test_migration_is_additive_and_idempotent(self):
         sql = self._statements()

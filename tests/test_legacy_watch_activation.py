@@ -403,7 +403,7 @@ class TestUnchangedBehavior:
 
     def test_activation_fix_added_no_schema_migration(self):
         """The legacy activation fix itself required no migration. Migrations
-        009–011 are known later phases; the next boundary is 012."""
+        009–012 are known later phases; the next boundary is 013."""
         assert [p.name for p in MIGRATIONS.glob("009_*")] == [
             "009_watch_outcome_coverage.sql"
         ]
@@ -413,4 +413,7 @@ class TestUnchangedBehavior:
         assert [p.name for p in sorted(MIGRATIONS.glob("011_*"))] == [
             "011_shadow_pair_outcomes.sql"
         ]
-        assert not list(MIGRATIONS.glob("012_*"))
+        assert [p.name for p in sorted(MIGRATIONS.glob("012_*"))] == [
+            "012_wyckoff_mtf_v2.sql"
+        ]
+        assert not list(MIGRATIONS.glob("013_*"))

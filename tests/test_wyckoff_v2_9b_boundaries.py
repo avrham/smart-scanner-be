@@ -56,17 +56,21 @@ def test_phase9a_and_9b_surface_still_importable():
     assert callable(v2.classify_phases)
 
 
-def test_registry_unchanged_no_v2():
+def test_registry_keeps_v1_and_may_include_v2():
     codes = list_strategies()
-    assert "wyckoff_mtf_v2" not in codes
+    assert "wyckoff_mtf" in codes
+    # Phase 9C2 registers v2; v1 must remain.
     assert "wyckoff_mtf" in codes
 
 
-def test_no_migration_012():
+def test_migration_012_is_wyckoff_v2_only():
     files = sorted(p.name for p in MIGRATIONS.glob("*.sql"))
-    assert "012_wyckoff_mtf_v2.sql" not in files
-    assert not any(name.startswith("012_") for name in files)
+    assert "012_wyckoff_mtf_v2.sql" in files
+    assert not any(name.startswith("013_") for name in files)
     assert "011_shadow_pair_outcomes.sql" in files
+    sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
+    assert "wyckoff_mtf_v2" in sql
+    assert "('wyckoff_mtf'," not in sql
 
 
 def test_no_provider_or_db_imports_in_9b_modules():
@@ -118,5 +122,17 @@ def test_protected_surfaces_unmodified():
         "app/workers/strategies/decision_card.py",
         "app/workers/scanner/funnel.py",
         "app/workers/persistence.py",
-        "app/workers/strategies/registry.py",
     ) == ""
+
+
+def test_registry_diff_is_v2_registration_only():
+    """Phase 9C2 may register wyckoff_mtf_v2; no other pattern codes added."""
+    diff = _git_diff("app/workers/strategies/registry.py")
+    if not diff:
+        return
+    assert "WyckoffMTFV2Strategy" in diff
+    assert "wyckoff_mtf_v2" in diff
+    # Must not remove or rename v1 registration.
+    assert "WyckoffMTFStrategy" in (ROOT / "app/workers/strategies/registry.py").read_text(
+        encoding="utf-8"
+    )

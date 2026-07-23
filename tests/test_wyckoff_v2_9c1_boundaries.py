@@ -1,4 +1,8 @@
-"""Phase 9C1 boundary guards — unregistered, no migration 012, no I/O."""
+"""Phase 9C1 boundary guards — orchestration isolation after Phase 9C2 registration.
+
+Phase 9C2 may register wyckoff_mtf_v2 and add migration 012. This file still
+guards against funnel/decision-card/provider expansion.
+"""
 
 from __future__ import annotations
 
@@ -41,18 +45,19 @@ def _git_diff(*paths: str) -> str:
     return result.stdout.strip()
 
 
-def test_no_migration_012():
-    assert not any(MIGRATIONS.glob("012_*"))
+def test_migration_012_exists_for_v2_only():
+    assert (MIGRATIONS / "012_wyckoff_mtf_v2.sql").exists()
+    assert not list(MIGRATIONS.glob("013_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
 
 
-def test_registry_unchanged_no_v2():
+def test_registry_includes_v2_after_canonical_init():
     codes = list_strategies()
-    assert "wyckoff_mtf_v2" not in codes
+    assert "wyckoff_mtf_v2" in codes
     assert "wyckoff_mtf" in codes
 
 
-def test_package_exports_strategy_without_registration():
+def test_package_exports_strategy_without_self_registration():
     before = list(list_strategies())
     from app.workers.strategies.wyckoff_v2 import WyckoffMTFV2Strategy
     import app.workers.strategies.wyckoff_v2 as v2
@@ -63,7 +68,6 @@ def test_package_exports_strategy_without_registration():
     assert WyckoffMTFV2Strategy.decision_policy_version == "wyckoff_mtf.policy.v1"
     after = list(list_strategies())
     assert after == before
-    assert "wyckoff_mtf_v2" not in after
 
 
 def test_default_rollout_and_min_price():
@@ -79,7 +83,6 @@ def test_default_rollout_and_min_price():
 def test_no_forbidden_surface_diffs():
     paths = [
         "app/workers/strategies/wyckoff",
-        "app/workers/strategies/registry.py",
         "app/workers/strategies/decision_card.py",
         "app/workers/scanner/funnel.py",
         "app/workers/provenance.py",
@@ -87,7 +90,6 @@ def test_no_forbidden_surface_diffs():
         "app/workers/outcomes",
         "app/workers/shadow",
         "app/routers",
-        "app/db/migrations",
         "docs/architecture/evidence-engine-roadmap.md",
     ]
     assert _git_diff(*paths) == ""
@@ -123,11 +125,7 @@ def test_c1_files_exist():
         assert (ROOT / "tests" / name).exists()
 
 
-def test_evidence_map_internal_not_required_on_package():
-    import app.workers.strategies.wyckoff_v2 as v2
-
-    # Internal module; package need not re-export helpers.
-    assert not hasattr(v2, "build_evidence_bundle") or True
+def test_evidence_map_internal_importable():
     from app.workers.strategies.wyckoff_v2 import evidence_map as em
 
     assert callable(em.build_evidence_bundle)

@@ -401,9 +401,9 @@ class TestNoBehaviorDrift:
         assert CALCULATION_VERSION == "outcome.v1"
         assert OUTCOME_COVERAGE_VERSION == "candidate_outcomes.v1"
 
-    def test_exactly_migration_011_no_012(self):
-        """010 is Phase 8.1B1; 011 is Phase 8.1B2 pair outcomes; nothing
-        beyond 011 exists yet."""
+    def test_exactly_migration_011_and_012_wyckoff_only(self):
+        """010 is Phase 8.1B1; 011 is Phase 8.1B2 pair outcomes; 012 is
+        Phase 9C2 wyckoff_mtf_v2 registration only."""
         migrations = Path(__file__).resolve().parents[1] / "app" / "db" / "migrations"
         assert [p.name for p in migrations.glob("010_*")] == [
             "010_sma150_shadow_evaluations.sql"
@@ -411,4 +411,10 @@ class TestNoBehaviorDrift:
         assert [p.name for p in sorted(migrations.glob("011_*"))] == [
             "011_shadow_pair_outcomes.sql"
         ]
-        assert not list(migrations.glob("012_*"))
+        assert [p.name for p in sorted(migrations.glob("012_*"))] == [
+            "012_wyckoff_mtf_v2.sql"
+        ]
+        assert not list(migrations.glob("013_*"))
+        sql = (migrations / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
+        assert "strategy_shadow" not in sql.lower()
+        assert "wyckoff_mtf_v2" in sql

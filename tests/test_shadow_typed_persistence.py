@@ -726,12 +726,18 @@ class TestBoundaries:
             "8b551311a2e421bb0a3bd8907970055b35122a79f1af714e4ba0b1a01d6c051d"
         )
 
-    def test_exactly_migration_011_no_012(self):
-        # Phase 8.1B2 adds exactly ONE new migration; 010 stays untouched.
+    def test_exactly_migration_011_and_012_wyckoff_only(self):
+        # Phase 8.1B2 added 011; Phase 9C2 adds exactly 012_wyckoff_mtf_v2.
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("011_*"))] == [
             "011_shadow_pair_outcomes.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("012_*"))
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("012_*"))] == [
+            "012_wyckoff_mtf_v2.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("013_*"))
+        sql = (MIGRATIONS_DIR / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
+        assert "strategy_shadow" not in sql.lower()
+        assert "wyckoff_mtf_v2" in sql
 
     def test_fingerprint_versions_unchanged(self):
         assert FRAME_SNAPSHOT_VERSION == "daily_ohlcv_snapshot.v1"

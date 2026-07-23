@@ -59,16 +59,26 @@ def test_v1_registry_identity_unchanged():
     assert STRATEGY_VERSION == "wyckoff_mtf.v1"
 
 
-def test_no_v2_registry_entry_yet():
-    from app.workers.strategies.registry import list_strategies
+def test_no_v2_replaces_v1_identity():
+    """Phase 9C2 may register v2, but v1 identity must remain distinct."""
+    from app.workers.strategies.registry import get_strategy, list_strategies
+    from app.workers.strategies.wyckoff import STRATEGY_VERSION
 
-    assert "wyckoff_mtf_v2" not in list_strategies()
+    assert "wyckoff_mtf" in list_strategies()
+    strategy = get_strategy("wyckoff_mtf")
+    assert strategy.pattern_code == "wyckoff_mtf"
+    assert strategy.version == STRATEGY_VERSION
+    assert STRATEGY_VERSION == "wyckoff_mtf.v1"
 
 
-def test_no_migration_012():
+def test_migration_012_is_wyckoff_v2_only():
     paths = sorted(MIGRATIONS.glob("012_*"))
-    assert paths == []
+    assert [p.name for p in paths] == ["012_wyckoff_mtf_v2.sql"]
+    assert not list(MIGRATIONS.glob("013_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
+    sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
+    assert "wyckoff_mtf_v2" in sql
+    assert "('wyckoff_mtf'," not in sql
 
 
 def test_no_scheduler_change():

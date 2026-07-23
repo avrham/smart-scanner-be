@@ -37,11 +37,18 @@ MIGRATION_011 = MIGRATIONS_DIR / "011_shadow_pair_outcomes.sql"
 
 
 class TestMigrationBoundaries:
-    def test_exactly_migration_011_no_012(self):
+    def test_exactly_migration_011_and_012_wyckoff_only(self):
+        # Phase 8.1B2 added 011; Phase 9C2 adds exactly 012_wyckoff_mtf_v2.
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("011_*"))] == [
             "011_shadow_pair_outcomes.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("012_*"))
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("012_*"))] == [
+            "012_wyckoff_mtf_v2.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("013_*"))
+        sql = (MIGRATIONS_DIR / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
+        assert "strategy_shadow" not in sql.lower()
+        assert "wyckoff_mtf_v2" in sql
 
     def test_migration_011_creates_required_tables(self):
         sql = MIGRATION_011.read_text()
