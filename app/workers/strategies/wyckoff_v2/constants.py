@@ -41,6 +41,10 @@ EFFORT_RESULT_VERSION = "wyckoff_effort_result.v1"
 EVENT_CANDIDATE_VERSION = EVENT_DETECTION_VERSION  # wyckoff_events.v1
 PHASE_CANDIDATE_VERSION = PHASE_CLASSIFICATION_VERSION  # wyckoff_phases.v1
 
+# Phase 9C1 sub-contract identities (declared only; nothing registers them).
+FOUR_HOUR_TRIGGER_VERSION = "wyckoff_4h_trigger.v1"
+INVALIDATION_VERSION = "wyckoff_invalidation.v1"
+
 # ---- Readiness status vocabulary (never represented as a zero score) ------ #
 STATUS_READY = "ready"
 STATUS_INSUFFICIENT_HISTORY = "insufficient_history"
@@ -149,6 +153,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_total_event_candidates": 120,
     # ---- Phase 9B: structure ---------------------------------------------- #
     "min_structure_confirmed_event_types": 2,
+    # ---- Phase 9C1: decision / 4H / evidence bounds ----------------------- #
+    "allow_enter": False,
+    "enable_4h_trigger": False,
+    "require_4h_trigger_for_enter": True,
+    "trigger_lookback_4h": 10,
+    "four_hour_bar_duration_hours": 4,
+    "four_hour_timestamp_timezone": "UTC",
+    "max_4h_staleness_sessions": 1,
+    "avoid_on_htf_contradiction": True,
+    "enter_eligible_phases": ["C", "D", "E"],
+    "structure_quality_full_event_types": 4,
+    "max_event_candidates_in_evidence": 32,
+    "max_event_candidates_in_details": 60,
+    "min_price": 5.0,
 }
 
 # The exact config subset that participates in the range-candidate identity
@@ -252,8 +270,10 @@ Phase9BConfigError = Phase9AConfigError
 
 
 def default_config() -> Dict[str, Any]:
-    """A fresh copy of the Phase 9A/9B default configuration contract."""
-    return dict(DEFAULT_CONFIG)
+    """A fresh copy of the Phase 9A/9B/9C1 default configuration contract."""
+    config = dict(DEFAULT_CONFIG)
+    config["enter_eligible_phases"] = list(DEFAULT_CONFIG["enter_eligible_phases"])
+    return config
 
 
 def _require_finite_number(value: Any, name: str) -> float:
@@ -606,15 +626,113 @@ def validate_phase9a_config(config: Dict[str, Any]) -> None:
         )
 
 
+def validate_phase9c1_config(config: Dict[str, Any]) -> None:
+    """Reject malformed Phase 9C1 config. Prefer rejection over silent clamping."""
+    for name in (
+        "allow_enter",
+        "enable_4h_trigger",
+        "require_4h_trigger_for_enter",
+        "avoid_on_htf_contradiction",
+    ):
+        if not isinstance(config[name], bool):
+            raise Phase9AConfigError(
+                "invalid_policy_config", f"{name} must be a boolean"
+            )
+
+    lookback = _require_positive_int(config, "trigger_lookback_4h")
+    duration = _require_finite_number(
+        config["four_hour_bar_duration_hours"], "four_hour_bar_duration_hours"
+    )
+    if duration <= 0:
+        raise Phase9AConfigError(
+            "invalid_policy_config", "four_hour_bar_duration_hours <= 0"
+        )
+    staleness = int(
+        _require_finite_number(
+            config["max_4h_staleness_sessions"], "max_4h_staleness_sessions"
+        )
+    )
+    if staleness < 0:
+        raise Phase9AConfigError(
+            "invalid_policy_config", "max_4h_staleness_sessions < 0"
+        )
+
+    phases = config["enter_eligible_phases"]
+    if not isinstance(phases, (list, tuple)) or len(phases) == 0:
+        raise Phase9AConfigError(
+            "invalid_policy_config", "enter_eligible_phases must be non-empty"
+        )
+    allowed = {"A", "B", "C", "D", "E"}
+    normalized = []
+    for p in phases:
+        s = str(p)
+        if s not in allowed:
+            raise Phase9AConfigError(
+                "invalid_policy_config",
+                f"enter_eligible_phases contains invalid phase {s!r}",
+            )
+        normalized.append(s)
+    # Persist a fresh list copy so callers cannot mutate defaults in place.
+    config["enter_eligible_phases"] = list(normalized)
+
+    full_types = _require_positive_int(config, "structure_quality_full_event_types")
+    evid_cap = _require_positive_int(config, "max_event_candidates_in_evidence")
+    details_cap = _require_positive_int(config, "max_event_candidates_in_details")
+    if evid_cap < 16:
+        raise Phase9AConfigError(
+            "invalid_policy_config",
+            "max_event_candidates_in_evidence must be >= 16",
+        )
+    if details_cap < evid_cap:
+        raise Phase9AConfigError(
+            "invalid_policy_config",
+            "max_event_candidates_in_details below max_event_candidates_in_evidence",
+        )
+
+    tz = str(config["four_hour_timestamp_timezone"])
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(tz)
+    except Exception as exc:
+        raise Phase9AConfigError(
+            "invalid_policy_config",
+            f"unsupported four_hour_timestamp_timezone: {tz!r}",
+        ) from exc
+
+    # min_price: finite, strictly > 0; booleans rejected (bool subclasses int).
+    if "min_price" not in config:
+        raise Phase9AConfigError("invalid_policy_config", "min_price missing")
+    raw_min = config["min_price"]
+    if isinstance(raw_min, bool) or not isinstance(raw_min, (int, float)):
+        raise Phase9AConfigError(
+            "invalid_policy_config", "min_price must be a finite number > 0"
+        )
+    min_price = _require_finite_number(raw_min, "min_price")
+    if min_price <= 0:
+        raise Phase9AConfigError(
+            "invalid_policy_config", "min_price must be strictly greater than zero"
+        )
+    _ = (lookback, full_types)
+
+
 def resolve_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Defaults overlaid with an explicit override dictionary (copied).
 
-    Validates the resolved Phase 9A and Phase 9B config. Does not silently
+    Validates the resolved Phase 9A/9B/9C1 config. Does not silently
     clamp operator values.
     """
     config = default_config()
     if overrides:
-        config.update(overrides)
+        # Deep-copy list-valued keys so callers cannot mutate shared defaults.
+        for k, v in overrides.items():
+            if isinstance(v, list):
+                config[k] = list(v)
+            elif isinstance(v, dict):
+                config[k] = dict(v)
+            else:
+                config[k] = v
     validate_phase9a_config(config)
     validate_phase9b_config(config)
+    validate_phase9c1_config(config)
     return config

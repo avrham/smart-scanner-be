@@ -698,6 +698,182 @@ class PhaseClassificationResult:
         return _json_safe(payload, "PhaseClassificationResult")
 
 
+# --------------------------------------------------------------------------- #
+# Phase 9C1 contracts
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class FourHourTriggerResult:
+    """Deterministic 4H trigger analysis (price-only first contract)."""
+
+    trigger_version: str
+    enabled: bool
+    state: str
+    reason_codes: Tuple[str, ...]
+    side: str
+    evaluation_time_utc: str
+    daily_market_data_as_of: Optional[str]
+    available_input_bars: int
+    available_completed_bars: int
+    required_completed_bars: int
+    excluded_incomplete_bar_count: int
+    latest_completed_4h_start: Optional[str]
+    latest_completed_4h_end: Optional[str]
+    latest_completed_4h_session_date: Optional[str]
+    staleness_sessions: Optional[int]
+    local_high: Optional[float]
+    local_low: Optional[float]
+    trigger_level: Optional[float]
+    contradiction_level: Optional[float]
+    current_close: Optional[float]
+    trigger_price: Optional[float]
+    triggered: bool
+    contradicted: bool
+    missing_data: Tuple[str, ...]
+    config_used: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "trigger_version": self.trigger_version,
+            "enabled": bool(self.enabled),
+            "state": self.state,
+            "reason_codes": list(self.reason_codes),
+            "side": self.side,
+            "evaluation_time_utc": self.evaluation_time_utc,
+            "daily_market_data_as_of": self.daily_market_data_as_of,
+            "available_input_bars": int(self.available_input_bars),
+            "available_completed_bars": int(self.available_completed_bars),
+            "required_completed_bars": int(self.required_completed_bars),
+            "excluded_incomplete_bar_count": int(self.excluded_incomplete_bar_count),
+            "latest_completed_4h_start": self.latest_completed_4h_start,
+            "latest_completed_4h_end": self.latest_completed_4h_end,
+            "latest_completed_4h_session_date": self.latest_completed_4h_session_date,
+            "staleness_sessions": (
+                None
+                if self.staleness_sessions is None
+                else int(self.staleness_sessions)
+            ),
+            "local_high": _require_finite(self.local_high, "local_high"),
+            "local_low": _require_finite(self.local_low, "local_low"),
+            "trigger_level": _require_finite(self.trigger_level, "trigger_level"),
+            "contradiction_level": _require_finite(
+                self.contradiction_level, "contradiction_level"
+            ),
+            "current_close": _require_finite(self.current_close, "current_close"),
+            "trigger_price": _require_finite(self.trigger_price, "trigger_price"),
+            "triggered": bool(self.triggered),
+            "contradicted": bool(self.contradicted),
+            "missing_data": list(self.missing_data),
+            "config_used": dict(self.config_used),
+        }
+        return _json_safe(payload, "FourHourTriggerResult")
+
+
+@dataclass(frozen=True)
+class InvalidationResult:
+    """Deterministic daily-structure invalidation (no stop/target)."""
+
+    invalidation_version: str
+    rule_code: Optional[str]
+    level: Optional[float]
+    source_range_id: Optional[str]
+    source_event_ids: Tuple[str, ...]
+    zone: Optional[Dict[str, float]]
+    atr: Optional[float]
+    buffer_atr_multiple: Optional[float]
+    timeframe: str
+    as_of: str
+    reason: Optional[str]
+    available: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "invalidation_version": self.invalidation_version,
+            "rule_code": self.rule_code,
+            "level": _require_finite(self.level, "level"),
+            "source_range_id": self.source_range_id,
+            "source_event_ids": list(self.source_event_ids),
+            "zone": self.zone,
+            "atr": _require_finite(self.atr, "atr"),
+            "buffer_atr_multiple": _require_finite(
+                self.buffer_atr_multiple, "buffer_atr_multiple"
+            ),
+            "timeframe": self.timeframe,
+            "as_of": self.as_of,
+            "reason": self.reason,
+            "available": bool(self.available),
+        }
+        return _json_safe(payload, "InvalidationResult")
+
+
+@dataclass(frozen=True)
+class RankingResult:
+    """Ranking-only score — never a policy gate."""
+
+    ranking_version: str
+    components: Dict[str, Optional[float]]
+    ranking_score: Optional[float]
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "ranking_version": self.ranking_version,
+            "components": {
+                k: _require_finite(v, f"components.{k}")
+                for k, v in self.components.items()
+            },
+            "ranking_score": _require_finite(self.ranking_score, "ranking_score"),
+        }
+        return _json_safe(payload, "RankingResult")
+
+
+@dataclass(frozen=True)
+class PolicyDecisionResult:
+    """Explicit wyckoff_mtf.policy.v1 decision (ENTER/WATCH/AVOID only)."""
+
+    decision_policy_version: str
+    verdict: str
+    side: str
+    setup_state: str
+    trigger_state: str
+    reason_code: Optional[str]
+    blocking_reasons: Tuple[str, ...]
+    waiting_reasons: Tuple[str, ...]
+    required_gate_results: Dict[str, bool]
+    allow_enter: bool
+    enter_eligible_without_rollout_gate: bool
+    selected_phase: Optional[str]
+    selected_phase_status: Optional[str]
+    invalidation_available: bool
+    trigger_required: bool
+    trigger_confirmed: bool
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "decision_policy_version": self.decision_policy_version,
+            "verdict": self.verdict,
+            "side": self.side,
+            "setup_state": self.setup_state,
+            "trigger_state": self.trigger_state,
+            "reason_code": self.reason_code,
+            "blocking_reasons": list(self.blocking_reasons),
+            "waiting_reasons": list(self.waiting_reasons),
+            "required_gate_results": {
+                str(k): bool(v) for k, v in self.required_gate_results.items()
+            },
+            "allow_enter": bool(self.allow_enter),
+            "enter_eligible_without_rollout_gate": bool(
+                self.enter_eligible_without_rollout_gate
+            ),
+            "selected_phase": self.selected_phase,
+            "selected_phase_status": self.selected_phase_status,
+            "invalidation_available": bool(self.invalidation_available),
+            "trigger_required": bool(self.trigger_required),
+            "trigger_confirmed": bool(self.trigger_confirmed),
+        }
+        return _json_safe(payload, "PolicyDecisionResult")
+
+
 # Re-export version constants for callers that import from models.
 __all__ = [
     "AGGREGATION_VERSION",
@@ -705,16 +881,20 @@ __all__ = [
     "EffortResultMeasurement",
     "EventCandidate",
     "EventDetectionResult",
+    "FourHourTriggerResult",
     "HTFContextResult",
+    "InvalidationResult",
     "PHASE_CANDIDATE_VERSION",
     "PhaseCandidate",
     "PhaseClassificationResult",
+    "PolicyDecisionResult",
     "PriceZone",
     "RANGE_CANDIDATE_VERSION",
     "RANGE_DETECTION_VERSION",
     "READINESS_VERSION",
     "RangeCandidate",
     "RangeDetectionResult",
+    "RankingResult",
     "ReadinessResult",
     "StructureClassificationResult",
     "TouchInteraction",

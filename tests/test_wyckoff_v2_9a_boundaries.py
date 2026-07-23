@@ -1,17 +1,17 @@
-"""Phase 9A boundary tests — isolation, no registration, no migration 012."""
+"""Phase 9A boundary tests — isolation, no registration, no migration 012.
+
+Phase 9C1 may export WyckoffMTFV2Strategy from the package without registering
+it. This file no longer forbids a Strategy class export.
+"""
 
 from __future__ import annotations
 
 import ast
-import importlib
 import subprocess
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 V2 = ROOT / "app" / "workers" / "strategies" / "wyckoff_v2"
-V1 = ROOT / "app" / "workers" / "strategies" / "wyckoff"
 MIGRATIONS = ROOT / "app" / "db" / "migrations"
 
 
@@ -79,7 +79,6 @@ def test_no_scheduler_change():
         text=True,
         check=False,
     )
-    # Paths may not exist; empty diff is what matters.
     assert result.stdout.strip() == ""
 
 
@@ -146,7 +145,8 @@ def test_bar_completion_shared_and_reexported():
     assert bar_completion.BAR_COMPLETION_POLICY == "ny_session_close.v1"
 
 
-def test_phase_9a_package_exports():
+def test_phase_9a_surface_remains_importable():
+    """Compatibility: Phase 9A public functions stay importable from the package."""
     import app.workers.strategies.wyckoff_v2 as v2
 
     assert v2.STRATEGY_CODE == "wyckoff_mtf_v2"
@@ -154,5 +154,5 @@ def test_phase_9a_package_exports():
     assert callable(v2.assess_data_readiness)
     assert callable(v2.detect_trading_ranges)
     assert callable(v2.aggregate_completed_timeframes)
-    # No Strategy class registered/exported yet.
-    assert not hasattr(v2, "WyckoffMTFV2Strategy")
+    assert callable(v2.normalize_canonical_daily)
+    assert callable(v2.derive_history_requirement)

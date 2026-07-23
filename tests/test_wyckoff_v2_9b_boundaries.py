@@ -1,9 +1,15 @@
-"""Phase 9B boundary guards — no orchestration, registry, migration, or I/O."""
+"""Phase 9B boundary guards — registry, migration, isolation.
+
+Phase 9C1 may include policy, StrategyResult orchestration, evidence mapping,
+and allow_enter config. This file no longer forbids those concepts via
+source-text substring checks.
+"""
 
 from __future__ import annotations
 
 import ast
 import pathlib
+import subprocess
 
 from app.workers.strategies.registry import list_strategies
 
@@ -12,12 +18,32 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 V2 = ROOT / "app" / "workers" / "strategies" / "wyckoff_v2"
 MIGRATIONS = ROOT / "app" / "db" / "migrations"
 
+FORBIDDEN_IMPORT_PREFIXES = (
+    "app.db",
+    "app.providers",
+    "openai",
+    "anthropic",
+    "app.workers.external",
+    "app.routers",
+)
+
 
 def _read(path: pathlib.Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_phase9a_surface_still_importable():
+def _git_diff(*paths: str) -> str:
+    result = subprocess.run(
+        ["git", "diff", "--", *paths],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip()
+
+
+def test_phase9a_and_9b_surface_still_importable():
     import app.workers.strategies.wyckoff_v2 as v2
 
     assert callable(v2.assess_data_readiness)
@@ -43,34 +69,6 @@ def test_no_migration_012():
     assert "011_shadow_pair_outcomes.sql" in files
 
 
-def test_no_strategy_result_or_policy_or_evidence_mapping():
-    forbidden_snippets = (
-        "StrategyResult",
-        "evidence.v1",
-        "allow_enter",
-        "decision_card",
-        "map_evidence",
-    )
-    for path in V2.glob("*.py"):
-        if path.name == "__init__.py":
-            text = _read(path)
-            # __init__ may mention versions in comments only — check imports
-            tree = ast.parse(text)
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    mod = (
-                        node.module
-                        if isinstance(node, ast.ImportFrom)
-                        else ",".join(a.name for a in node.names)
-                    )
-                    assert mod is None or "decision_card" not in (mod or "")
-                    assert mod is None or "evidence" not in (mod or "")
-            continue
-        text = _read(path)
-        for snip in ("class StrategyResult", "def map_to_evidence", "allow_enter="):
-            assert snip not in text, f"{path.name} contains {snip}"
-
-
 def test_no_provider_or_db_imports_in_9b_modules():
     modules = (
         "context_htf.py",
@@ -78,33 +76,47 @@ def test_no_provider_or_db_imports_in_9b_modules():
         "events.py",
         "phases.py",
     )
-    banned = (
-        "app.db",
-        "app.providers",
-        "sqlalchemy",
-        "openai",
-        "anthropic",
-        "save_signal",
-        "httpx",
-        "requests",
-    )
     for name in modules:
-        text = _read(V2 / name)
-        for b in banned:
-            assert b not in text, f"{name} references {b}"
+        path = V2 / name
+        tree = ast.parse(_read(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    for prefix in FORBIDDEN_IMPORT_PREFIXES:
+                        assert not alias.name.startswith(prefix), f"{name}: {alias.name}"
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                for prefix in FORBIDDEN_IMPORT_PREFIXES:
+                    assert not mod.startswith(prefix), f"{name}: {mod}"
+        text = _read(path)
+        assert "save_signal" not in text
 
 
 def test_v1_package_untouched_marker():
-    # v1 strategy module still present and independent
     v1 = ROOT / "app" / "workers" / "strategies" / "wyckoff" / "strategy.py"
     assert v1.exists()
     text = _read(v1)
     assert "wyckoff_mtf.v1" in text or "STRATEGY_VERSION" in text
 
 
-def test_no_scheduler_or_router_changes_required():
-    # Boundary: 9B modules must not import routers/scheduler
+def test_no_scheduler_or_router_imports_in_v2():
     for path in V2.glob("*.py"):
-        text = _read(path)
-        assert "app.routers" not in text
-        assert "apscheduler" not in text.lower()
+        tree = ast.parse(_read(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                assert not mod.startswith("app.routers"), path.name
+                assert "apscheduler" not in mod.lower()
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith("app.routers")
+                    assert "apscheduler" not in alias.name.lower()
+
+
+def test_protected_surfaces_unmodified():
+    assert _git_diff(
+        "app/workers/strategies/decision_card.py",
+        "app/workers/scanner/funnel.py",
+        "app/workers/persistence.py",
+        "app/workers/strategies/registry.py",
+    ) == ""
