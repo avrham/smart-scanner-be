@@ -12,12 +12,17 @@ import logging
 import asyncpg
 
 from app.deps import get_db, get_worker_token
+from app.models.responses import StrategyDiscoveryResponse
 from app.workers.scan_runner import run_scan_batch
 from app.workers.maintenance import cleanup_daily_seen, clear_daily_seen
 from app.workers.outcomes.service import calculate_outcomes_for_signals
 from app.workers.scanner.funnel import run_funnel_scan
 from app.workers import market_jobs, market_store
 from app.workers.coverage import UnsupportedProviderError, get_market_data_coverage
+from app.workers.strategies.discovery import (
+    discover_all_strategies,
+    discover_strategy,
+)
 from app.providers import ProviderConfigError, get_market_data_provider
 from app.config import settings
 from app.utils.events import event_bus
@@ -670,6 +675,58 @@ async def shadow_outcomes_calculate(
         outcome_run_id=outcome_run_id,
     )
     return {"message": "Shadow outcome calculation completed", **summary}
+
+
+def _discovery_to_response(item) -> StrategyDiscoveryResponse:
+    return StrategyDiscoveryResponse(
+        pattern_code=item.pattern_code,
+        registered=item.registered,
+        enabled=item.enabled,
+        db_configured=item.db_configured,
+        config_status=item.config_status,
+        name=item.name,
+        description=item.description,
+        strategy_version=item.strategy_version,
+        decision_policy_version=item.decision_policy_version,
+        allow_enter=item.allow_enter,
+        enable_4h_trigger=item.enable_4h_trigger,
+        min_price=item.min_price,
+        effective_config=item.effective_config,
+    )
+
+
+@router.get("/strategies", response_model=List[StrategyDiscoveryResponse])
+async def list_admin_strategies(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Read-only catalog of every canonically registered strategy.
+
+    Includes disabled and unconfigured strategies. Does not enable strategies,
+    mutate configuration, or invoke providers. Distinct from public
+    GET /api/patterns which only returns is_enabled=true rows.
+    """
+    items = await discover_all_strategies(db)
+    return [_discovery_to_response(item) for item in items]
+
+
+@router.get(
+    "/strategies/{pattern_code}",
+    response_model=StrategyDiscoveryResponse,
+)
+async def get_admin_strategy(
+    pattern_code: str,
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Read-only discovery for one registered strategy code."""
+    item = await discover_strategy(db, pattern_code)
+    if item is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No strategy registered for pattern_code '{pattern_code}'",
+        )
+    return _discovery_to_response(item)
 
 
 @router.get("/status")

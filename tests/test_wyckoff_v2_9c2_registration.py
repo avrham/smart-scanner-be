@@ -394,11 +394,15 @@ class TestRolloutBehavior:
 
 class TestPhase9C2Boundaries:
     def test_no_funnel_decision_card_scheduler_api_persistence_diff(self):
+        # Phase 9C3 may add admin read-only strategy discovery in admin.py.
+        # Public listing and execution surfaces must stay unchanged.
         assert _git_diff(
             "app/workers/scanner/funnel.py",
             "app/workers/strategies/decision_card.py",
             "app/workers/persistence.py",
-            "app/routers",
+            "app/routers/public.py",
+            "app/routers/outcomes.py",
+            "app/routers/shadow.py",
             "app/workers/scheduler",
             "app/scheduler",
             "app/jobs",

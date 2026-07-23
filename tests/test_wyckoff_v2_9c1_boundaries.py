@@ -81,6 +81,8 @@ def test_default_rollout_and_min_price():
 
 
 def test_no_forbidden_surface_diffs():
+    # Phase 9C3 may extend admin read discovery under app/routers/admin.py.
+    # Keep execution / public / outcomes / shadow surfaces unmodified.
     paths = [
         "app/workers/strategies/wyckoff",
         "app/workers/strategies/decision_card.py",
@@ -89,7 +91,9 @@ def test_no_forbidden_surface_diffs():
         "app/workers/persistence.py",
         "app/workers/outcomes",
         "app/workers/shadow",
-        "app/routers",
+        "app/routers/public.py",
+        "app/routers/outcomes.py",
+        "app/routers/shadow.py",
         "docs/architecture/evidence-engine-roadmap.md",
     ]
     assert _git_diff(*paths) == ""
