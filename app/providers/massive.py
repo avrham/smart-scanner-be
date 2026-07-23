@@ -61,6 +61,8 @@ class MassiveProvider(MarketDataProvider):
     # [from_date, to_date] window — genuine bounded range retrieval, so old
     # shadow pairs remain calculable after they leave any latest-N window.
     supports_bounded_daily_range = True
+    # Massive aggregates serve REAL bounded intraday ranges too (Phase 9E1).
+    supports_intraday_history = True
 
     def __init__(self, client: Optional[MassiveClient] = None):
         self.client = client or MassiveClient(api_key=settings.MASSIVE_API_KEY)
@@ -319,6 +321,92 @@ class MassiveProvider(MarketDataProvider):
                 logger.warning("[massive] history failed for %s: %s", symbol, exc)
                 results[symbol] = {"symbol": symbol, "historical": []}
         return results
+
+    async def get_intraday_history(
+        self,
+        symbol: str,
+        *,
+        multiplier: int,
+        timespan: str,
+        start=None,
+        end=None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Normalized typed intraday bars over an explicit bounded range.
+
+        Maps directly onto Massive aggregates (epoch-ms UTC bar starts).
+        Requests MUST be bounded: both `start` and `end` are required — a
+        missing bound would silently become an unbounded window. Bars are
+        returned oldest-first with tz-aware UTC start timestamps; malformed
+        rows are skipped and counted; exact-duplicate rows (same start and
+        identical OHLCV) are dropped keep-first and counted; rows sharing a
+        start with DIFFERENT values are preserved for the canonical frame
+        layer to reject. Completed-bar semantics are NOT applied here.
+        Provider errors propagate as MassiveApiError — never silently empty.
+        """
+        if int(multiplier) <= 0:
+            raise ValueError("multiplier must be a positive integer")
+        if timespan not in ("minute", "hour", "day"):
+            raise ValueError(f"unsupported timespan {timespan!r}")
+        if start is None or end is None:
+            raise ValueError(
+                "get_intraday_history requires explicit start and end bounds"
+            )
+
+        def _as_date_str(value) -> str:
+            if isinstance(value, datetime):
+                return value.astimezone(timezone.utc).date().isoformat()
+            if isinstance(value, date):
+                return value.isoformat()
+            return str(value)[:10]
+
+        start_str = _as_date_str(start)
+        end_str = _as_date_str(end)
+        raw = await self.client.get_aggs(
+            symbol, int(multiplier), timespan, start_str, end_str
+        )
+
+        bars: List[Dict[str, Any]] = []
+        skipped = 0
+        for bar in raw:
+            try:
+                start_utc = datetime.fromtimestamp(
+                    float(bar["t"]) / 1000.0, tz=timezone.utc
+                )
+                bars.append({
+                    "start_utc": start_utc,
+                    "open": float(bar["o"]),
+                    "high": float(bar["h"]),
+                    "low": float(bar["l"]),
+                    "close": float(bar["c"]),
+                    "volume": float(bar["v"]),
+                })
+            except (KeyError, TypeError, ValueError):
+                skipped += 1
+                continue
+
+        bars.sort(key=lambda b: b["start_utc"])
+        deduped: List[Dict[str, Any]] = []
+        dropped = 0
+        for bar in bars:
+            if deduped and deduped[-1] == bar:
+                dropped += 1
+                continue
+            deduped.append(bar)
+        if limit is not None:
+            deduped = deduped[-int(limit):]
+
+        return {
+            "symbol": symbol,
+            "provider": self.name,
+            "multiplier": int(multiplier),
+            "timespan": timespan,
+            "requested_start": start_str,
+            "requested_end": end_str,
+            "bars": deduped,
+            "skipped_malformed": skipped,
+            "dropped_exact_duplicates": dropped,
+        }
 
     async def fetch_historical_4h(
         self, symbol: str, limit: Optional[int] = None

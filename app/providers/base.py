@@ -11,7 +11,17 @@ Massive or FMP directly. Two groups of operations:
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Union
+
+
+class IntradayHistoryUnsupportedError(RuntimeError):
+    """The configured provider cannot serve REAL bounded intraday ranges.
+
+    Typed unsupported-capability state (Phase 9E1): callers must classify
+    this explicitly instead of falling back to a latest-N shim that would
+    silently misrepresent an as-of window.
+    """
 
 
 class MarketDataProvider(ABC):
@@ -25,6 +35,14 @@ class MarketDataProvider(ABC):
     # requires True: an old range served from a latest-N shim would silently
     # lose bars and corrupt forward-bar alignment. Conservative default.
     supports_bounded_daily_range: bool = False
+
+    # Whether get_intraday_history performs REAL bounded intraday range
+    # retrieval (Phase 9E1). Same honesty rule as
+    # supports_bounded_daily_range: a provider whose intraday endpoint only
+    # serves a fixed latest-N window must keep this False rather than
+    # client-side-filter a window it cannot actually bound. Conservative
+    # default.
+    supports_intraday_history: bool = False
 
     # ---- discovery / ingestion ---- #
 
@@ -70,3 +88,41 @@ class MarketDataProvider(ABC):
         self, symbol: str, limit: Optional[int] = None
     ) -> Dict[str, Any]:
         """FMP-shaped 4H payload; empty `historical` when unavailable."""
+
+    # ---- canonical intraday history (Phase 9E1) ---- #
+
+    async def get_intraday_history(
+        self,
+        symbol: str,
+        *,
+        multiplier: int,
+        timespan: str,
+        start: Union[date, datetime, str, None] = None,
+        end: Union[date, datetime, str, None] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Normalized typed intraday bars over an explicit bounded range.
+
+        Generic timeframe request (e.g. multiplier=4, timespan="hour" for the
+        canonical 4H frame). Implementations must return:
+
+            {"symbol", "provider", "multiplier", "timespan",
+             "requested_start", "requested_end",
+             "bars": [{"start_utc": tz-aware datetime (bar START),
+                       "open", "high", "low", "close", "volume"}, ...],
+             "skipped_malformed": int,
+             "dropped_exact_duplicates": int}
+
+        Contract: bars sorted ascending by start_utc; exact-duplicate rows
+        (identical start AND identical OHLCV) dropped deterministically
+        (keep-first, counted); rows sharing a start with DIFFERENT values are
+        preserved so the canonical frame layer can reject them explicitly;
+        the currently-forming bucket is NOT excluded here — completed-bar
+        semantics belong to the canonical frame builder. Providers that
+        cannot honestly serve a bounded intraday range keep
+        supports_intraday_history=False and raise
+        IntradayHistoryUnsupportedError (this default).
+        """
+        raise IntradayHistoryUnsupportedError(
+            f"provider '{self.name}' does not support bounded intraday history"
+        )
