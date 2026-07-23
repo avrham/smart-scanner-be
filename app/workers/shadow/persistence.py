@@ -699,10 +699,13 @@ _STRATEGY_EVALUATION_SQL = """
            e.reason, e.rejection_reason, e.created_at,
            e.details_snapshot->'policy' AS policy,
            e.details_snapshot->'readiness'->>'status' AS readiness_status,
+           e.details_snapshot->'four_hour_trigger' AS four_hour_trigger,
+           e.details_snapshot->'_four_hour_frame_meta' AS four_hour_frame_meta,
            jsonb_path_query_array(
                e.details_snapshot, '$.evidence.items[*].category'
            ) AS evidence_categories,
            p.symbol, p.snapshot_date, p.experiment_code, p.experiment_version,
+           p.frame_snapshot_version AS daily_frame_contract_version,
            p.provider,
            (o.id IS NOT NULL) AS has_outcome,
            o.outcome_status AS outcome_status
@@ -728,11 +731,14 @@ def _evaluation_record(row: Any) -> Dict[str, Any]:
         "rejection_reason": row["rejection_reason"],
         "policy": _maybe_json(row["policy"]),
         "readiness_status": row["readiness_status"],
+        "four_hour_trigger": _maybe_json(row["four_hour_trigger"]),
+        "four_hour_frame_meta": _maybe_json(row["four_hour_frame_meta"]),
         "evidence_categories": categories if isinstance(categories, list) else [],
         "symbol": row["symbol"],
         "snapshot_date": row["snapshot_date"],
         "experiment_code": row["experiment_code"],
         "experiment_version": row["experiment_version"],
+        "daily_frame_contract_version": row["daily_frame_contract_version"],
         "provider": row["provider"],
         "has_outcome": bool(row["has_outcome"]),
         "outcome_status": row["outcome_status"],
@@ -782,5 +788,119 @@ async def fetch_strategy_shadow_evaluations(
     try:
         rows = await conn.fetch(query, *params)
         return [_evaluation_record(r) for r in rows]
+    finally:
+        await release_db_connection(conn)
+
+
+# --------------------------------------------------------------------------- #
+# Campaign reads (Phase 9E8) — campaigns ARE shadow runs whose frozen
+# telemetry carries a campaign block; no separate campaign table exists.
+# --------------------------------------------------------------------------- #
+
+_CAMPAIGN_RUN_SQL = """
+    SELECT id, experiment_code, experiment_version, status, provider,
+           requested_symbols, requested_limit, started_at, finished_at,
+           error_code, created_at,
+           telemetry->'campaign' AS campaign,
+           telemetry->'pair_count' AS pair_count,
+           telemetry->'pairs_created' AS pairs_created,
+           telemetry->'pairs_deduplicated' AS pairs_deduplicated,
+           telemetry->'rejected_symbols' AS rejected_symbols
+    FROM strategy_shadow_runs
+    WHERE telemetry->'campaign' IS NOT NULL
+"""
+
+
+def _campaign_run_row(row: Any) -> Dict[str, Any]:
+    return {
+        "run_id": str(row["id"]),
+        "experiment_code": row["experiment_code"],
+        "experiment_version": row["experiment_version"],
+        "status": row["status"],
+        "provider": row["provider"],
+        "requested_symbols": _maybe_json(row["requested_symbols"]),
+        "requested_limit": row["requested_limit"],
+        "started_at": row["started_at"],
+        "finished_at": row["finished_at"],
+        "error_code": row["error_code"],
+        "campaign": _maybe_json(row["campaign"]),
+        "pair_count": _maybe_json(row["pair_count"]),
+        "pairs_created": _maybe_json(row["pairs_created"]),
+        "pairs_deduplicated": _maybe_json(row["pairs_deduplicated"]),
+        "rejected_symbols": _maybe_json(row["rejected_symbols"]),
+        "created_at": row["created_at"],
+    }
+
+
+async def fetch_shadow_campaign_runs(
+    *,
+    campaign_id: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Bounded newest-first campaign chunk runs (read-only)."""
+    where: List[str] = []
+    params: List[Any] = []
+
+    if campaign_id is not None:
+        params.append(str(campaign_id))
+        where.append(
+            f"telemetry->'campaign'->>'campaign_id' = ${len(params)}"
+        )
+
+    params.append(int(limit))
+    query = (
+        _CAMPAIGN_RUN_SQL
+        + (("AND " + " AND ".join(where)) if where else "")
+        + f" ORDER BY started_at DESC LIMIT ${len(params)}"
+    )
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(query, *params)
+        return [_campaign_run_row(r) for r in rows]
+    finally:
+        await release_db_connection(conn)
+
+
+async def fetch_campaign_outcome_coverage(
+    run_ids: List[str],
+) -> Dict[str, Any]:
+    """Outcome coverage for a campaign's persisted pairs (read-only).
+
+    A pair without an outcome row is reported as 'missing_outcome' — never
+    as a zero return.
+    """
+    if not run_ids:
+        return {"pair_count": 0, "with_outcome_count": 0,
+                "missing_outcome_count": 0, "outcome_status_distribution": {}}
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT o.outcome_status AS outcome_status,
+                   COUNT(DISTINCT p.id) AS n
+            FROM strategy_shadow_run_pairs rp
+            JOIN strategy_shadow_pairs p ON p.id = rp.pair_id
+            LEFT JOIN strategy_shadow_pair_outcomes o ON o.pair_id = p.id
+            WHERE rp.run_id = ANY($1::uuid[])
+            GROUP BY o.outcome_status
+            """,
+            [as_uuid_param(r, "run_ids") for r in run_ids],
+        )
+        distribution: Dict[str, int] = {}
+        missing = 0
+        total = 0
+        for row in rows:
+            n = int(row["n"])
+            total += n
+            if row["outcome_status"] is None:
+                missing += n
+            else:
+                distribution[str(row["outcome_status"])] = n
+        return {
+            "pair_count": total,
+            "with_outcome_count": total - missing,
+            "missing_outcome_count": missing,
+            "outcome_status_distribution": dict(sorted(distribution.items())),
+        }
     finally:
         await release_db_connection(conn)

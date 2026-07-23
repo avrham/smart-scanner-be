@@ -306,7 +306,8 @@ class TestShadowMetricsEndpoint:
         assert resp.status_code == 200
         body = resp.json()
         assert body["strategy_code"] == "wyckoff_mtf_v2"
-        assert body["metrics_contract_version"] == "strategy_shadow_metrics.v1"
+        # Phase 9E5 bumped the contract additively (trigger/4H evidence).
+        assert body["metrics_contract_version"] == "strategy_shadow_metrics.v2"
         assert body["evaluated_count"] == 1
         group = body["groups"][0]
         assert group["rollout_blocked_count"] == 1

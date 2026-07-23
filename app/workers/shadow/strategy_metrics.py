@@ -33,7 +33,11 @@ from statistics import mean, median
 from typing import Any, Dict, List, Optional, Tuple
 
 
-STRATEGY_METRICS_CONTRACT_VERSION = "strategy_shadow_metrics.v1"
+# v2 (Phase 9E5): additive trigger/4H-readiness evidence and frame-contract
+# grouping on top of the v1 decision-state fields. Every v1 field keeps its
+# exact semantics; the version is bumped because the grouping identity and
+# the emitted field set changed.
+STRATEGY_METRICS_CONTRACT_VERSION = "strategy_shadow_metrics.v2"
 
 VALID_DECISIONS = ("ENTER", "WATCH", "AVOID")
 
@@ -44,7 +48,60 @@ GROUP_IDENTITY_FIELDS = (
     "strategy_version",
     "decision_policy_version",
     "config_hash",
+    "daily_frame_contract_version",
+    "four_hour_frame_contract_version",
 )
+
+# Deterministic trigger-state classification over the FROZEN trigger record
+# (wyckoff_4h_trigger.v1 states + reason codes). Every state stays separate:
+# insufficient 4H data is never pooled with an absent trigger, and a
+# strategy that never reached trigger analysis is 'not_evaluated', never a
+# fake zero.
+TRIGGER_CLASS_CONFIRMED = "confirmed"
+TRIGGER_CLASS_WAITING = "waiting"
+TRIGGER_CLASS_CONTRADICTED = "contradicted"
+TRIGGER_CLASS_ABSENT = "absent"
+TRIGGER_CLASS_INSUFFICIENT = "four_hour_insufficient"
+TRIGGER_CLASS_DISABLED = "disabled"
+TRIGGER_CLASS_SIDE_UNKNOWN = "side_unknown"
+TRIGGER_CLASS_UNKNOWN_OTHER = "unknown_other"
+TRIGGER_CLASS_NOT_EVALUATED = "not_evaluated"
+
+_INSUFFICIENT_4H_REASONS = frozenset({
+    "insufficient_4h_history",
+    "unconfirmed_4h_bar_completion",
+    "four_hour_trigger_stale",
+    "unconfirmed_4h_freshness",
+})
+
+
+def classify_trigger_state(record: Dict[str, Any]) -> str:
+    """Classify one evaluation's frozen 4H trigger record."""
+    trigger = record.get("four_hour_trigger")
+    if not isinstance(trigger, dict):
+        return TRIGGER_CLASS_NOT_EVALUATED
+    state = trigger.get("state")
+    if state == "confirmed":
+        return TRIGGER_CLASS_CONFIRMED
+    if state == "missing":
+        return TRIGGER_CLASS_WAITING
+    if state == "contradicted":
+        return TRIGGER_CLASS_CONTRADICTED
+    reasons = set(trigger.get("reason_codes") or ())
+    if "four_hour_trigger_disabled" in reasons:
+        return TRIGGER_CLASS_DISABLED
+    if "four_hour_data_missing" in reasons:
+        return TRIGGER_CLASS_ABSENT
+    if reasons & _INSUFFICIENT_4H_REASONS:
+        return TRIGGER_CLASS_INSUFFICIENT
+    if "trigger_side_unknown" in reasons:
+        return TRIGGER_CLASS_SIDE_UNKNOWN
+    return TRIGGER_CLASS_UNKNOWN_OTHER
+
+
+def _four_hour_meta(record: Dict[str, Any]) -> Dict[str, Any]:
+    meta = record.get("four_hour_frame_meta")
+    return meta if isinstance(meta, dict) else {}
 
 
 def _policy(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,7 +150,13 @@ def _distribution(values: List[Optional[str]]) -> Dict[str, int]:
 
 
 def _group_identity(record: Dict[str, Any]) -> Dict[str, Any]:
-    return {f: record.get(f) for f in GROUP_IDENTITY_FIELDS}
+    identity = {f: record.get(f) for f in GROUP_IDENTITY_FIELDS}
+    # The 4H frame contract version is derived from the frozen frame
+    # metadata; daily-only rows keep None (never fabricated).
+    identity["four_hour_frame_contract_version"] = _four_hour_meta(
+        record
+    ).get("contract_version")
+    return identity
 
 
 def _group_metrics(
@@ -150,6 +213,26 @@ def _group_metrics(
         if isinstance(reasons, list):
             waiting_reasons.extend(x for x in reasons if isinstance(x, str))
 
+    # ---- Phase 9E5: trigger + 4H frame readiness evidence ---------------- #
+    trigger_classes = [classify_trigger_state(r) for r in records]
+    trigger_class_counts = _distribution(trigger_classes)
+    real_trigger_prices = sum(
+        1 for r in records
+        if isinstance(r.get("four_hour_trigger"), dict)
+        and r["four_hour_trigger"].get("trigger_price") is not None
+    )
+    frame_states = [
+        _four_hour_meta(r).get("state") for r in records
+    ]
+    frame_state_counts = _distribution(frame_states)
+    setup_present = sum(
+        1 for r in records
+        if _policy(r).get("setup_state") == "valid"
+    )
+    matured_outcomes = sum(
+        1 for r in records if r.get("outcome_status") == "complete"
+    )
+
     evaluated = len(records)
     return {
         **identity,
@@ -159,10 +242,55 @@ def _group_metrics(
         "valid_decision_count": valid_decisions,
         "valid_non_enter_decision_count": valid_non_enter,
         # Data-sufficiency states (unknown stays unknown, never zero).
+        "daily_ready_count": sum(
+            1 for s in readiness_known if s == "ready"
+        ),
+        "daily_insufficient_count": insufficient_data,
         "insufficient_data_count": insufficient_data,
         "readiness_known_count": len(readiness_known),
         "readiness_unknown_count": evaluated - len(readiness_known),
         "readiness_status_distribution": _distribution(readiness_statuses),
+        # 4H frame + trigger readiness (Phase 9E5) — every state separate:
+        # insufficient 4H data is never pooled with an absent trigger, and
+        # rollout blocking stays a policy-level state, never a trigger state.
+        "four_hour_frame_state_distribution": frame_state_counts,
+        "four_hour_frames_built_count": frame_state_counts.get("built", 0),
+        "four_hour_fetch_error_count": frame_state_counts.get(
+            "fetch_error", 0
+        ),
+        "four_hour_frame_rejected_count": frame_state_counts.get(
+            "frame_rejected", 0
+        ),
+        "four_hour_unsupported_provider_count": frame_state_counts.get(
+            "unsupported_provider", 0
+        ),
+        "trigger_state_distribution": trigger_class_counts,
+        "trigger_confirmed_count": trigger_class_counts.get(
+            TRIGGER_CLASS_CONFIRMED, 0
+        ),
+        "trigger_waiting_count": trigger_class_counts.get(
+            TRIGGER_CLASS_WAITING, 0
+        ),
+        "trigger_contradicted_count": trigger_class_counts.get(
+            TRIGGER_CLASS_CONTRADICTED, 0
+        ),
+        "trigger_absent_count": trigger_class_counts.get(
+            TRIGGER_CLASS_ABSENT, 0
+        ),
+        "four_hour_insufficient_count": trigger_class_counts.get(
+            TRIGGER_CLASS_INSUFFICIENT, 0
+        ),
+        "trigger_not_evaluated_count": trigger_class_counts.get(
+            TRIGGER_CLASS_NOT_EVALUATED, 0
+        ),
+        "four_hour_ready_count": (
+            trigger_class_counts.get(TRIGGER_CLASS_CONFIRMED, 0)
+            + trigger_class_counts.get(TRIGGER_CLASS_WAITING, 0)
+            + trigger_class_counts.get(TRIGGER_CLASS_CONTRADICTED, 0)
+        ),
+        "real_trigger_price_count": real_trigger_prices,
+        "setup_present_count": setup_present,
+        "matured_outcome_count": matured_outcomes,
         # Setup rejection states.
         "rejected_setup_count": rejected_setups,
         "failure_reason_distribution": _distribution(
