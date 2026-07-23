@@ -12,7 +12,10 @@ import logging
 import asyncpg
 
 from app.deps import get_db, get_worker_token
-from app.models.responses import StrategyDiscoveryResponse
+from app.models.responses import (
+    StrategyDiscoveryResponse,
+    StrategyDryRunResponse,
+)
 from app.workers.scan_runner import run_scan_batch
 from app.workers.maintenance import cleanup_daily_seen, clear_daily_seen
 from app.workers.outcomes.service import calculate_outcomes_for_signals
@@ -727,6 +730,344 @@ async def get_admin_strategy(
             detail=f"No strategy registered for pattern_code '{pattern_code}'",
         )
     return _discovery_to_response(item)
+
+
+@router.post(
+    "/strategies/{pattern_code}/dry-run",
+    response_model=StrategyDryRunResponse,
+)
+async def strategy_dry_run(
+    pattern_code: str,
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    symbol: str = Body(..., embed=True),
+    evaluation_time_utc: Optional[str] = Body(None, embed=True),
+):
+    """Phase 9D1: explicit persistence-free dry-run of ONE registered strategy.
+
+    Resolves the strategy through the canonical registry and its configuration
+    through the canonical merge path (patterns/pattern_configs over strategy
+    defaults), fetches daily history from the configured MarketDataProvider,
+    evaluates deterministically on the canonical completed frame and returns
+    a typed result with persisted=false.
+
+    A registered but database-disabled strategy (e.g. wyckoff_mtf_v2) may be
+    dry-run explicitly; this never enables it, never mutates configuration or
+    rollout flags, and never creates a signal, watch, alert, notification,
+    decision card or ranking input. There is no fallback strategy.
+    """
+    from app.workers.strategies.dry_run import (
+        DryRunRequestError,
+        DryRunUnknownStrategyError,
+        run_strategy_dry_run,
+    )
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    try:
+        result = await run_strategy_dry_run(
+            db,
+            provider,
+            pattern_code=pattern_code,
+            symbol=symbol,
+            evaluation_time_utc=evaluation_time_utc,
+        )
+    except DryRunUnknownStrategyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No strategy registered for pattern_code '{pattern_code}'",
+        )
+    except DryRunRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return StrategyDryRunResponse(**result)
+
+
+@router.post("/strategies/{pattern_code}/shadow-run")
+async def strategy_shadow_run(
+    pattern_code: str,
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+    symbols: Any = Body(..., embed=True),
+    run_in_background: bool = Body(False, embed=True),
+):
+    """Phase 9D2/9D6: explicit shadow evaluation of ONE candidate strategy
+    through the canonical shadow runner.
+
+    Resolves the declared shadow experiment whose CANDIDATE arm is
+    `pattern_code` (wyckoff_mtf_v2 -> wyckoff_v2_vs_baseline against the
+    sma150_bounce baseline; sma150_bounce_v3 -> the historical sma150
+    experiment) and runs the bounded comparison over the explicit symbol
+    list (max 25). Shadow rows are experiment evidence only: never signals,
+    watches, alerts, notifications, decision cards, ranking inputs or
+    scheduler results, and the run never enables the candidate or changes
+    rollout flags.
+    """
+    from app.workers.shadow.experiments import (
+        UnknownShadowExperimentError,
+        experiment_for_candidate,
+    )
+    from app.workers.shadow.runner import (
+        ShadowRequestError,
+        normalize_shadow_symbols,
+        run_shadow_comparison,
+    )
+    from app.workers.strategies.registry import (
+        UnknownStrategyError,
+        get_strategy,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        get_strategy(pattern_code)
+    except UnknownStrategyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No strategy registered for pattern_code '{pattern_code}'",
+        )
+    try:
+        experiment = experiment_for_candidate(pattern_code)
+    except UnknownShadowExperimentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        normalized = normalize_shadow_symbols(symbols)
+    except ShadowRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    run_id = str(uuid.uuid4())
+
+    if run_in_background:
+        async def _run() -> None:
+            try:
+                summary = await run_shadow_comparison(
+                    provider, normalized, run_id=run_id, experiment=experiment
+                )
+                logger.info(
+                    "[ADMIN] shadow run %s (%s) finished: status=%s",
+                    run_id, experiment.experiment_code, summary.get("status"),
+                )
+            except Exception as exc:
+                logger.error(
+                    "[ADMIN] shadow run %s (%s) failed: %s",
+                    run_id, experiment.experiment_code, exc,
+                )
+
+        background_tasks.add_task(_run)
+        return {
+            "message": "Shadow run enqueued",
+            "run_id": run_id,
+            "experiment_code": experiment.experiment_code,
+            "experiment_version": experiment.experiment_version,
+            "candidate_pattern_code": experiment.candidate_pattern_code,
+            "control_pattern_code": experiment.control_pattern_code,
+            "requested_count": len(normalized),
+        }
+
+    summary = await run_shadow_comparison(
+        provider, normalized, run_id=run_id, experiment=experiment
+    )
+    return {
+        "message": "Shadow run completed",
+        "experiment_code": experiment.experiment_code,
+        "experiment_version": experiment.experiment_version,
+        "candidate_pattern_code": experiment.candidate_pattern_code,
+        "control_pattern_code": experiment.control_pattern_code,
+        **summary,
+    }
+
+
+_SHADOW_RUN_STATUSES = ("running", "completed", "failed")
+
+
+def _experiment_code_for_pattern(pattern_code: Optional[str]) -> Optional[str]:
+    """Map an optional candidate pattern_code filter to its experiment code."""
+    if pattern_code is None:
+        return None
+    from app.workers.shadow.experiments import (
+        UnknownShadowExperimentError,
+        experiment_for_candidate,
+    )
+
+    try:
+        return experiment_for_candidate(pattern_code).experiment_code
+    except UnknownShadowExperimentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@router.get("/shadow-runs")
+async def list_shadow_runs(
+    _: str = Depends(get_worker_token),
+    pattern_code: Optional[str] = None,
+    experiment_code: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 50,
+):
+    """Phase 9D6: bounded newest-first shadow-run listing (read-only).
+
+    `pattern_code` filters to the experiment whose candidate arm is that
+    strategy; `experiment_code` filters directly. No provider client is
+    constructed and nothing is written.
+    """
+    from app.workers.shadow.persistence import fetch_shadow_runs
+
+    if status is not None and status not in _SHADOW_RUN_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {list(_SHADOW_RUN_STATUSES)}",
+        )
+    if limit < 1 or limit > 200:
+        raise HTTPException(
+            status_code=422, detail="limit must be between 1 and 200"
+        )
+    resolved_experiment = (
+        experiment_code
+        if experiment_code is not None
+        else _experiment_code_for_pattern(pattern_code)
+    )
+    runs = await fetch_shadow_runs(
+        experiment_code=resolved_experiment, status=status, limit=limit
+    )
+    return {"count": len(runs), "runs": runs}
+
+
+@router.get("/shadow-runs/{run_id}")
+async def get_admin_shadow_run(
+    run_id: str,
+    _: str = Depends(get_worker_token),
+    pair_limit: int = 100,
+):
+    """Phase 9D6: one shadow run's bounded detail — the run row with its
+    telemetry plus bounded pair summaries (never full frame/details
+    snapshots)."""
+    from app.workers.shadow.persistence import (
+        fetch_shadow_pairs,
+        fetch_shadow_run,
+    )
+
+    if pair_limit < 1 or pair_limit > 500:
+        raise HTTPException(
+            status_code=422, detail="pair_limit must be between 1 and 500"
+        )
+    try:
+        validated = str(uuid.UUID(run_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="run not found")
+
+    run = await fetch_shadow_run(validated)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    pairs = await fetch_shadow_pairs(run_id=validated, limit=pair_limit)
+    return {**run, "pair_count": len(pairs), "pairs": pairs}
+
+
+@router.get("/shadow-metrics")
+async def strategy_shadow_metrics(
+    _: str = Depends(get_worker_token),
+    pattern_code: str = "wyckoff_mtf_v2",
+    symbol: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    experiment_code: Optional[str] = None,
+    limit: int = 500,
+):
+    """Phase 9D5/9D6: neutral strategy-filtered shadow DECISION metrics.
+
+    Aggregates the strategy's frozen shadow evaluations (verdict counts,
+    insufficient-data, rejected-setup, rollout-blocked, pre-rollout ENTER
+    candidates, outcome coverage, failure-reason / waiting-reason /
+    evidence-category distributions), grouped by strategy version, decision
+    policy version and config hash. Missing outcomes stay missing; blocked
+    and insufficient states stay separate. Read-only; market-path RETURN
+    statistics live on GET /api/admin/shadow-comparison.
+    """
+    from app.workers.shadow.persistence import (
+        fetch_strategy_shadow_evaluations,
+    )
+    from app.workers.shadow.strategy_metrics import (
+        aggregate_strategy_shadow_metrics,
+    )
+
+    if not (pattern_code or "").strip():
+        raise HTTPException(status_code=422, detail="pattern_code is required")
+    if limit < 1 or limit > 2000:
+        raise HTTPException(
+            status_code=422, detail="limit must be between 1 and 2000"
+        )
+    records = await fetch_strategy_shadow_evaluations(
+        strategy_code=pattern_code,
+        symbol=symbol,
+        strategy_version=strategy_version,
+        decision_policy_version=decision_policy_version,
+        experiment_code=experiment_code,
+        limit=limit,
+    )
+    metrics = aggregate_strategy_shadow_metrics(records)
+    return {
+        "strategy_code": pattern_code,
+        "record_limit": limit,
+        **metrics,
+    }
+
+
+@router.get("/shadow-comparison")
+async def strategy_shadow_comparison(
+    _: str = Depends(get_worker_token),
+    pattern_code: Optional[str] = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    symbol: Optional[str] = None,
+    outcome_status: Optional[str] = None,
+    limit: int = 1000,
+):
+    """Phase 9D5/9D6: strategy-filtered shadow COMPARISON metrics.
+
+    Reuses the existing shadow_pair_resolution_metrics.v1 contract verbatim
+    (identity-grouped neutral evidence, positive_return_rate, per-horizon
+    mean/median returns, SPY/QQQ baseline-relative returns) over the joined
+    pair outcomes where `pattern_code` is the candidate arm. Nothing is
+    written and no provider client is constructed.
+    """
+    from app.workers.shadow.outcomes.constants import (
+        METRICS_CONTRACT_VERSION,
+        OUTCOME_STATUSES,
+    )
+    from app.workers.shadow.outcomes.metrics import (
+        aggregate_pair_outcome_metrics,
+    )
+    from app.workers.shadow.outcomes.persistence import fetch_pair_outcomes
+
+    if outcome_status is not None and outcome_status not in OUTCOME_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"outcome_status must be one of {list(OUTCOME_STATUSES)}",
+        )
+    if limit < 1 or limit > 5000:
+        raise HTTPException(
+            status_code=422, detail="limit must be between 1 and 5000"
+        )
+    rows = await fetch_pair_outcomes(
+        candidate_strategy_code=pattern_code,
+        experiment_code=experiment_code,
+        symbol=symbol,
+        outcome_status=outcome_status,
+        limit=limit,
+    )
+    return {
+        "metrics_contract_version": METRICS_CONTRACT_VERSION,
+        "candidate_strategy_code": pattern_code,
+        "experiment_code": experiment_code,
+        "total_outcomes": len(rows),
+        "groups": aggregate_pair_outcome_metrics(rows),
+    }
 
 
 @router.get("/status")

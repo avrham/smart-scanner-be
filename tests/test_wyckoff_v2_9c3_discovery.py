@@ -376,7 +376,12 @@ class TestExecutionPathsUnchanged:
 
 class TestPhase9C3Boundaries:
     def test_no_migration_013(self):
-        assert not list(MIGRATIONS.glob("013_*"))
+        # Phase 9D3 adds exactly 013_wyckoff_v2_shadow_arms (arm-code
+        # CHECK extension only); nothing later exists.
+        assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
+            "013_wyckoff_v2_shadow_arms.sql"
+        ]
+        assert not list(MIGRATIONS.glob("014_*"))
         assert (MIGRATIONS / "012_wyckoff_mtf_v2.sql").exists()
 
     def test_forbidden_surfaces_unmodified(self):
@@ -398,21 +403,39 @@ class TestPhase9C3Boundaries:
             "app/routers/shadow.py",
         ) == ""
 
-    def test_admin_diff_is_discovery_only(self):
-        diff = _git_diff("app/routers/admin.py")
-        assert diff
-        assert "list_admin_strategies" in diff
-        assert "discover_all_strategies" in diff
-        assert "get_admin_strategy" in diff
-        # Discovery endpoints must not introduce new write verbs.
-        assert "@router.post(\"/strategies" not in diff
-        assert "@router.put(\"/strategies" not in diff
-        assert "@router.patch(\"/strategies" not in diff
+    def test_admin_discovery_surface_read_only(self):
+        """State-independent form of the 9C3 guard (the original asserted a
+        NON-EMPTY uncommitted admin.py diff, which could only ever pass in
+        the exact pre-commit working tree of Phase 9C3).
+
+        Intent preserved: the discovery endpoints exist, stay read-only
+        GETs, and the discovery module never writes. Phase 9D adds explicit
+        worker-token-protected operator EXECUTION endpoints (dry-run /
+        shadow-run) as POSTs scoped under /strategies/{pattern_code}/...;
+        the bare discovery resources themselves never gain write verbs.
+        """
+        import re as _re
+
         text = ADMIN.read_text(encoding="utf-8")
+        assert "list_admin_strategies" in text
+        assert "discover_all_strategies" in text
+        assert "get_admin_strategy" in text
         assert '@router.get("/strategies"' in text
         assert '@router.get(\n    "/strategies/{pattern_code}"' in text or (
             '@router.get("/strategies/{pattern_code}"' in text
         )
+        # No write verb on the discovery resources themselves.
+        assert '@router.post("/strategies")' not in text
+        assert '@router.put("/strategies' not in text
+        assert '@router.patch("/strategies' not in text
+        assert '@router.delete("/strategies' not in text
+        post_routes = _re.findall(
+            r'@router\.post\(\s*"(/strategies[^"]*)"', text
+        )
+        assert sorted(post_routes) == [
+            "/strategies/{pattern_code}/dry-run",
+            "/strategies/{pattern_code}/shadow-run",
+        ]
         disc = DISCOVERY.read_text(encoding="utf-8")
         assert "INSERT" not in disc.upper()
         assert "UPDATE" not in disc.upper()
