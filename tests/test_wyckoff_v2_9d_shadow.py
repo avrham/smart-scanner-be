@@ -117,11 +117,16 @@ class TestExperimentRegistry:
     def test_wyckoff_experiment_identity(self):
         exp = WYCKOFF_V2_VS_BASELINE
         assert exp.experiment_code == "wyckoff_v2_vs_baseline"
-        assert exp.experiment_version == "wyckoff_v2_shadow.v1"
+        # Phase 9E3 bumped the protocol (canonical 4H frame + experiment-only
+        # enable_4h_trigger override); no .v1 rows can exist anywhere because
+        # migration 013 has never been applied.
+        assert exp.experiment_version == "wyckoff_v2_shadow.v2"
         assert exp.control_pattern_code == "sma150_bounce"
         assert exp.candidate_pattern_code == "wyckoff_mtf_v2"
         assert exp.control_arm_code == "control_baseline"
         assert exp.candidate_arm_code == "candidate_wyckoff_v2"
+        assert exp.requires_four_hour_frame is True
+        assert exp.candidate_config_overrides == {"enable_4h_trigger": True}
 
     def test_candidate_resolution_is_unique_and_explicit(self):
         candidates = [e.candidate_pattern_code for e in EXPERIMENTS.values()]
@@ -188,13 +193,13 @@ class TestWyckoffShadowRun:
 
         assert summary["status"] == "completed"
         assert summary["telemetry"]["experiment_code"] == "wyckoff_v2_vs_baseline"
-        assert summary["telemetry"]["experiment_version"] == "wyckoff_v2_shadow.v1"
+        assert summary["telemetry"]["experiment_version"] == "wyckoff_v2_shadow.v2"
         assert summary["telemetry"]["pair_count"] == 1
 
         stored = list(store.pairs.values())[0]
         pair = stored["pair"]
         assert pair["experiment_code"] == "wyckoff_v2_vs_baseline"
-        assert pair["experiment_version"] == "wyckoff_v2_shadow.v1"
+        assert pair["experiment_version"] == "wyckoff_v2_shadow.v2"
 
         by_arm = {ev["arm_code"]: ev for ev in stored["evaluations"]}
         assert set(by_arm) == {"control_baseline", "candidate_wyckoff_v2"}
@@ -308,15 +313,28 @@ class TestWyckoffShadowRun:
         stored = list(store.pairs.values())[0]
         by_arm = {ev["arm_code"]: ev for ev in stored["evaluations"]}
         details = by_arm["candidate_wyckoff_v2"]["details_snapshot"]
-        # No df_4h was supplied and enable_4h_trigger=false: any trigger
-        # record must not carry a confirmed trigger price.
+        # The provider fake supplies no intraday capability, so no 4H frame
+        # exists: any trigger record must not carry a confirmed trigger
+        # price — missing stays missing, nothing is fabricated.
         trigger = details.get("four_hour_trigger")
         if trigger is not None:
             assert trigger.get("trigger_price") is None
             assert trigger.get("state") != "confirmed"
-        # wyckoff v2 never fabricates stop/target.
-        assert details["thresholds_used"]["enable_4h_trigger"] is False
+        # Phase 9E3: the EXPERIMENT-ONLY evaluation override enables real
+        # trigger analysis inside the shadow run; the stored production
+        # rollout default remains false (asserted from the strategy's own
+        # defaults) and allow_enter stays false everywhere.
+        assert details["thresholds_used"]["enable_4h_trigger"] is True
         assert details["thresholds_used"]["allow_enter"] is False
+        from app.workers.strategies.wyckoff_v2.constants import (
+            default_config as v2_defaults,
+        )
+
+        assert v2_defaults()["enable_4h_trigger"] is False
+        # The 4H frame state is frozen alongside the evaluation.
+        meta = details["_four_hour_frame_meta"]
+        assert meta["state"] == "unsupported_provider"
+        assert meta["frame_hash"] is None
 
     def test_category_vocabulary_is_generic(self, store, default_configs):
         payloads = {"LONGX": _long_daily_payload()}
@@ -401,7 +419,7 @@ class TestTypedPersistenceEndToEnd:
 
         args = db.pair_inserts[0]
         assert args[2] == "wyckoff_v2_vs_baseline"
-        assert args[3] == "wyckoff_v2_shadow.v1"
+        assert args[3] == "wyckoff_v2_shadow.v2"
         for idx in (7, 12, 13):
             assert type(args[idx]) is _date, idx
         assert args[8].tzinfo == timezone.utc

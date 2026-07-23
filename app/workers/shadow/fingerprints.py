@@ -39,6 +39,7 @@ def compute_pair_fingerprint(
     experiment_code: str = EXPERIMENT_CODE,
     experiment_version: str = EXPERIMENT_VERSION,
     fingerprint_version: str = PAIR_FINGERPRINT_VERSION,
+    four_hour: Optional[Dict[str, Any]] = None,
 ) -> str:
     """SHA-256 identity of one exact comparison input.
 
@@ -46,6 +47,13 @@ def compute_pair_fingerprint(
     strategy_version, decision_policy_version and config_hash. A changed
     frame, config, version or policy yields a different fingerprint; run_id
     never enters the payload.
+
+    `four_hour` (Phase 9E4) carries the canonical 4H input identity for
+    experiments that supply a 4H frame ({"contract_version", "frame_hash",
+    "state"} — frame_hash None with an explicit state when no frame could be
+    built). When None (every daily-only experiment, including sma150), the
+    payload is BYTE-IDENTICAL to the historical one, so existing sma150
+    fingerprints never change.
     """
     payload = {
         "fingerprint_version": fingerprint_version,
@@ -70,6 +78,12 @@ def compute_pair_fingerprint(
             "config_hash": candidate_identity["config_hash"],
         },
     }
+    if four_hour is not None:
+        payload["four_hour"] = {
+            "contract_version": four_hour.get("contract_version"),
+            "frame_hash": four_hour.get("frame_hash"),
+            "state": four_hour.get("state"),
+        }
     return _sha256(canonical_json(payload))
 
 

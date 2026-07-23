@@ -59,7 +59,16 @@ class ShadowExperiment:
       experiments use neutral 'control_*_candidate_*' labels);
     * history-bar derivations are each arm's OWN canonical requirement;
     * data_meta extras carry per-strategy completion vocabulary — the default
-      runner keys are never removed, only extended.
+      runner keys are never removed, only extended;
+    * `requires_four_hour_frame` declares that the CANDIDATE arm evaluates a
+      canonical completed 4H frame alongside the daily frame (Phase 9E3);
+    * `candidate_config_overrides` is the experiment-only IMMUTABLE
+      evaluation override applied on top of the canonically resolved config
+      for the CANDIDATE arm inside the shadow run ONLY. It never mutates
+      stored pattern configuration rows or any production configuration; it
+      is visible verbatim in the frozen config snapshot, enters the config
+      hash (and therefore every fingerprint), and is echoed in run
+      telemetry. `allow_enter` may never be overridden here.
     """
 
     experiment_code: str
@@ -78,6 +87,15 @@ class ShadowExperiment:
     candidate_data_meta_extras: Optional[
         Callable[[CanonicalFrame], Dict[str, Any]]
     ] = field(default=None)
+    requires_four_hour_frame: bool = False
+    candidate_config_overrides: Optional[Dict[str, Any]] = field(default=None)
+
+    def __post_init__(self) -> None:
+        overrides = self.candidate_config_overrides
+        if overrides is not None and "allow_enter" in overrides:
+            raise ValueError(
+                "experiment config overrides may never touch allow_enter"
+            )
 
 
 # Phase 8.1B1 experiment, preserved verbatim (codes, arms, labels, depth
@@ -96,10 +114,23 @@ SMA150_V2_VS_V3 = ShadowExperiment(
 )
 
 # Phase 9D2: wyckoff_mtf_v2 candidate vs the production baseline strategy.
+# Phase 9E3 bumps the protocol version: the candidate now also receives a
+# canonical completed 4H frame and an experiment-only enable_4h_trigger
+# evaluation override, both of which are MATERIAL to pair fingerprints. No
+# wyckoff_v2_shadow.v1 rows can exist anywhere (migration 013 has not been
+# applied), so no recorded evidence changes identity.
 WYCKOFF_V2_EXPERIMENT_CODE = "wyckoff_v2_vs_baseline"
-WYCKOFF_V2_EXPERIMENT_VERSION = "wyckoff_v2_shadow.v1"
+WYCKOFF_V2_EXPERIMENT_VERSION = "wyckoff_v2_shadow.v2"
 WYCKOFF_V2_CONTROL_ARM_CODE = "control_baseline"
 WYCKOFF_V2_CANDIDATE_ARM_CODE = "candidate_wyckoff_v2"
+
+# The experiment-only evaluation override: real completed-4H trigger analysis
+# is measured inside the shadow run, while the STORED production rollout
+# default (enable_4h_trigger=false) is never touched. allow_enter stays
+# false everywhere — a confirmed trigger remains shadow-only evidence.
+WYCKOFF_V2_CANDIDATE_CONFIG_OVERRIDES: Dict[str, Any] = {
+    "enable_4h_trigger": True,
+}
 
 WYCKOFF_V2_VS_BASELINE = ShadowExperiment(
     experiment_code=WYCKOFF_V2_EXPERIMENT_CODE,
@@ -113,6 +144,8 @@ WYCKOFF_V2_VS_BASELINE = ShadowExperiment(
     control_history_bars=required_history_bars_v2,
     candidate_history_bars=required_history_bars_wyckoff_v2,
     candidate_data_meta_extras=_wyckoff_v2_data_meta_extras,
+    requires_four_hour_frame=True,
+    candidate_config_overrides=WYCKOFF_V2_CANDIDATE_CONFIG_OVERRIDES,
 )
 
 DEFAULT_EXPERIMENT = SMA150_V2_VS_V3

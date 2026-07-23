@@ -14,7 +14,7 @@ or regression.
 import logging
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from app.workers.patterns.config import resolve_pattern_config
@@ -35,6 +35,12 @@ from app.workers.shadow.constants import (
     PAIR_FINGERPRINT_VERSION,
 )
 from app.workers.shadow.experiments import DEFAULT_EXPERIMENT, ShadowExperiment
+from app.workers.shadow.frames_4h import (
+    FOUR_HOUR_FETCH_CALENDAR_DAYS,
+    FOUR_HOUR_FRAME_CONTRACT_VERSION,
+    FourHourFrameRejection,
+    build_four_hour_frame,
+)
 from app.workers.shadow.fingerprints import (
     compute_evaluation_fingerprint,
     compute_pair_fingerprint,
@@ -93,7 +99,12 @@ def normalize_shadow_symbols(symbols: Any) -> List[str]:
     return normalized
 
 
-async def _resolve_arm(pattern_code: str, arm_code: str) -> Dict[str, Any]:
+async def _resolve_arm(
+    pattern_code: str,
+    arm_code: str,
+    *,
+    config_overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Resolve one arm's REAL strategy object + frozen config identity.
 
     Versions come from the registered strategy object (never inferred from
@@ -101,9 +112,23 @@ async def _resolve_arm(pattern_code: str, arm_code: str) -> Dict[str, Any]:
     pattern_configs respected) merged over the strategy's own defaults, then
     sanitized with the existing secret-removal policy and hashed
     deterministically. pattern_configs is never modified.
+
+    `config_overrides` (Phase 9E3) is an experiment-declared IMMUTABLE
+    evaluation override applied on an in-memory COPY of the resolved config
+    only — the database configuration and the strategy defaults are never
+    mutated. Overridden values are visible verbatim in the frozen config
+    snapshot, enter the config hash (and therefore every fingerprint), and
+    are echoed separately so an operator can always see that an override
+    was in effect.
     """
     strategy = get_strategy(pattern_code)
     resolved = await resolve_pattern_config(pattern_code, strategy.default_config())
+    applied_overrides: Dict[str, Any] = {}
+    if config_overrides:
+        resolved = dict(resolved)
+        for key, value in config_overrides.items():
+            applied_overrides[key] = value
+            resolved[key] = value
     # The persisted config snapshot crosses the same strict JSON boundary as
     # every other shadow JSONB field. config_hash stays on the existing
     # provenance path (sanitize + canonical JSON) — hashes are unchanged.
@@ -117,6 +142,88 @@ async def _resolve_arm(pattern_code: str, arm_code: str) -> Dict[str, Any]:
         "strategy_version": strategy.version,
         "decision_policy_version": strategy.decision_policy_version,
         "config_hash": config_hash(resolved),
+        "config_overrides": applied_overrides,
+    }
+
+
+async def _acquire_four_hour(
+    provider: Any,
+    symbol: str,
+    frame: CanonicalFrame,
+    *,
+    evaluation_time_utc: Optional[datetime],
+    as_of_date: Optional[date],
+) -> Dict[str, Any]:
+    """Fetch and build the canonical completed 4H frame for one symbol.
+
+    Never aborts the pair: every failure mode is a TYPED state
+    (unsupported_provider / fetch_error / frame_rejected) recorded in the
+    frozen metadata and telemetry — the candidate still evaluates the daily
+    frame and its own trigger analysis reports the missing 4H data honestly.
+    Returns {"status", "frame" (or None), "meta"}.
+    """
+    base_meta: Dict[str, Any] = {
+        "contract_version": FOUR_HOUR_FRAME_CONTRACT_VERSION,
+        "frame_hash": None,
+    }
+    if not bool(getattr(provider, "supports_intraday_history", False)):
+        return {
+            "status": "unsupported_provider",
+            "frame": None,
+            "meta": {**base_meta, "state": "unsupported_provider"},
+        }
+
+    # As-of alignment: the 4H window ends at the DAILY frame's pinned as-of
+    # session (plus one calendar day of fetch margin; the frame builder cuts
+    # any bar ending on a later exchange session).
+    as_of_session = as_of_date or date.fromisoformat(frame.last_date)
+    fetch_end = as_of_session + timedelta(days=1)
+    fetch_start = as_of_session - timedelta(days=FOUR_HOUR_FETCH_CALENDAR_DAYS)
+    try:
+        payload = await provider.get_intraday_history(
+            symbol,
+            multiplier=4,
+            timespan="hour",
+            start=fetch_start,
+            end=fetch_end,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Shadow 4H fetch failed for %s: %s", symbol, type(exc).__name__
+        )
+        return {
+            "status": "fetch_error",
+            "frame": None,
+            "meta": {
+                **base_meta,
+                "state": "fetch_error",
+                "reason_code": f"provider_{type(exc).__name__}",
+            },
+        }
+
+    daily_sessions = [date.fromisoformat(b["date"]) for b in frame.bars]
+    try:
+        frame_4h = build_four_hour_frame(
+            symbol,
+            payload,
+            evaluation_time_utc=evaluation_time_utc,
+            as_of_session_date=as_of_session,
+            daily_session_dates=daily_sessions,
+        )
+    except FourHourFrameRejection as rejection:
+        return {
+            "status": "frame_rejected",
+            "frame": None,
+            "meta": {
+                **base_meta,
+                "state": "frame_rejected",
+                "reason_code": rejection.reason_code,
+            },
+        }
+    return {
+        "status": "built",
+        "frame": frame_4h,
+        "meta": normalize_json_safe(frame_4h.metadata()),
     }
 
 
@@ -212,6 +319,8 @@ async def run_shadow_comparison(
     run_id: Optional[str] = None,
     now_utc: Optional[datetime] = None,
     experiment: Optional[ShadowExperiment] = None,
+    as_of_date: Optional[date] = None,
+    telemetry_extras: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one bounded shadow comparison over an explicit symbol list.
 
@@ -224,11 +333,28 @@ async def run_shadow_comparison(
     historical sma150 v2-vs-v3 experiment runs unchanged. Whatever the
     experiment, running it never enables a strategy, never creates a signal,
     watch, alert, notification or decision card, and never touches ranking.
+
+    `as_of_date` (Phase 9E6) pins the evaluation to a historical session:
+    daily bars after the date are excluded before the canonical frame is
+    built, the 4H window is aligned to the same session, and (when now_utc
+    is not supplied) the evaluation time resolves deterministically to
+    midnight UTC of the following day. Only real historical bars are used —
+    nothing is fabricated.
+
+    `telemetry_extras` merges bounded JSON-safe operator metadata (e.g. the
+    campaign block) into the finalized run telemetry.
     """
     experiment = experiment or DEFAULT_EXPERIMENT
     normalized = normalize_shadow_symbols(symbols)
     run_id = run_id or str(uuid.uuid4())
     provider_name = getattr(provider, "name", None) or "unknown"
+    if as_of_date is not None and now_utc is None:
+        # Midnight UTC of the next day is deterministically AFTER the NY
+        # session close of as_of_date, so the as-of bar counts as completed.
+        next_day = as_of_date + timedelta(days=1)
+        now_utc = datetime(
+            next_day.year, next_day.month, next_day.day, tzinfo=timezone.utc
+        )
 
     def _category(control_verdict: str, candidate_verdict: str) -> str:
         return disagreement_category(
@@ -249,6 +375,7 @@ async def run_shadow_comparison(
 
     counts = Counter()
     categories: Counter = Counter()
+    trigger_states: Counter = Counter()
     rejected: Counter = Counter()
     rejected_symbols: Dict[str, List[str]] = {}
     completion_meta: Dict[str, Any] = {}
@@ -259,7 +386,9 @@ async def run_shadow_comparison(
             experiment.control_pattern_code, experiment.control_arm_code
         )
         candidate = await _resolve_arm(
-            experiment.candidate_pattern_code, experiment.candidate_arm_code
+            experiment.candidate_pattern_code,
+            experiment.candidate_arm_code,
+            config_overrides=experiment.candidate_config_overrides,
         )
 
         # Shared canonical history depth, DERIVED once per run from both
@@ -296,6 +425,22 @@ async def run_shadow_comparison(
                 rejected_symbols.setdefault("fetch_error", []).append(symbol)
                 continue
 
+            if as_of_date is not None:
+                # Pin the evaluation to the as-of session: only REAL bars on
+                # or before the date survive (ISO date strings compare
+                # lexicographically; malformed rows stay for the canonical
+                # frame builder to reject explicitly).
+                as_of_iso = as_of_date.isoformat()
+                payload = {
+                    **(payload or {}),
+                    "historical": [
+                        bar for bar in (payload or {}).get("historical") or []
+                        if not isinstance(bar, dict)
+                        or "date" not in bar
+                        or str(bar.get("date"))[:10] <= as_of_iso
+                    ],
+                }
+
             try:
                 frame = build_canonical_frame(
                     symbol, payload,
@@ -323,6 +468,24 @@ async def run_shadow_comparison(
                 "history_depth_complete": frame.bar_count >= desired_bars,
             }
 
+            # Canonical completed 4H frame (Phase 9E3) — a typed per-symbol
+            # state, never a pair abort: the candidate's own trigger analysis
+            # reports missing 4H data honestly.
+            four_hour: Optional[Dict[str, Any]] = None
+            four_hour_identity: Optional[Dict[str, Any]] = None
+            if experiment.requires_four_hour_frame:
+                four_hour = await _acquire_four_hour(
+                    provider, symbol, frame,
+                    evaluation_time_utc=now_utc, as_of_date=as_of_date,
+                )
+                counts[f"four_hour_{four_hour['status']}"] += 1
+                completion_meta[symbol]["four_hour"] = four_hour["meta"]
+                four_hour_identity = {
+                    "contract_version": four_hour["meta"].get("contract_version"),
+                    "frame_hash": four_hour["meta"].get("frame_hash"),
+                    "state": four_hour["meta"].get("state"),
+                }
+
             try:
                 control_eval = _evaluate_arm(
                     control, frame, run_id,
@@ -333,14 +496,20 @@ async def run_shadow_comparison(
                         else None
                     ),
                 )
+                candidate_extras: Optional[Dict[str, Any]] = (
+                    experiment.candidate_data_meta_extras(frame)
+                    if experiment.candidate_data_meta_extras is not None
+                    else None
+                )
+                if four_hour is not None and four_hour["frame"] is not None:
+                    candidate_extras = {
+                        **(candidate_extras or {}),
+                        "df_4h": four_hour["frame"].dataframe(),
+                    }
                 candidate_eval = _evaluate_arm(
                     candidate, frame, run_id,
                     latest_bar_completed=True, now_utc=now_utc,
-                    data_meta_extras=(
-                        experiment.candidate_data_meta_extras(frame)
-                        if experiment.candidate_data_meta_extras is not None
-                        else None
-                    ),
+                    data_meta_extras=candidate_extras,
                 )
 
                 pair_fingerprint = compute_pair_fingerprint(
@@ -354,11 +523,24 @@ async def run_shadow_comparison(
                     candidate_identity=candidate,
                     experiment_code=experiment.experiment_code,
                     experiment_version=experiment.experiment_version,
+                    four_hour=four_hour_identity,
                 )
 
                 evaluations = []
                 for ev in (control_eval, candidate_eval):
                     bounded = _bound_details(ev["details"])
+                    snapshot = bounded["snapshot"]
+                    if (
+                        four_hour is not None
+                        and ev["arm_code"] == experiment.candidate_arm_code
+                    ):
+                        # Runner-added namespaced metadata (same convention
+                        # as _snapshot_meta): injected AFTER the original
+                        # details hash, so the strategy's own output stays
+                        # pure while the frozen row carries queryable 4H
+                        # frame evidence.
+                        snapshot = dict(snapshot)
+                        snapshot["_four_hour_frame_meta"] = four_hour["meta"]
                     evaluations.append({
                         "arm_code": ev["arm_code"],
                         "strategy_code": ev["strategy_code"],
@@ -370,7 +552,7 @@ async def run_shadow_comparison(
                         "score": ev["score"],
                         "reason": ev["reason"],
                         "rejection_reason": ev["rejection_reason"],
-                        "details_snapshot": bounded["snapshot"],
+                        "details_snapshot": snapshot,
                         "evidence_original_sha256": bounded["original_sha256"],
                         "evaluation_fingerprint": compute_evaluation_fingerprint(
                             pair_fingerprint=pair_fingerprint,
@@ -458,6 +640,16 @@ async def run_shadow_comparison(
             xv = candidate_eval["verdict"]
             counts[f"control_{cv.lower()}_count"] += 1
             counts[f"candidate_{xv.lower()}_count"] += 1
+            if experiment.requires_four_hour_frame:
+                trigger_record = (
+                    (candidate_eval["details"] or {}).get("four_hour_trigger")
+                    or {}
+                )
+                trigger_states[
+                    str(trigger_record.get("state") or "not_evaluated")
+                ] += 1
+                if trigger_record.get("trigger_price") is not None:
+                    counts["candidate_real_trigger_price_count"] += 1
             if cv == xv:
                 counts["agreement_count"] += 1
             else:
@@ -516,6 +708,39 @@ async def run_shadow_comparison(
                 "config_hash": candidate["config_hash"],
             },
         }
+        # Experiment-only immutable evaluation overrides are ALWAYS visible
+        # in frozen run telemetry (empty overrides add nothing, keeping the
+        # sma150 telemetry byte-identical).
+        if control["config_overrides"]:
+            telemetry["control_identity"]["config_overrides"] = (
+                normalize_json_safe(control["config_overrides"])
+            )
+        if candidate["config_overrides"]:
+            telemetry["candidate_identity"]["config_overrides"] = (
+                normalize_json_safe(candidate["config_overrides"])
+            )
+        if as_of_date is not None:
+            telemetry["as_of_date"] = as_of_date.isoformat()
+        if experiment.requires_four_hour_frame:
+            telemetry["four_hour_contract_version"] = (
+                FOUR_HOUR_FRAME_CONTRACT_VERSION
+            )
+            telemetry["four_hour_frames_built"] = counts["four_hour_built"]
+            telemetry["four_hour_unsupported_provider"] = counts[
+                "four_hour_unsupported_provider"
+            ]
+            telemetry["four_hour_fetch_error"] = counts["four_hour_fetch_error"]
+            telemetry["four_hour_frame_rejected"] = counts[
+                "four_hour_frame_rejected"
+            ]
+            telemetry["candidate_trigger_states"] = dict(
+                sorted(trigger_states.items())
+            )
+            telemetry["candidate_real_trigger_price_count"] = counts[
+                "candidate_real_trigger_price_count"
+            ]
+        if telemetry_extras:
+            telemetry.update(normalize_json_safe(dict(telemetry_extras)))
         if counts["pair_count"] == 0:
             # All symbols honestly rejected -> still a COMPLETED run with an
             # explicit terminal reason (failure is reserved for operational
