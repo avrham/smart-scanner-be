@@ -1272,6 +1272,486 @@ async def get_shadow_campaign(
     }
 
 
+# --------------------------------------------------------------------------- #
+# Phase 9F: shadow evidence review (read-only, advisory, never enabling)
+# --------------------------------------------------------------------------- #
+
+def _evidence_filters(
+    pattern_code: str,
+    experiment_code: Optional[str],
+    strategy_version: Optional[str],
+    decision_policy_version: Optional[str],
+    config_hash: Optional[str],
+    symbol: Optional[str],
+    campaign_id: Optional[str],
+    min_snapshot_date: Optional[str],
+    max_snapshot_date: Optional[str],
+    trigger_state: Optional[str],
+    readiness: Optional[str],
+    rollout_blocked: Optional[bool],
+    outcome_maturity: Optional[str],
+    limit: Optional[int],
+):
+    from app.workers.shadow.evidence_review import (
+        EvidenceFilterError,
+        normalize_evidence_filters,
+    )
+
+    try:
+        return normalize_evidence_filters(
+            strategy_code=pattern_code,
+            experiment_code=experiment_code,
+            strategy_version=strategy_version,
+            decision_policy_version=decision_policy_version,
+            config_hash=config_hash,
+            symbol=symbol,
+            campaign_id=campaign_id,
+            min_snapshot_date=min_snapshot_date,
+            max_snapshot_date=max_snapshot_date,
+            trigger_state=trigger_state,
+            readiness=readiness,
+            rollout_blocked=rollout_blocked,
+            outcome_maturity_filter=outcome_maturity,
+            limit=limit,
+        )
+    except EvidenceFilterError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+async def _evidence_outcome_rows(filters) -> list:
+    from app.workers.shadow.outcomes.persistence import fetch_pair_outcomes
+
+    return await fetch_pair_outcomes(
+        candidate_strategy_code=filters["strategy_code"],
+        experiment_code=filters["experiment_code"],
+        symbol=filters["symbol"],
+        campaign_id=filters["campaign_id"],
+        candidate_strategy_version=filters["strategy_version"],
+        candidate_config_hash=filters["config_hash"],
+        min_snapshot_date=filters["min_snapshot_date"],
+        max_snapshot_date=filters["max_snapshot_date"],
+        limit=filters["limit"],
+    )
+
+
+@router.get("/shadow-evidence/cohorts")
+async def shadow_evidence_cohorts(
+    _: str = Depends(get_worker_token),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    trigger_state: Optional[str] = None,
+    readiness: Optional[str] = None,
+    rollout_blocked: Optional[bool] = None,
+    outcome_maturity: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """Phase 9F2: explicit versioned cohorts over frozen shadow evidence.
+
+    Read-only: no provider, no writes, no execution. Unknown strategy codes
+    yield typed empty cohorts, never errors.
+    """
+    from app.workers.shadow.evidence_cohorts import build_cohorts
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        filters_for_response,
+    )
+
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, trigger_state, readiness,
+        rollout_blocked, outcome_maturity, limit,
+    )
+    records = await fetch_evidence_records(filters)
+    return {
+        "filters": filters_for_response(filters),
+        **build_cohorts(records),
+    }
+
+
+@router.get("/shadow-evidence/failures")
+async def shadow_evidence_failures(
+    _: str = Depends(get_worker_token),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    trigger_state: Optional[str] = None,
+    readiness: Optional[str] = None,
+    rollout_blocked: Optional[bool] = None,
+    outcome_maturity: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """Phase 9F6: failure / waiting / readiness / trigger-reason
+    distributions (each vocabulary kept separate). Read-only."""
+    from app.workers.shadow.evidence_cohorts import (
+        build_failure_distributions,
+    )
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        filters_for_response,
+    )
+
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, trigger_state, readiness,
+        rollout_blocked, outcome_maturity, limit,
+    )
+    records = await fetch_evidence_records(filters)
+    return {
+        "filters": filters_for_response(filters),
+        **build_failure_distributions(records),
+    }
+
+
+@router.get("/shadow-evidence/outcomes")
+async def shadow_evidence_outcomes(
+    _: str = Depends(get_worker_token),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """Phase 9F3: grouped per-horizon outcome and benchmark evidence over
+    the existing pair-outcome model (returns reused verbatim; missing
+    outcomes reported, never zeroed). Read-only."""
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        filters_for_response,
+        outcome_maturity as maturity_of,
+    )
+    from app.workers.shadow.outcome_evidence import build_outcome_evidence
+
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, None, None, None, None, limit,
+    )
+    records = await fetch_evidence_records(filters)
+    rows = await _evidence_outcome_rows(filters)
+    missing = sum(1 for r in records if maturity_of(r) == "missing")
+    return {
+        "filters": filters_for_response(filters),
+        **build_outcome_evidence(rows, missing_outcome_count=missing),
+    }
+
+
+@router.get("/shadow-evidence/quality")
+async def shadow_evidence_quality(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """Phase 9F4: versioned evidence-quality audit (blocking / warning /
+    informational). Read-only; nothing is repaired or mutated."""
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        filters_for_response,
+    )
+    from app.workers.shadow.persistence import fetch_shadow_campaign_runs
+    from app.workers.shadow.quality_audit import build_quality_audit
+    from app.workers.strategies.discovery import discover_strategy
+
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, None, None, None, None, limit,
+    )
+    records = await fetch_evidence_records(filters)
+    rows = await _evidence_outcome_rows(filters)
+    campaign_runs = await fetch_shadow_campaign_runs(
+        campaign_id=filters["campaign_id"], limit=200
+    )
+    discovery = await discover_strategy(db, filters["strategy_code"])
+    discovery_block = None
+    if discovery is not None:
+        discovery_block = {
+            "db_configured": discovery.db_configured,
+            "config_status": discovery.config_status,
+        }
+    audit = build_quality_audit(
+        records,
+        campaign_runs=campaign_runs,
+        outcome_rows=rows,
+        strategy_discovery=discovery_block,
+    )
+    return {"filters": filters_for_response(filters), **audit}
+
+
+@router.get("/shadow-evidence/readiness")
+async def shadow_evidence_readiness(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    limit: Optional[int] = None,
+    min_evaluated: Optional[int] = None,
+    min_unique_symbols: Optional[int] = None,
+    min_unique_sessions: Optional[int] = None,
+    min_trigger_confirmed: Optional[int] = None,
+    min_matured_outcomes: Optional[int] = None,
+    min_outcome_coverage: Optional[float] = None,
+    max_provider_failure_rate: Optional[float] = None,
+    max_frame_rejection_rate: Optional[float] = None,
+    max_readiness_unknown_rate: Optional[float] = None,
+    min_performance_sample: Optional[int] = None,
+    min_divergent_resolved: Optional[int] = None,
+    target_horizon: Optional[str] = None,
+):
+    """Phase 9F5: ADVISORY rollout-readiness decision.
+
+    Transparent versioned policy over frozen evidence: every threshold,
+    observed value and pass/fail condition is returned. This endpoint can
+    only ever return an advisory state — it never enables the strategy and
+    never mutates any configuration.
+    """
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        filters_for_response,
+    )
+    from app.workers.shadow.persistence import fetch_shadow_campaign_runs
+    from app.workers.shadow.quality_audit import build_quality_audit
+    from app.workers.shadow.rollout_readiness import (
+        ReadinessOverrideError,
+        evaluate_rollout_readiness,
+        resolve_thresholds,
+    )
+    from app.workers.strategies.discovery import discover_strategy
+
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, None, None, None, None, limit,
+    )
+    try:
+        thresholds = resolve_thresholds({
+            "min_evaluated": min_evaluated,
+            "min_unique_symbols": min_unique_symbols,
+            "min_unique_sessions": min_unique_sessions,
+            "min_trigger_confirmed": min_trigger_confirmed,
+            "min_matured_outcomes": min_matured_outcomes,
+            "min_outcome_coverage": min_outcome_coverage,
+            "max_provider_failure_rate": max_provider_failure_rate,
+            "max_frame_rejection_rate": max_frame_rejection_rate,
+            "max_readiness_unknown_rate": max_readiness_unknown_rate,
+            "min_performance_sample": min_performance_sample,
+            "min_divergent_resolved": min_divergent_resolved,
+            "target_horizon": target_horizon,
+        })
+    except ReadinessOverrideError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    records = await fetch_evidence_records(filters)
+    rows = await _evidence_outcome_rows(filters)
+    campaign_runs = await fetch_shadow_campaign_runs(
+        campaign_id=filters["campaign_id"], limit=200
+    )
+    discovery = await discover_strategy(db, filters["strategy_code"])
+    discovery_block = None
+    if discovery is not None:
+        discovery_block = {
+            "db_configured": discovery.db_configured,
+            "config_status": discovery.config_status,
+        }
+    audit = build_quality_audit(
+        records,
+        campaign_runs=campaign_runs,
+        outcome_rows=rows,
+        strategy_discovery=discovery_block,
+    )
+    latest = max(
+        (str(r.get("created_at")) for r in records
+         if r.get("created_at") is not None),
+        default=None,
+    )
+    return evaluate_rollout_readiness(
+        records,
+        outcome_rows=rows,
+        quality_audit=audit,
+        thresholds=thresholds,
+        filters=filters_for_response(filters),
+        evidence_timestamp=latest,
+    )
+
+
+@router.get("/shadow-evidence/export")
+async def shadow_evidence_export(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    limit: Optional[int] = None,
+    max_record_references: int = 200,
+):
+    """Phase 9F7: bounded deterministic evidence package for human review.
+
+    The deterministic evidence body is hashed (content_sha256) and separated
+    from the generation timestamp. Read-only; never contains credentials.
+    """
+    from datetime import datetime, timezone
+
+    from app.workers.shadow.evidence_export import build_evidence_export
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        outcome_maturity as maturity_of,
+    )
+    from app.workers.shadow.outcome_evidence import build_outcome_evidence
+    from app.workers.shadow.persistence import fetch_shadow_campaign_runs
+    from app.workers.shadow.quality_audit import build_quality_audit
+    from app.workers.shadow.rollout_readiness import (
+        evaluate_rollout_readiness,
+        resolve_thresholds,
+    )
+    from app.workers.strategies.discovery import discover_strategy
+
+    if max_record_references < 1 or max_record_references > 200:
+        raise HTTPException(
+            status_code=422,
+            detail="max_record_references must be between 1 and 200",
+        )
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, None, None, None, None, limit,
+    )
+    records = await fetch_evidence_records(filters)
+    rows = await _evidence_outcome_rows(filters)
+    campaign_runs = await fetch_shadow_campaign_runs(
+        campaign_id=filters["campaign_id"], limit=200
+    )
+    discovery = await discover_strategy(db, filters["strategy_code"])
+    discovery_block = None
+    if discovery is not None:
+        discovery_block = {
+            "db_configured": discovery.db_configured,
+            "config_status": discovery.config_status,
+        }
+    audit = build_quality_audit(
+        records,
+        campaign_runs=campaign_runs,
+        outcome_rows=rows,
+        strategy_discovery=discovery_block,
+    )
+    latest = max(
+        (str(r.get("created_at")) for r in records
+         if r.get("created_at") is not None),
+        default=None,
+    )
+    readiness = evaluate_rollout_readiness(
+        records,
+        outcome_rows=rows,
+        quality_audit=audit,
+        thresholds=resolve_thresholds(),
+        filters=None,
+        evidence_timestamp=latest,
+    )
+    missing = sum(1 for r in records if maturity_of(r) == "missing")
+    return build_evidence_export(
+        filters=filters,
+        records=records,
+        outcome_evidence=build_outcome_evidence(
+            rows, missing_outcome_count=missing
+        ),
+        quality_audit=audit,
+        readiness=readiness,
+        campaign_runs=campaign_runs,
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        max_record_references=max_record_references,
+    )
+
+
+@router.post("/shadow-campaign-plan")
+async def shadow_campaign_plan(
+    _: str = Depends(get_worker_token),
+    experiment_code: str = Body("wyckoff_v2_vs_baseline"),
+    candidate_symbols: Any = Body(...),
+    as_of_sessions: Any = Body(...),
+    max_symbols_per_campaign: Optional[int] = Body(None),
+    target_unique_symbols: Optional[int] = Body(None),
+    target_trigger_confirmed: Optional[int] = Body(None),
+    target_matured_outcomes: Optional[int] = Body(None),
+    target_horizon: str = Body("20D"),
+    existing_evaluated_symbols: Optional[List[str]] = Body(None),
+    existing_unique_symbols: int = Body(0),
+    existing_trigger_confirmed: int = Body(0),
+    existing_matured_outcomes: int = Body(0),
+):
+    """Phase 9F8: deterministic campaign PLAN — never an execution.
+
+    Returns the exact bounded admin payloads an operator would submit,
+    with executed=false, the migration-013 warning and the Massive
+    requirement warning. No provider is constructed, nothing is written,
+    nothing is scheduled.
+    """
+    from app.workers.shadow.campaign_planning import (
+        CampaignPlanError,
+        build_campaign_plan,
+    )
+    from app.workers.shadow.experiments import UnknownShadowExperimentError
+
+    try:
+        return build_campaign_plan(
+            experiment_code=experiment_code,
+            candidate_symbols=candidate_symbols,
+            as_of_sessions=as_of_sessions,
+            max_symbols_per_campaign=max_symbols_per_campaign,
+            target_unique_symbols=target_unique_symbols,
+            target_trigger_confirmed=target_trigger_confirmed,
+            target_matured_outcomes=target_matured_outcomes,
+            target_horizon=target_horizon,
+            existing_evaluated_symbols=existing_evaluated_symbols,
+            existing_unique_symbols=existing_unique_symbols,
+            existing_trigger_confirmed=existing_trigger_confirmed,
+            existing_matured_outcomes=existing_matured_outcomes,
+        )
+    except UnknownShadowExperimentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except CampaignPlanError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 @router.get("/status")
 async def get_status(
     _: str = Depends(get_worker_token),
