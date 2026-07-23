@@ -1070,6 +1070,208 @@ async def strategy_shadow_comparison(
     }
 
 
+@router.post("/shadow-campaigns")
+async def create_shadow_campaign(
+    background_tasks: BackgroundTasks,
+    _: str = Depends(get_worker_token),
+    experiment_code: str = Body(...),
+    symbols: Any = Body(...),
+    max_symbols: Optional[int] = Body(None),
+    as_of_date: Optional[str] = Body(None),
+    run_in_background: bool = Body(False),
+):
+    """Phase 9E6: bounded operator-controlled shadow campaign.
+
+    Plans and executes sequential bounded chunks (max 25 symbols each,
+    campaign cap 100) of the declared experiment through the canonical
+    shadow runner. `max_symbols` is a REQUIRED explicit safety bound; the
+    symbol list is always explicit (no implicit universe), deterministic
+    (sorted, deduplicated) and never silently truncated. Optional
+    `as_of_date` pins every chunk to one historical session. Campaign chunk
+    runs persist as normal strategy_shadow_runs rows carrying a frozen
+    campaign telemetry block; retries are idempotent via pair-fingerprint
+    dedupe. No scheduling, no watches, no decision cards, no alerts, no
+    ranking, and no strategy enablement.
+    """
+    from app.workers.shadow.campaigns import (
+        CampaignRequestError,
+        plan_shadow_campaign,
+        run_shadow_campaign,
+    )
+    from app.workers.shadow.experiments import UnknownShadowExperimentError
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        plan = plan_shadow_campaign(
+            experiment_code=experiment_code,
+            symbols=symbols,
+            max_symbols=max_symbols,
+            as_of_date=as_of_date,
+        )
+    except UnknownShadowExperimentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except CampaignRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        provider = get_market_data_provider()
+    except ProviderConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    if run_in_background:
+        async def _run() -> None:
+            try:
+                summary = await run_shadow_campaign(provider, plan)
+                logger.info(
+                    "[ADMIN] shadow campaign %s finished: status=%s",
+                    plan["campaign_id"], summary.get("status"),
+                )
+            except Exception as exc:
+                logger.error(
+                    "[ADMIN] shadow campaign %s failed: %s",
+                    plan["campaign_id"], exc,
+                )
+
+        background_tasks.add_task(_run)
+        return {
+            "message": "Shadow campaign enqueued",
+            "campaign_id": plan["campaign_id"],
+            "experiment_code": plan["experiment_code"],
+            "requested_count": plan["requested_count"],
+            "chunk_count": plan["chunk_count"],
+            "as_of_date": plan["as_of_date"],
+        }
+
+    summary = await run_shadow_campaign(provider, plan)
+    return {"message": "Shadow campaign completed", **summary}
+
+
+@router.get("/shadow-campaigns")
+async def list_shadow_campaigns(
+    _: str = Depends(get_worker_token),
+    limit: int = 100,
+):
+    """Phase 9E8: bounded newest-first campaign listing (read-only).
+
+    Groups persisted campaign chunk runs by campaign_id. No provider client
+    is constructed and nothing is written.
+    """
+    from app.workers.shadow.persistence import fetch_shadow_campaign_runs
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(
+            status_code=422, detail="limit must be between 1 and 500"
+        )
+    rows = await fetch_shadow_campaign_runs(limit=limit)
+    campaigns: dict = {}
+    order: List[str] = []
+    for row in rows:
+        block = row.get("campaign") or {}
+        campaign_id = str(block.get("campaign_id") or "unknown")
+        if campaign_id not in campaigns:
+            order.append(campaign_id)
+            campaigns[campaign_id] = {
+                "campaign_id": campaign_id,
+                "campaign_contract_version": block.get(
+                    "campaign_contract_version"
+                ),
+                "experiment_code": row.get("experiment_code"),
+                "experiment_version": row.get("experiment_version"),
+                "as_of_date": block.get("as_of_date"),
+                "requested_count": block.get("requested_count"),
+                "chunk_count": block.get("chunk_count"),
+                "observed_chunk_runs": 0,
+                "run_statuses": {},
+                "first_started_at": row.get("started_at"),
+                "last_finished_at": row.get("finished_at"),
+            }
+        entry = campaigns[campaign_id]
+        entry["observed_chunk_runs"] += 1
+        status = str(row.get("status"))
+        entry["run_statuses"][status] = entry["run_statuses"].get(status, 0) + 1
+    return {
+        "count": len(order),
+        "campaigns": [campaigns[cid] for cid in order],
+    }
+
+
+@router.get("/shadow-campaigns/{campaign_id}")
+async def get_shadow_campaign(
+    campaign_id: str,
+    _: str = Depends(get_worker_token),
+    pair_limit: int = 100,
+):
+    """Phase 9E8: one campaign's bounded detail — its persisted chunk runs,
+    per-symbol statuses (evaluated pairs + typed rejections), and outcome
+    coverage (missing outcomes stay missing, never zero returns). Read-only:
+    no provider call, no write."""
+    from app.workers.shadow.persistence import (
+        fetch_campaign_outcome_coverage,
+        fetch_shadow_campaign_runs,
+        fetch_shadow_pairs,
+    )
+
+    if pair_limit < 1 or pair_limit > 500:
+        raise HTTPException(
+            status_code=422, detail="pair_limit must be between 1 and 500"
+        )
+    runs = await fetch_shadow_campaign_runs(campaign_id=campaign_id, limit=200)
+    if not runs:
+        raise HTTPException(status_code=404, detail="campaign not found")
+
+    symbol_statuses: dict = {}
+    run_summaries = []
+    for row in runs:
+        run_id = row["run_id"]
+        pairs = await fetch_shadow_pairs(run_id=run_id, limit=pair_limit)
+        for pair in pairs:
+            symbol_statuses[pair["symbol"]] = {
+                "status": "evaluated",
+                "run_id": run_id,
+                "pair_id": pair["pair_id"],
+                "control_verdict": pair["control"]["verdict"],
+                "candidate_verdict": pair["candidate"]["verdict"],
+                "disagreement_category": pair["disagreement_category"],
+            }
+        for reason, syms in (row.get("rejected_symbols") or {}).items():
+            for symbol in syms:
+                symbol_statuses.setdefault(symbol, {
+                    "status": "rejected",
+                    "reason_code": reason,
+                    "run_id": run_id,
+                })
+        run_summaries.append({
+            "run_id": run_id,
+            "status": row["status"],
+            "chunk_index": (row.get("campaign") or {}).get("chunk_index"),
+            "pair_count": row.get("pair_count"),
+            "pairs_created": row.get("pairs_created"),
+            "pairs_deduplicated": row.get("pairs_deduplicated"),
+            "started_at": row.get("started_at"),
+            "finished_at": row.get("finished_at"),
+            "error_code": row.get("error_code"),
+        })
+
+    coverage = await fetch_campaign_outcome_coverage(
+        [row["run_id"] for row in runs]
+    )
+    first = runs[-1]
+    block = first.get("campaign") or {}
+    return {
+        "campaign_id": campaign_id,
+        "campaign_contract_version": block.get("campaign_contract_version"),
+        "experiment_code": first.get("experiment_code"),
+        "experiment_version": first.get("experiment_version"),
+        "as_of_date": block.get("as_of_date"),
+        "requested_count": block.get("requested_count"),
+        "chunk_count": block.get("chunk_count"),
+        "runs": run_summaries,
+        "symbol_statuses": symbol_statuses,
+        "outcome_coverage": coverage,
+    }
+
+
 @router.get("/status")
 async def get_status(
     _: str = Depends(get_worker_token),

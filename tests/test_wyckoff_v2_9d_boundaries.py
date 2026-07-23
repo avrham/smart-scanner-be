@@ -145,7 +145,16 @@ class TestRegistryAndRolloutBoundaries:
 
         from app.workers.strategies import registry
 
+        modules = (
+            "app.workers.strategies.wyckoff_v2",
+            "app.workers.shadow.experiments",
+            "app.workers.strategies.dry_run",
+        )
         saved = dict(registry._REGISTRY)
+        # Preserve the ORIGINAL module objects: a re-imported copy left in
+        # sys.modules would fork class identities (exception isinstance
+        # checks across modules would silently break in later tests).
+        saved_modules = {name: sys.modules.get(name) for name in modules}
         try:
             registry._REGISTRY.clear()
             sys.modules.pop("app.workers.strategies.wyckoff_v2", None)
@@ -160,6 +169,18 @@ class TestRegistryAndRolloutBoundaries:
         finally:
             registry._REGISTRY.clear()
             registry._REGISTRY.update(saved)
+            for name, module in saved_modules.items():
+                if module is not None:
+                    sys.modules[name] = module
+                    # Re-importing also rebinds the leaf attribute on the
+                    # parent package; restore it so `import a.b.c as x`
+                    # resolves the ORIGINAL module everywhere.
+                    parent_name, _, leaf = name.rpartition(".")
+                    parent = sys.modules.get(parent_name)
+                    if parent is not None:
+                        setattr(parent, leaf, module)
+                else:
+                    sys.modules.pop(name, None)
 
     def test_rollout_defaults_preserved(self):
         cfg = v2_default_config()
