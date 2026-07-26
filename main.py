@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
 from app.routers import public, admin, outcomes, shadow
 from app.utils.logging import setup_logging
@@ -22,8 +23,12 @@ async def lifespan(app: FastAPI):
     # Setup logging
     setup_logging()
     logger = logging.getLogger(__name__)
-    logger.info("Starting Smart Scanner Backend")
-    
+    # Concise, secret-free build-provenance line so logs prove the running
+    # revision (never a token, DB URL, provider key or full env dump).
+    logger.info("Starting Smart Scanner Backend", extra={
+        "extra_data": startup_log_fields()
+    })
+
     # Start scheduler if enabled
     if settings.ENABLE_SCHEDULER:
         start_scheduler()
@@ -90,12 +95,17 @@ async def _health_payload(db) -> JSONResponse | dict:
     except Exception:
         pass  # never fail health because of the sync-status lookup
 
+    # Source revision (short SHA or "unknown"). Additive and non-breaking: the
+    # application `version` is unchanged and remains a separate concept from
+    # the git revision. Full provenance lives on GET /version.
+    revision = build_provenance()["git_sha_short"]
     try:
         await db.execute("SELECT 1")
         return {
             "status": "healthy",
             "database": "connected",
             "version": "1.1.0",
+            "revision": revision,
             "market_data": provider_block,
         }
     except Exception as e:
@@ -105,6 +115,7 @@ async def _health_payload(db) -> JSONResponse | dict:
                 "status": "unhealthy",
                 "database": "disconnected",
                 "error": str(e),
+                "revision": revision,
                 "market_data": provider_block,
             }
         )
@@ -125,6 +136,27 @@ async def api_health_check(db=Depends(get_db)):
     health check report correctly.
     """
     return await _health_payload(db)
+
+
+@app.get("/version")
+async def version():
+    """Read-only deployment provenance: which source revision is running.
+
+    Returns ONLY safe build metadata (service, application version, git SHA,
+    build time, environment, release). It never touches the database, never
+    constructs a market-data provider, never calls Massive/FMP/Supabase, and
+    never exposes tokens, credentials, URLs, paths or environment dumps. When
+    the build SHA was not embedded, git_sha and git_sha_short report
+    "unknown" rather than a misleading value.
+    """
+    return build_provenance()
+
+
+@app.get("/api/version")
+async def api_version():
+    """Alias of /version under the /api prefix (the UI api client prepends
+    `/api`). Identical read-only provenance payload."""
+    return build_provenance()
 
 
 if __name__ == "__main__":

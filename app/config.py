@@ -13,7 +13,17 @@ class Settings(BaseSettings):
     # Environment
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
-    
+
+    # Deployment build provenance (Deployment Readiness - Build Provenance).
+    # Embedded at build/release time so a running backend can prove exactly
+    # which source revision it is executing. These are OPTIONAL and default to
+    # safe local values — startup and tests never require them, and they are
+    # NEVER derived by running git inside the container at runtime.
+    APP_GIT_SHA: str = "unknown"
+    APP_BUILD_TIME: str = "unknown"   # ISO 8601 UTC build timestamp
+    APP_ENVIRONMENT: str = "local"    # local | development | staging | production
+    APP_RELEASE: str = "unknown"      # optional human/image release identifier
+
      # Database
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
