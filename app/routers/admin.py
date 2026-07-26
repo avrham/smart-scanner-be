@@ -1272,6 +1272,168 @@ async def get_shadow_campaign(
     }
 
 
+def _parse_symbol_query(value: Optional[str]) -> Optional[List[str]]:
+    """Parse a comma/space/newline-delimited symbol query into a raw list.
+
+    Returns None when nothing usable is supplied so the audit can fall back to
+    the persisted campaign symbol set (the strongest membership source).
+    """
+    if not value:
+        return None
+    from app.workers.shadow.universe_identity import parse_symbol_file_text
+
+    tokens = parse_symbol_file_text(value)
+    return tokens or None
+
+
+@router.get("/shadow-campaigns/{campaign_id}/audit")
+async def audit_shadow_campaign(
+    campaign_id: str,
+    _: str = Depends(get_worker_token),
+    pattern_code: str = "wyckoff_mtf_v2",
+    expected_symbols: Optional[str] = None,
+    expected_count: Optional[int] = None,
+    limit: int = 500,
+):
+    """Read-only post-run audit + verdict for ONE prospective campaign.
+
+    Reuses the existing decision-state aggregation and adds the campaign
+    identity, membership and side-effect invariants. Verdict is one of
+    valid / invalid / incomplete / membership_unverifiable. ZERO confirmed
+    triggers is a valid result. Nothing is written and no provider client is
+    constructed. Expected membership is proven against the campaign's
+    persisted requested symbols first; an explicit `expected_symbols` list
+    (your frozen universe file) cross-checks it; `expected_count` alone is a
+    weak assertion that can never prove membership.
+    """
+    from app.workers.shadow.campaign_audit import build_campaign_audit
+    from app.workers.shadow.persistence import (
+        fetch_shadow_campaign_runs,
+        fetch_strategy_shadow_evaluations,
+    )
+
+    if limit < 1 or limit > 2000:
+        raise HTTPException(
+            status_code=422, detail="limit must be between 1 and 2000"
+        )
+    campaign_runs = await fetch_shadow_campaign_runs(
+        campaign_id=campaign_id, limit=200
+    )
+    if not campaign_runs:
+        raise HTTPException(status_code=404, detail="campaign not found")
+
+    records = await fetch_strategy_shadow_evaluations(
+        strategy_code=pattern_code,
+        campaign_id=campaign_id,
+        limit=limit,
+    )
+    audit = build_campaign_audit(
+        records,
+        campaign_runs,
+        campaign_id=campaign_id,
+        expected_symbols=_parse_symbol_query(expected_symbols),
+        expected_count=expected_count,
+    )
+    return audit
+
+
+async def _latest_completed_session_inputs():
+    """Read-only inputs for completed-session resolution (no provider call).
+
+    Returns (latest_bar_date, completion_state, reference_session_dates) where
+    completion_state is the frozen ny_session_close.v1 verdict for the latest
+    local bar and reference_session_dates is the recent SPY trading calendar.
+    """
+    from datetime import timedelta
+
+    import pandas as pd
+
+    from app.workers.strategies.bar_completion import assess_latest_bar_completion
+
+    latest = await market_store.get_latest_daily_bar_date()
+    if latest is None:
+        return None, "unknown", []
+    completion = assess_latest_bar_completion(
+        pd.DataFrame({"date": [pd.Timestamp(latest)]})
+    )
+    bars = await market_store.get_local_daily_bars_range(
+        "SPY", latest - timedelta(days=20), latest
+    )
+    reference = sorted({
+        b["trading_date"] for b in bars if b.get("trading_date")
+    })
+    return latest, completion.get("state"), reference
+
+
+@router.get("/shadow-campaign-preflight")
+async def prospective_campaign_preflight(
+    _: str = Depends(get_worker_token),
+    symbols: str = "",
+    experiment_code: str = "wyckoff_v2_vs_baseline",
+    expected_count: int = 50,
+):
+    """Read-only safety preflight for ONE prospective campaign.
+
+    Validates the supplied frozen universe (normalized/deduped/hashed, with
+    duplicates and invalid tokens reported), resolves the latest COMPLETED
+    trading session via the frozen ny_session_close.v1 policy (never a bare
+    latest bar that could be partial), and checks whether an equivalent
+    campaign already exists (same experiment + session + universe hash) so the
+    operator resumes instead of duplicating. Never schedules, never creates,
+    never mutates, never calls a provider.
+    """
+    from app.workers.shadow.experiments import (
+        UnknownShadowExperimentError,
+        get_experiment,
+    )
+    from app.workers.shadow.persistence import fetch_shadow_campaign_runs
+    from app.workers.shadow.prospective_preflight import (
+        build_prospective_preflight,
+        classify_existing_campaigns,
+        resolve_latest_completed_session,
+    )
+    from app.workers.shadow.universe_identity import (
+        inspect_universe_symbols,
+        parse_symbol_file_text,
+    )
+
+    try:
+        get_experiment(experiment_code)
+    except UnknownShadowExperimentError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if not (symbols or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail="symbols is required — the frozen universe must be explicit",
+        )
+
+    symbol_report = inspect_universe_symbols(
+        parse_symbol_file_text(symbols), expected_count=expected_count
+    )
+    latest, completion_state, reference = (
+        await _latest_completed_session_inputs()
+    )
+    session = resolve_latest_completed_session(
+        latest_bar_date=latest,
+        latest_bar_completion_state=completion_state,
+        reference_session_dates=reference,
+    )
+    campaign_runs = await fetch_shadow_campaign_runs(limit=500)
+    campaign_match = classify_existing_campaigns(
+        campaign_runs,
+        experiment_code=experiment_code,
+        session_date=session["resolved_session"],
+        universe_hash=symbol_report["universe_hash"],
+    )
+    return build_prospective_preflight(
+        experiment_code=experiment_code,
+        symbol_report=symbol_report,
+        session=session,
+        campaign_match=campaign_match,
+        expected_count=expected_count,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Phase 9F: shadow evidence review (read-only, advisory, never enabling)
 # --------------------------------------------------------------------------- #
@@ -1501,6 +1663,115 @@ async def shadow_evidence_quality(
         records,
         campaign_runs=campaign_runs,
         outcome_rows=rows,
+        strategy_discovery=discovery_block,
+    )
+    return {"filters": filters_for_response(filters), **audit}
+
+
+async def _cohort_trading_calendar(records) -> tuple:
+    """Read-only trading calendar for the cohort from the local daily_bars.
+
+    Uses SPY (always a benchmark of every shadow outcome) as the session
+    reference. Returns (sorted session dates, latest completed session). An
+    empty calendar leaves session-based eligibility honestly UNKNOWN — it is
+    never inferred from calendar days.
+    """
+    from datetime import date as _date
+
+    snapshots = [
+        r.get("snapshot_date") for r in records if r.get("snapshot_date")
+    ]
+    latest = await market_store.get_latest_daily_bar_date()
+    if not snapshots or latest is None:
+        return [], latest
+
+    def _as_date(v):
+        return v if isinstance(v, _date) else _date.fromisoformat(str(v))
+
+    min_snapshot = min(_as_date(s) for s in snapshots)
+    bars = await market_store.get_local_daily_bars_range("SPY", min_snapshot, latest)
+    session_dates = sorted({b["trading_date"] for b in bars if b.get("trading_date")})
+    return session_dates, latest
+
+
+@router.get("/shadow-cohort/closeout")
+async def shadow_cohort_closeout(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    limit: Optional[int] = None,
+):
+    """Read-only closeout audit for an existing historical shadow cohort.
+
+    Summarizes the cohort's decision-state coverage, versioned quality issues,
+    per-horizon / per-status outcome counts, provider failures, the single
+    `forward_fetch_error` rows, duplicate detection and — using COMPLETED
+    TRADING SESSIONS, never calendar days — how many outcomes are eligible for
+    maturation now versus not yet eligible. It is strictly read-only: it never
+    matures anything. Maturation stays on the existing bounded endpoint
+    POST /api/admin/shadow/outcomes/calculate.
+    """
+    from app.workers.shadow.cohort_closeout import build_cohort_closeout_audit
+    from app.workers.shadow.evidence_review import (
+        fetch_evidence_records,
+        filters_for_response,
+    )
+    from app.workers.shadow.persistence import fetch_shadow_campaign_runs
+    from app.workers.strategies.discovery import discover_strategy
+
+    # Bounded-scope guard: an operational cohort is never "all history for a
+    # strategy". Require at least one explicit cohort selector so a bare call
+    # can never sweep the whole shadow record set.
+    if not any([
+        experiment_code, campaign_id, strategy_version, config_hash, symbol,
+        min_snapshot_date, max_snapshot_date,
+    ]):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "a cohort selector is required (one or more of: experiment_code, "
+                "campaign_id, strategy_version, config_hash, symbol, "
+                "min_snapshot_date, max_snapshot_date) — the closeout audit never "
+                "scans all shadow history"
+            ),
+        )
+
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, None, None, None, None, limit,
+    )
+    records = await fetch_evidence_records(filters)
+    outcome_rows = await _evidence_outcome_rows(filters)
+    campaign_runs = await fetch_shadow_campaign_runs(
+        campaign_id=filters["campaign_id"], limit=200
+    )
+    discovery = await discover_strategy(db, filters["strategy_code"])
+    discovery_block = None
+    if discovery is not None:
+        discovery_block = {
+            "db_configured": discovery.db_configured,
+            "config_status": discovery.config_status,
+        }
+    session_dates, latest = await _cohort_trading_calendar(records)
+
+    audit = build_cohort_closeout_audit(
+        records,
+        outcome_rows,
+        session_dates=session_dates,
+        latest_completed_session=latest,
+        campaign_runs=campaign_runs,
+        campaign_ids=(
+            [filters["campaign_id"]] if filters["campaign_id"] else None
+        ),
         strategy_discovery=discovery_block,
     )
     return {"filters": filters_for_response(filters), **audit}
