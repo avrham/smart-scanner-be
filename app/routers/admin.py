@@ -1694,6 +1694,22 @@ async def _cohort_trading_calendar(records) -> tuple:
     return session_dates, latest
 
 
+@router.get("/shadow-cohort/access-check")
+async def shadow_cohort_access_check(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Read-only proof that the connected PostgreSQL identity has ONLY the
+    privileges the cohort closeout audit requires (SELECT on the exact closeout
+    relations) and no write privileges. Runs inside a read-only transaction and
+    issues NO mutation SQL. Worker-token protected. Reports only safe capability
+    information — never a connection string, hostname, password, Supabase URL,
+    secret value or raw SQL error."""
+    from app.audit_access import run_access_check
+
+    return await run_access_check(db)
+
+
 @router.get("/shadow-cohort/closeout")
 async def shadow_cohort_closeout(
     _: str = Depends(get_worker_token),

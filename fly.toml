@@ -22,6 +22,7 @@ primary_region = 'fra'
 # never committed here.
 [env]
   APP_ENVIRONMENT = 'staging'
+  AUDIT_ONLY_MODE = 'true'        # expose ONLY revision/liveness + shadow-cohort audit routes
   ENABLE_SCHEDULER = 'false'      # no cron scans, no background jobs, no provider
   REQUIRE_WORKER_TOKEN = 'true'   # admin surface stays protected (/version is public)
   MARKET_DATA_PROVIDER = 'massive'

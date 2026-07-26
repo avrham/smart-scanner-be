@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
+from app.audit_mode import is_audit_route_allowed
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
 from app.routers import public, admin, outcomes, shadow
@@ -29,11 +30,22 @@ async def lifespan(app: FastAPI):
         "extra_data": startup_log_fields()
     })
 
-    # Start scheduler if enabled
-    if settings.ENABLE_SCHEDULER:
+    # Audit-only mode is incompatible with background processing: a misconfig
+    # that enables both must fail fast rather than quietly run the scheduler.
+    # The message carries no secrets.
+    if settings.AUDIT_ONLY_MODE and settings.ENABLE_SCHEDULER:
+        raise RuntimeError(
+            "invalid configuration: AUDIT_ONLY_MODE=true requires "
+            "ENABLE_SCHEDULER=false (audit-only mode never runs background work)"
+        )
+
+    # Start scheduler if enabled — never in audit-only mode.
+    if settings.ENABLE_SCHEDULER and not settings.AUDIT_ONLY_MODE:
         start_scheduler()
         logger.info("Scheduler started")
-    
+    elif settings.AUDIT_ONLY_MODE:
+        logger.info("Audit-only mode: scheduler and background work disabled")
+
     yield
     
     logger.info("Shutting down Smart Scanner Backend")
@@ -60,6 +72,21 @@ app.include_router(public.router, prefix="/api", tags=["public"])
 app.include_router(outcomes.router, prefix="/api", tags=["outcomes"])
 app.include_router(shadow.router, prefix="/api", tags=["shadow"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+
+
+@app.middleware("http")
+async def audit_only_gate(request, call_next):
+    """Reject any non-allowlisted route BEFORE its handler when audit-only mode
+    is on. Blocked routes get a stable 404 (never a healthy handler, never a
+    hint at the allowlist). Allowlisted audit routes still run their own
+    worker-token dependency — this gate never bypasses authentication. When
+    AUDIT_ONLY_MODE is false (the default), every request passes through
+    unchanged."""
+    if settings.AUDIT_ONLY_MODE and not is_audit_route_allowed(
+        request.method, request.url.path
+    ):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
 
 
 @app.get("/")

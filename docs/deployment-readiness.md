@@ -207,3 +207,70 @@ fly deploy -a smart-scanner-be-staging \
 Verify: `curl -sS https://smart-scanner-be-staging.fly.dev/version | jq -r .git_sha`
 must equal `git rev-parse HEAD`. `/health` is not revision proof (§9). Remove
 when done: `fly apps destroy smart-scanner-be-staging`.
+
+## 12. Read-only cohort-audit access model (production connection)
+
+Before connecting the audit environment to real data, the connected identity
+must be a dedicated least-privilege PostgreSQL role — never the production
+`postgres`/service role.
+
+### Connection model (as built in `app/deps.py`)
+
+* The app connects to Postgres via **asyncpg** using DSN candidates in order:
+  Supabase Supavisor **pooler** `aws-0-<region>.pooler.supabase.com:6543` and
+  `:5432` (username `postgres.<project_ref>`), then the **direct** host
+  `db.<project_ref>.supabase.co:5432` (username `postgres`).
+* The **only** DB credentials consumed by the audit path are `SUPABASE_URL`
+  (parsed for the project ref + host), `SUPABASE_REGION` and
+  `SUPABASE_DB_PASSWORD` (the Postgres login password).
+* `SUPABASE_SERVICE_KEY` and `SUPABASE_ANON_KEY` are Supabase **HTTP API** keys
+  and are **not used** by the closeout/access-check DB path (asyncpg only). The
+  Supabase HTTP API is not involved.
+* The audit can therefore operate with **only a dedicated PostgreSQL login**
+  (username + password + host). To point the login at the dedicated role,
+  the username derivation would use `<role>.<project_ref>` for the pooler or
+  `<role>` for the direct host — set via the eventual real DB credential.
+* **Transaction pooling caveat:** on the `:6543` transaction pooler, session
+  `SET`s may not persist across statements. That is why the dedicated role sets
+  `default_transaction_read_only=on` and the timeouts at the **role** level
+  (`ALTER ROLE ... SET`) — those hold regardless of pooling. The app's own
+  read-only transaction on `access-check` is defense-in-depth.
+
+### Settings required only because `Settings()` validates them
+
+`SUPABASE_SERVICE_KEY`, `SUPABASE_ANON_KEY`, `WORKER_TOKEN` (for import;
+`WORKER_TOKEN` is also used to protect the audit routes), and (until real access)
+`SUPABASE_URL` / `SUPABASE_DB_PASSWORD` as **non-production placeholders**.
+
+### Settings actually consumed by the audit DB path
+
+`SUPABASE_URL`, `SUPABASE_REGION`, `SUPABASE_DB_PASSWORD` (asyncpg login) plus
+`WORKER_TOKEN` (route auth). `MASSIVE_API_KEY` / `FMP_API_KEY` are never
+required (no provider is constructed in audit-only mode).
+
+### Secrets that MUST remain placeholders (this task)
+
+`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `SUPABASE_ANON_KEY`,
+`SUPABASE_DB_PASSWORD`, `WORKER_TOKEN` (a staging-only random value). No
+Massive/FMP keys.
+
+### The one credential that will eventually be real
+
+A single dedicated **`smart_scanner_audit_reader`** PostgreSQL login
+(host + username + password) — see `ops/sql/create_shadow_audit_reader.sql`.
+It grants `CONNECT` + `USAGE` on `public` + `SELECT` on exactly the 8 closeout
+relations, no write privileges, `default_transaction_read_only=on`, bounded
+timeouts, `NOINHERIT`, `NOBYPASSRLS`. Verify with
+`ops/sql/verify_shadow_audit_reader.sql` and, at runtime, the read-only
+`GET /api/admin/shadow-cohort/access-check` endpoint (worker-token protected),
+whose `ready_for_closeout_audit` must be `true` before any closeout run.
+
+### Audit-only mode
+
+`AUDIT_ONLY_MODE=true` (set in `fly.toml`) exposes ONLY:
+`GET /`, `/version`, `/api/version`, `/health`, `/api/health`,
+`/api/admin/shadow-cohort/access-check`, `/api/admin/shadow-cohort/closeout`.
+Every other route (mutations, provider/universe/scan, campaign create/resume,
+outcome calculation, `/docs`, `/openapi.json`, `/redoc`) returns `404` before
+its handler runs, even with a valid worker token. `AUDIT_ONLY_MODE=true` with
+`ENABLE_SCHEDULER=true` fails startup.

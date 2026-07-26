@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     WORKER_TOKEN: str
     REQUIRE_WORKER_TOKEN: bool = False
     ENABLE_SCHEDULER: bool = True
+
+    # Audit-only mode (Deployment Readiness). When true, the app exposes ONLY a
+    # narrow read-only allowlist (revision/liveness + the shadow-cohort audit
+    # routes); every other API and docs route is rejected before its handler
+    # runs, and no scheduler/background work may start. Default false keeps
+    # local, test and normal deployments completely unchanged.
+    AUDIT_ONLY_MODE: bool = False
     SCAN_BATCH_SIZE: int = 150
     SCAN_TIMES: List[str] = ["10:00", "14:00", "18:00"]  # UTC times
     
