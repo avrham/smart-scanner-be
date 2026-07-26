@@ -157,3 +157,53 @@ endpoint) until `/version.git_sha` on the target environment is proven to equal
 commit `f6a6bd5652470f6e96e0a02432e454afe0ceb851`, or a descendant commit that
 contains it. Until that proof exists, the runtime cohort state is unverifiable
 and no production audit should be run.
+
+## 11. Fly.io revision-verification staging (provider-specific)
+
+A minimal, **verification-only** Fly.io app (`fly.toml` in the repo root) that
+boots an exact committed revision and exposes `/version`. It runs **no
+scheduler and no background processing**, uses a **non-production placeholder
+database** and **no live provider credentials**, and is safe to remove.
+
+Key `fly.toml` properties: Dockerfile build; `internal_port = 8000`;
+`force_https`; a single `app` web process; `auto_stop_machines`/
+`min_machines_running = 0` (scales to zero when idle); **health check on
+`/version`** (not `/health`, which legitimately reports the placeholder DB
+disconnected); no release command, no volume, no database/Redis resource. The
+`[env]` block hard-disables background work:
+
+```toml
+[env]
+  APP_ENVIRONMENT = 'staging'
+  ENABLE_SCHEDULER = 'false'
+  REQUIRE_WORKER_TOKEN = 'true'
+```
+
+Secrets are set once via `fly secrets set` (never committed) using
+**non-production** placeholders that cannot resolve to production:
+
+```bash
+# staging-only, non-production placeholders (never real credentials)
+fly secrets set -a smart-scanner-be-staging \
+  SUPABASE_URL="https://staging-placeholder.invalid" \
+  SUPABASE_SERVICE_KEY="staging-placeholder" \
+  SUPABASE_ANON_KEY="staging-placeholder" \
+  SUPABASE_DB_PASSWORD="staging-placeholder" \
+  WORKER_TOKEN="$(openssl rand -hex 24)"   # generated; never printed/committed
+```
+
+Deploy the EXACT HEAD revision (SHA supplied at build time, never hardcoded):
+
+```bash
+CURRENT_SHA="$(git rev-parse HEAD)"; SHORT_SHA="$(git rev-parse --short HEAD)"
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; RELEASE="smart-scanner-be-$SHORT_SHA"
+fly deploy -a smart-scanner-be-staging \
+  --build-arg APP_GIT_SHA="$CURRENT_SHA" \
+  --build-arg APP_BUILD_TIME="$BUILD_TIME" \
+  --build-arg APP_RELEASE="$RELEASE" \
+  --build-arg APP_ENVIRONMENT="staging"
+```
+
+Verify: `curl -sS https://smart-scanner-be-staging.fly.dev/version | jq -r .git_sha`
+must equal `git rev-parse HEAD`. `/health` is not revision proof (§9). Remove
+when done: `fly apps destroy smart-scanner-be-staging`.
