@@ -186,6 +186,10 @@ class _CleanConn:
         return None
 
     async def fetchrow(self, q, *a):
+        if "rolsuper" in q:
+            return {"rolsuper": False, "rolcreaterole": False,
+                    "rolcreatedb": False, "rolreplication": False,
+                    "rolbypassrls": False}
         return {"can_select": True, "can_insert": False, "can_update": False,
                 "can_delete": False, "can_truncate": False, "can_trigger": False}
 

@@ -274,3 +274,104 @@ Every other route (mutations, provider/universe/scan, campaign create/resume,
 outcome calculation, `/docs`, `/openapi.json`, `/redoc`) returns `404` before
 its handler runs, even with a valid worker token. `AUDIT_ONLY_MODE=true` with
 `ENABLE_SCHEDULER=true` fails startup.
+
+## 13. Explicit audit database connection (custom least-privilege role)
+
+### Why the legacy connection cannot authenticate the custom role
+
+`app/deps.build_connection_dsns` derives the PostgreSQL **username** from the
+Supabase project ref (`postgres.<ref>` on the pooler, `postgres` direct).
+Changing only `SUPABASE_DB_PASSWORD` keeps that derived `postgres` username, so
+it can never log in as `smart_scanner_audit_reader`. Audit deployments therefore
+supply a COMPLETE connection identity via `AUDIT_DATABASE_URL`.
+
+### Configuration precedence (audit-aware selector)
+
+`init_db_pool` chooses the DSN via `app/audit_db.select_connection_plan`:
+
+* `AUDIT_ONLY_MODE=false` → legacy Supabase-derived candidates (unchanged).
+* `AUDIT_ONLY_MODE=true` + `AUDIT_DATABASE_URL` set → **only** that DSN
+  (`statement_cache_size=0` so it is pooler-safe). `database_connection_mode = audit_explicit`.
+* `AUDIT_ONLY_MODE=true` + no `AUDIT_DATABASE_URL` → **fail closed** (503, no
+  fallback to any default identity). `database_connection_mode = audit_unconfigured`.
+
+`AUDIT_DATABASE_URL` is a SECRET: never logged, never returned by `/version`,
+`/health`, access-check, exceptions or startup logs, and never committed.
+
+### Expected DSN structures (placeholders only)
+
+Supavisor **session mode** (preferred for the initial Fly audit connection —
+port 5432, no prepared-statement incompatibility):
+
+```text
+postgresql://smart_scanner_audit_reader.<PROJECT_REF>:<PASSWORD>@aws-0-<REGION>.pooler.supabase.com:5432/postgres?sslmode=require
+```
+
+**Direct** connection (username has no project-ref suffix):
+
+```text
+postgresql://smart_scanner_audit_reader:<PASSWORD>@db.<PROJECT_REF>.supabase.co:5432/postgres?sslmode=require
+```
+
+* **Do NOT use transaction mode (port 6543)** unless prepared statements are
+  proven disabled. The audit pool sets `statement_cache_size=0`, which makes it
+  compatible with either mode, but session mode (5432) is the safe default.
+* The username is the SOURCE OF TRUTH copied from the Supabase Connect panel —
+  the app never suffixes the project ref itself. On the pooler the wire username
+  is `smart_scanner_audit_reader.<ref>`; PostgreSQL `current_user` is still
+  `smart_scanner_audit_reader`, which is what the access-check compares.
+* **Percent-encode** special characters in the password (e.g. `@` → `%40`).
+* Obtain the pooler host + project ref from Supabase → Project → Connect →
+  "Session pooler".
+
+### Create + verify the role
+
+1. Create it (manual, once) on the target database:
+   `psql "<admin conn>" -v audit_password="$(openssl rand -base64 24)" -v db_name=postgres -f ops/sql/create_shadow_audit_reader.sql`
+2. Verify locally / against the target as the role:
+   `psql "<audit-reader conn>" -f ops/sql/verify_shadow_audit_reader.sql`
+   (checks read-only defaults, SELECT on the 8 relations, absence of write
+   privileges, and RLS state). A local Postgres integration test
+   (`tests/test_audit_db_integration.py`) proves real enforcement end-to-end.
+
+### Wire it to staging (later; do NOT do it in this task)
+
+```bash
+fly secrets set -a smart-scanner-be-staging \
+  AUDIT_DATABASE_URL="postgresql://smart_scanner_audit_reader.<ref>:<enc-pw>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"
+# AUDIT_EXPECTED_DB_ROLE=smart_scanner_audit_reader is already in fly.toml.
+```
+
+Do not print the URL. Then:
+
+* `curl -sS $HOST/version` → confirm the deployed `git_sha`.
+* `curl -sS -H "X-Worker-Token: <tok>" $HOST/api/admin/shadow-cohort/access-check`
+  → require `ready_for_closeout_audit == true` (identity =
+  `smart_scanner_audit_reader`, read-only defaults on, SELECT-only, no elevated
+  attributes). The closeout endpoint **fails closed** (409) until this is true.
+
+### Rollback
+
+Remove ONLY the staging secret — never auto-drop the role:
+
+```bash
+fly secrets unset -a smart-scanner-be-staging AUDIT_DATABASE_URL
+```
+
+Audit mode then returns to the fail-closed (unavailable) state.
+
+### Prohibition
+
+Never use the default `postgres` (or `supabase_admin` / `service_role`) role for
+the audit environment. The access-check rejects readiness for any identity that
+is denylisted or holds `rolsuper` / `rolcreaterole` / `rolcreatedb` /
+`rolreplication` / `rolbypassrls`.
+
+### RLS findings (per repository migrations 001/005/010/011)
+
+None of the 8 relations enable Row Level Security (`ENABLE ROW LEVEL SECURITY` /
+`CREATE POLICY` / `FORCE ROW LEVEL SECURITY` appear in no migration), and all
+are owned by the migration runner. Plain `SELECT` grants are therefore
+sufficient and **no** read policy is required for `smart_scanner_audit_reader`.
+`BYPASSRLS` is never granted. `verify_shadow_audit_reader.sql` re-checks RLS at
+apply time and fails readiness if RLS is ever enabled without a SELECT policy.

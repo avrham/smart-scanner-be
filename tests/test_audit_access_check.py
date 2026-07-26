@@ -122,6 +122,14 @@ class _FakeConn:
         return None
 
     async def fetchrow(self, q, *a):
+        if "rolsuper" in q:
+            self.sql.append("role_attributes")
+            # A clean audit role: no elevated attributes.
+            return {
+                "rolsuper": False, "rolcreaterole": False,
+                "rolcreatedb": False, "rolreplication": False,
+                "rolbypassrls": False,
+            }
         self.sql.append("has_table_privilege")
         return {
             "can_select": self._select, "can_insert": self._writes,

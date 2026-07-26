@@ -27,6 +27,11 @@ primary_region = 'fra'
   REQUIRE_WORKER_TOKEN = 'true'   # admin surface stays protected (/version is public)
   MARKET_DATA_PROVIDER = 'massive'
   LOG_FORMAT = 'json'
+  # The custom read-only role the audit connection MUST authenticate as. This
+  # is NON-secret (just a role name). The actual connection (AUDIT_DATABASE_URL)
+  # is a SECRET set later via `fly secrets set` — never in fly.toml. Until then,
+  # audit mode fails closed (no fallback to any default database identity).
+  AUDIT_EXPECTED_DB_ROLE = 'smart_scanner_audit_reader'
 
 [http_service]
   internal_port = 8000

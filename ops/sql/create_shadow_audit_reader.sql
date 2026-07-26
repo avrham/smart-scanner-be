@@ -13,11 +13,15 @@
 -- Apply (example):
 --   psql "<admin connection to the target db>" \
 --        -v audit_password="$(openssl rand -base64 24)" \
+--        -v db_name="<target database>" \
 --        -f ops/sql/create_shadow_audit_reader.sql
 --
--- Placeholders:
---   :audit_password   -> a strong password supplied via -v (never committed)
---   <DB_NAME>         -> the target database name (edit the CONNECT grant)
+-- psql variables (both OPTIONAL; the script is safely rerunnable):
+--   :audit_password   -> a strong password supplied via -v (never committed).
+--                        If omitted, the role's password is left unchanged.
+--   :db_name          -> the target database name for the CONNECT grant.
+--                        If omitted, the CONNECT grant is skipped (run it
+--                        manually). Supabase's database is named `postgres`.
 -- =============================================================================
 
 \set ON_ERROR_STOP on
@@ -40,9 +44,14 @@ BEGIN
 END
 $$;
 
--- Password is supplied at apply time via psql -v audit_password=...  (never
--- stored in this file). Uncomment to set it:
--- ALTER ROLE smart_scanner_audit_reader PASSWORD :'audit_password';
+-- Password is supplied at apply time via psql -v audit_password=... (never
+-- stored in this file). Quoted with :'...' so special characters are handled.
+\if :{?audit_password}
+  ALTER ROLE smart_scanner_audit_reader PASSWORD :'audit_password';
+  \echo 'audit_reader password set from -v audit_password'
+\else
+  \echo 'NOTE: audit_password not supplied; role password left unchanged.'
+\endif
 
 -- 2) Session hardening: read-only by default + bounded timeouts. These ALTER
 --    ROLE ... SET defaults apply to every session/transaction for this role
@@ -53,8 +62,14 @@ ALTER ROLE smart_scanner_audit_reader SET statement_timeout = '30s';
 ALTER ROLE smart_scanner_audit_reader SET idle_in_transaction_session_timeout = '15s';
 ALTER ROLE smart_scanner_audit_reader SET lock_timeout = '5s';
 
--- 3) Connect + schema usage ONLY. Edit <DB_NAME> to the target database.
--- GRANT CONNECT ON DATABASE "<DB_NAME>" TO smart_scanner_audit_reader;
+-- 3) Connect + schema usage ONLY. The CONNECT grant needs the DB name as an
+--    identifier (:"db_name" quotes it safely); skipped when db_name is absent.
+\if :{?db_name}
+  GRANT CONNECT ON DATABASE :"db_name" TO smart_scanner_audit_reader;
+  \echo 'CONNECT granted on database from -v db_name'
+\else
+  \echo 'NOTE: db_name not supplied; run GRANT CONNECT ON DATABASE ... manually.'
+\endif
 GRANT USAGE ON SCHEMA public TO smart_scanner_audit_reader;
 
 -- 4) SELECT on the EXACT relations the closeout read path requires — nothing
@@ -81,10 +96,17 @@ GRANT SELECT ON public.pattern_configs                TO smart_scanner_audit_rea
 --   * The app connects to Postgres directly (or via the Supabase Supavisor
 --     pooler) as this login — NOT through the Supabase HTTP API. The Supabase
 --     service-role / anon keys are NOT used by the closeout DB path.
---   * BYPASSRLS is false, so any row-level security policies on these tables
---     still apply. The shadow_* / daily_bars / patterns tables are internal
---     evidence tables; if RLS is enabled on them, add read policies for this
---     role rather than granting BYPASSRLS.
+--   * BYPASSRLS is false (never grant it). Per this repo's migrations, NONE of
+--     the 8 relations enable Row Level Security, so plain SELECT grants are
+--     sufficient and NO read policy is required. `verify_shadow_audit_reader.sql`
+--     re-checks RLS state and fails readiness if RLS is unexpectedly enabled.
+--   * If RLS is ever enabled on any of these tables in production, add the
+--     NARROW read-only policy below (scoped to this role) instead of BYPASSRLS:
+--
+--       -- ALTER TABLE public.<relation> ENABLE ROW LEVEL SECURITY;   -- (owner)
+--       -- CREATE POLICY audit_reader_select ON public.<relation>
+--       --   FOR SELECT TO smart_scanner_audit_reader USING (true);
+--
 --   * Under a transaction pooler, per-session SETs may not persist across
 --     statements — which is exactly why the read-only default and timeouts are
 --     set at the ROLE level (ALTER ROLE ... SET) above.

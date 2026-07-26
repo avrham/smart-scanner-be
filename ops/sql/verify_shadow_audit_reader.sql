@@ -71,6 +71,42 @@ WHERE to_regclass(relation) IS NULL
    OR has_table_privilege(relation, 'TRIGGER');
 
 -- 4) Sanity: this role must not be a superuser and must not bypass RLS.
-SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole
+SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole,
+       rolreplication
 FROM pg_roles
 WHERE rolname = current_user;
+
+-- 5) RLS state of the 8 relations. Per this repo's migrations RLS is expected
+--    OFF (relrowsecurity=f). If any row shows relrowsecurity=t WITHOUT a SELECT
+--    policy granting this role access, plain SELECT grants are NOT sufficient —
+--    resolve it (add a narrow read policy) before trusting the audit.
+SELECT n.nspname AS schema, c.relname AS relation,
+       c.relrowsecurity   AS rls_enabled,
+       c.relforcerowsecurity AS rls_forced,
+       (SELECT count(*) FROM pg_policies p
+         WHERE p.schemaname = n.nspname AND p.tablename = c.relname
+           AND p.cmd IN ('SELECT', 'ALL')) AS select_policy_count
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname IN (
+    'strategy_shadow_evaluations', 'strategy_shadow_pairs',
+    'strategy_shadow_pair_outcomes', 'strategy_shadow_run_pairs',
+    'strategy_shadow_runs', 'daily_bars', 'patterns', 'pattern_configs')
+ORDER BY c.relname;
+
+-- 6) Fail loudly if RLS is enabled on any required relation without a SELECT
+--    policy this role could use. Expected result: zero rows.
+SELECT n.nspname || '.' || c.relname AS relation, 'RLS_WITHOUT_POLICY' AS status
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relname IN (
+    'strategy_shadow_evaluations', 'strategy_shadow_pairs',
+    'strategy_shadow_pair_outcomes', 'strategy_shadow_run_pairs',
+    'strategy_shadow_runs', 'daily_bars', 'patterns', 'pattern_configs')
+  AND c.relrowsecurity = true
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_policies p
+    WHERE p.schemaname = n.nspname AND p.tablename = c.relname
+      AND p.cmd IN ('SELECT', 'ALL'));

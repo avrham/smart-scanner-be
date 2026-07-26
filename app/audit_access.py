@@ -55,6 +55,21 @@ WRITE_PRIVILEGES: tuple = (
     "INSERT", "UPDATE", "DELETE", "TRUNCATE", "TRIGGER",
 )
 
+# PostgreSQL role attributes that make an identity broader than an audit
+# reader. Any of these being true fails readiness.
+ELEVATED_ROLE_ATTRIBUTES: tuple = (
+    "rolsuper", "rolcreaterole", "rolcreatedb", "rolreplication",
+    "rolbypassrls",
+)
+
+# Role names that are never acceptable as the audit identity (belt-and-suspenders
+# alongside the attribute check).
+DENYLISTED_ROLES: frozenset = frozenset({
+    "postgres", "supabase_admin", "service_role", "supabase_auth_admin",
+    "supabase_storage_admin", "supabase_read_only_user", "authenticator",
+    "rds_superuser", "pg_read_all_data", "pg_write_all_data",
+})
+
 
 def _is_on(value: Any) -> Optional[bool]:
     """Interpret a PostgreSQL on/off setting; None when unknown."""
@@ -63,18 +78,28 @@ def _is_on(value: Any) -> Optional[bool]:
     return str(value).strip().lower() == "on"
 
 
+def _elevated_attributes(role_attributes: Optional[Dict[str, Any]]) -> List[str]:
+    attrs = role_attributes or {}
+    return [a for a in ELEVATED_ROLE_ATTRIBUTES if attrs.get(a) is True]
+
+
 def evaluate_access(
     *,
     database_identity: Optional[str],
     transaction_read_only: Any,
     default_transaction_read_only: Any,
     relation_privileges: List[Dict[str, Any]],
+    role_attributes: Optional[Dict[str, Any]] = None,
+    expected_role: Optional[str] = None,
+    require_expected_role: bool = False,
+    connection_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """PURE: turn raw capability probe results into the access-check verdict.
 
     `relation_privileges` is one dict per required relation with keys:
     relation, exists, can_select, can_insert, can_update, can_delete,
-    can_truncate, can_trigger.
+    can_truncate, can_trigger. `role_attributes` are the pg_roles attributes of
+    current_user; `expected_role` is the identity the caller demands.
     """
     reasons: List[str] = []
     unexpected_write: List[Dict[str, Any]] = []
@@ -96,7 +121,19 @@ def evaluate_access(
             unexpected_write.append({"relation": rel, "privileges": held})
 
     default_ro = _is_on(default_transaction_read_only)
+    elevated = _elevated_attributes(role_attributes)
 
+    # ---- identity ---------------------------------------------------------- #
+    if require_expected_role and not (expected_role or "").strip():
+        reasons.append("expected_role_not_configured")
+    elif expected_role and database_identity != expected_role:
+        reasons.append("database_identity_mismatch")
+    if database_identity in DENYLISTED_ROLES:
+        reasons.append("denylisted_role")
+    if elevated:
+        reasons.append(f"privileged_role_attributes:{elevated}")
+
+    # ---- privileges / transaction defaults --------------------------------- #
     if missing_relations:
         reasons.append(f"missing_relations:{sorted(missing_relations)}")
     if missing_select:
@@ -113,7 +150,14 @@ def evaluate_access(
     return {
         "access_check_contract_version": ACCESS_CHECK_CONTRACT_VERSION,
         "database_connected": True,
+        "database_connection_mode": connection_mode,
         "database_identity": database_identity,
+        "expected_database_role": expected_role or None,
+        "role_attributes": {
+            a: bool((role_attributes or {}).get(a))
+            for a in ELEVATED_ROLE_ATTRIBUTES
+        } if role_attributes is not None else None,
+        "elevated_role_attributes": elevated,
         "transaction_read_only": _is_on(transaction_read_only),
         "default_transaction_read_only": default_ro,
         "required_relations": relation_privileges,
@@ -164,7 +208,32 @@ async def _relation_privileges(conn) -> List[Dict[str, Any]]:
     return out
 
 
-async def run_access_check(conn) -> Dict[str, Any]:
+async def _role_attributes(conn, identity: Optional[str]) -> Dict[str, Any]:
+    """pg_roles attributes of current_user (read-only). {} when unavailable."""
+    row = await conn.fetchrow(
+        """
+        SELECT rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls
+        FROM pg_roles WHERE rolname = current_user
+        """
+    )
+    if row is None:
+        return {}
+    return {
+        "rolsuper": bool(row["rolsuper"]),
+        "rolcreaterole": bool(row["rolcreaterole"]),
+        "rolcreatedb": bool(row["rolcreatedb"]),
+        "rolreplication": bool(row["rolreplication"]),
+        "rolbypassrls": bool(row["rolbypassrls"]),
+    }
+
+
+async def run_access_check(
+    conn,
+    *,
+    expected_role: Optional[str] = None,
+    require_expected_role: bool = False,
+    connection_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     """Run every capability probe inside an explicit READ ONLY transaction.
 
     Defense-in-depth: the audit probes cannot issue a mutation because the
@@ -176,6 +245,7 @@ async def run_access_check(conn) -> Dict[str, Any]:
         identity = await conn.fetchval("SELECT current_user")
         txn_ro = await conn.fetchval("SHOW transaction_read_only")
         default_ro = await conn.fetchval("SHOW default_transaction_read_only")
+        role_attributes = await _role_attributes(conn, identity)
         relation_privileges = await _relation_privileges(conn)
 
     return evaluate_access(
@@ -183,6 +253,10 @@ async def run_access_check(conn) -> Dict[str, Any]:
         transaction_read_only=txn_ro,
         default_transaction_read_only=default_ro,
         relation_privileges=relation_privileges,
+        role_attributes=role_attributes,
+        expected_role=expected_role,
+        require_expected_role=require_expected_role,
+        connection_mode=connection_mode,
     )
 
 

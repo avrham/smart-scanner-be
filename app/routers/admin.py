@@ -1694,6 +1694,27 @@ async def _cohort_trading_calendar(records) -> tuple:
     return session_dates, latest
 
 
+async def _run_configured_access_check(db):
+    """Run the access-check with the identity policy resolved from settings.
+
+    Shared by the access-check endpoint and the closeout fail-closed gate so
+    their readiness semantics can never diverge. `AUDIT_EXPECTED_DB_ROLE` is
+    REQUIRED once a real AUDIT_DATABASE_URL is configured in audit mode.
+    """
+    from app.audit_access import run_access_check
+    from app.audit_db import audit_database_configured, get_connection_mode
+
+    require_expected_role = (
+        settings.AUDIT_ONLY_MODE and audit_database_configured()
+    )
+    return await run_access_check(
+        db,
+        expected_role=(settings.AUDIT_EXPECTED_DB_ROLE or None),
+        require_expected_role=require_expected_role,
+        connection_mode=get_connection_mode(),
+    )
+
+
 @router.get("/shadow-cohort/access-check")
 async def shadow_cohort_access_check(
     _: str = Depends(get_worker_token),
@@ -1701,13 +1722,12 @@ async def shadow_cohort_access_check(
 ):
     """Read-only proof that the connected PostgreSQL identity has ONLY the
     privileges the cohort closeout audit requires (SELECT on the exact closeout
-    relations) and no write privileges. Runs inside a read-only transaction and
-    issues NO mutation SQL. Worker-token protected. Reports only safe capability
+    relations), no write privileges, no elevated role attributes, and matches
+    the expected audit role. Runs inside a read-only transaction and issues NO
+    mutation SQL. Worker-token protected. Reports only safe capability
     information — never a connection string, hostname, password, Supabase URL,
     secret value or raw SQL error."""
-    from app.audit_access import run_access_check
-
-    return await run_access_check(db)
+    return await _run_configured_access_check(db)
 
 
 @router.get("/shadow-cohort/closeout")
@@ -1759,6 +1779,25 @@ async def shadow_cohort_closeout(
                 "scans all shadow history"
             ),
         )
+
+    # Fail-closed readiness gate (audit-only mode): the closeout refuses to run
+    # unless the SAME connection satisfies the access-check contract — reusing
+    # the identical service, never duplicating its logic. The operator does not
+    # have to remember to run access-check first. Only bounded safe reason codes
+    # are returned (never a DSN / host / credential).
+    if settings.AUDIT_ONLY_MODE:
+        access = await _run_configured_access_check(db)
+        if not access["ready_for_closeout_audit"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "closeout_not_ready",
+                    "database_connection_mode": access.get(
+                        "database_connection_mode"
+                    ),
+                    "reasons": access["reasons"],
+                },
+            )
 
     filters = _evidence_filters(
         pattern_code, experiment_code, strategy_version,

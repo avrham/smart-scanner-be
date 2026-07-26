@@ -75,6 +75,18 @@ class Settings(BaseSettings):
     # runs, and no scheduler/background work may start. Default false keeps
     # local, test and normal deployments completely unchanged.
     AUDIT_ONLY_MODE: bool = False
+
+    # Explicit read-only audit database identity. A COMPLETE PostgreSQL DSN
+    # (postgresql://<role>:<password>@<host>:<port>/<db>?sslmode=require) used
+    # ONLY when AUDIT_ONLY_MODE=true. It supplies the custom least-privilege
+    # role directly — the legacy Supabase-derived username cannot. SECRET:
+    # never logged, never returned by any endpoint, never in .env.example with a
+    # real value. Empty by default; supplied via `fly secrets set`.
+    AUDIT_DATABASE_URL: str = ""
+    # The PostgreSQL role the audit connection MUST authenticate as. Required
+    # once AUDIT_DATABASE_URL is set in audit mode; the access-check refuses
+    # readiness if current_user differs or is broader.
+    AUDIT_EXPECTED_DB_ROLE: str = ""
     SCAN_BATCH_SIZE: int = 150
     SCAN_TIMES: List[str] = ["10:00", "14:00", "18:00"]  # UTC times
     
