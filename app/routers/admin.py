@@ -1832,6 +1832,136 @@ async def shadow_cohort_closeout(
     return {"filters": filters_for_response(filters), **audit}
 
 
+@router.get("/shadow-cohort/maturation-plan")
+async def shadow_cohort_maturation_plan(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    pattern_code: str = "wyckoff_mtf_v2",
+    experiment_code: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    decision_policy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    symbol: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    limit: int = 500,
+    offset: int = 0,
+    duplicate_focus: Optional[str] = None,
+):
+    """Read-only bounded maturation PLAN for an existing shadow cohort.
+
+    Produces the COMPLETE, deterministically ordered, paginated manifest of
+    every eligible-but-unmatured pair (the truncation-free superset of what the
+    closeout only samples), a SEPARATE retry plan for retryable failures,
+    per-record attribution of duplicate (symbol, session) groups, campaign-
+    membership verification and a stable manifest hash — then proves whether a
+    later bounded maturation run is safe to execute.
+
+    It is strictly read-only: it never matures, never recalculates, never calls
+    a provider and issues no mutation SQL. Maturation itself stays on the
+    existing bounded endpoint POST /api/admin/shadow/outcomes/calculate, which
+    this staging app (audit-only, SELECT-only role, no provider) cannot reach.
+    """
+    from app.workers.shadow.evidence_review import (
+        MAX_RECORD_LIMIT,
+        fetch_evidence_records,
+        filters_for_response,
+    )
+    from app.workers.shadow.maturation_plan import (
+        MAX_PAGE_LIMIT,
+        build_maturation_plan,
+    )
+
+    # Bounded-scope guard: identical to closeout — an operational cohort is
+    # never "all history for a strategy".
+    if not any([
+        experiment_code, campaign_id, strategy_version, config_hash, symbol,
+        min_snapshot_date, max_snapshot_date,
+    ]):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "a cohort selector is required (one or more of: experiment_code, "
+                "campaign_id, strategy_version, config_hash, symbol, "
+                "min_snapshot_date, max_snapshot_date) — the maturation plan "
+                "never scans all shadow history"
+            ),
+        )
+    if limit < 1 or limit > MAX_PAGE_LIMIT:
+        raise HTTPException(
+            status_code=422,
+            detail=f"limit must be between 1 and {MAX_PAGE_LIMIT}",
+        )
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be >= 0")
+
+    # Same fail-closed readiness gate as closeout: refuse unless the SAME
+    # connection satisfies the access-check contract.
+    if settings.AUDIT_ONLY_MODE:
+        access = await _run_configured_access_check(db)
+        if not access["ready_for_closeout_audit"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "maturation_plan_not_ready",
+                    "database_connection_mode": access.get(
+                        "database_connection_mode"
+                    ),
+                    "reasons": access["reasons"],
+                },
+            )
+
+    # The manifest must be COMPLETE regardless of page size, so the underlying
+    # evidence read always fetches the whole cohort at the bounded hard cap
+    # (never an unbounded request); page limit/offset only slice the eligible
+    # manifest in memory.
+    filters = _evidence_filters(
+        pattern_code, experiment_code, strategy_version,
+        decision_policy_version, config_hash, symbol, campaign_id,
+        min_snapshot_date, max_snapshot_date, None, None, None, None,
+        MAX_RECORD_LIMIT,
+    )
+    records = await fetch_evidence_records(filters)
+    outcome_rows = await _evidence_outcome_rows(filters)
+    session_dates, latest = await _cohort_trading_calendar(records)
+
+    # Recover each pair's origin run (read-only, on the SAME audit connection,
+    # within the already-granted strategy_shadow_pairs SELECT). Kept here rather
+    # than widening the frozen shared evaluation read.
+    pair_ids = [str(r["pair_id"]) for r in records if r.get("pair_id")]
+    if pair_ids:
+        run_rows = await db.fetch(
+            "SELECT id, origin_run_id FROM strategy_shadow_pairs "
+            "WHERE id = ANY($1::uuid[])",
+            pair_ids,
+        )
+        run_by_pair = {
+            str(r["id"]): (str(r["origin_run_id"]) if r["origin_run_id"] else None)
+            for r in run_rows
+        }
+        for record in records:
+            record["run_id"] = run_by_pair.get(str(record.get("pair_id")))
+
+    focus_keys = (
+        [k.strip().upper() for k in duplicate_focus.split(",") if k.strip()]
+        if duplicate_focus else None
+    )
+    plan = build_maturation_plan(
+        records,
+        outcome_rows,
+        applied_filters=filters_for_response(filters),
+        session_dates=session_dates,
+        latest_completed_session=latest,
+        campaign_ids=([filters["campaign_id"]] if filters["campaign_id"] else None),
+        page_limit=limit,
+        page_offset=offset,
+        records_possibly_truncated=(len(records) >= MAX_RECORD_LIMIT),
+        duplicate_focus=focus_keys,
+    )
+    return plan
+
+
 @router.get("/shadow-evidence/readiness")
 async def shadow_evidence_readiness(
     _: str = Depends(get_worker_token),

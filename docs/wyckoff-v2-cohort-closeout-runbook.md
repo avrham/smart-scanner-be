@@ -79,6 +79,121 @@ Use `unresolved_sample` to drive the bounded maturation below. If
 calendar (SPY `daily_bars`) is incomplete — sync daily bars before trusting
 session-based eligibility.
 
+## 1a. Bounded maturation PLAN (build the exact manifest before any mutation)
+
+```bash
+GET /api/admin/shadow-cohort/maturation-plan?experiment_code=wyckoff_v2_vs_baseline
+```
+
+This read-only endpoint (contract `shadow_maturation_plan.v1`) is the bridge
+between the closeout report and the mutation endpoint. It is worker-token
+protected, allowed in `AUDIT_ONLY_MODE`, uses the same fail-closed audit access
+gate as closeout, and requires at least one cohort selector (never all-history).
+
+### Why the closeout counts were complete but its unresolved IDs were sampled
+
+The closeout `eligibility.counts` are exact — every one of the 504 evaluations
+is classified. But its `unresolved_sample` is deliberately capped at 200 rows
+(`unresolved_sample_truncated=true` when more exist) so a large cohort can never
+grow the response without bound. The exact **counts** are trustworthy; the
+enumerated **IDs** are only a sample. You therefore cannot drive a mutation from
+the closeout body alone.
+
+### Why an exact pair-ID manifest is required before mutation
+
+A maturation run mutates outcome rows. To keep it bounded, provable and
+reversible-in-reasoning, you must feed the calculation endpoint the EXACT set of
+`pair_ids` it will touch — not a broad selector that might sweep unrelated pairs.
+The plan endpoint returns that complete, de-duplicated, deterministically ordered
+manifest (ordering `snapshot_date_asc_symbol_asc_pair_id_asc`) plus a stable
+`manifest_hash`, so the pair set is fixed and auditable before and after the run.
+
+### Why `pending=true` must NOT be used unless cohort isolation is proven
+
+`POST /api/admin/shadow/outcomes/calculate` supports only `pair_ids` / `symbols`
+/ `run_id` / `pending` selectors — **NOT** `experiment_code` or `campaign_id`.
+Its `select_pairs_for_outcomes` applies the pending status predicate with no
+experiment or strategy filter, so `pending=true` (without a narrowing selector)
+sweeps EVERY incomplete pair across ALL experiments and strategies — cross-cohort
+leakage. Never use `pending=true` for cohort maturation unless you have proven
+isolation (e.g. only this experiment has any incomplete pairs). Use the explicit
+`pair_ids` manifest instead.
+
+### How to request every manifest page
+
+The manifest is paginated (`limit` ≤ 500, `offset`). The 329-pair cohort fits in
+one page, but always confirm completeness by paging until `has_more=false`:
+
+```bash
+GET .../maturation-plan?experiment_code=wyckoff_v2_vs_baseline&limit=500&offset=0
+# then, while has_more: offset = next_offset
+GET .../maturation-plan?experiment_code=wyckoff_v2_vs_baseline&limit=500&offset=500
+```
+
+### How to verify the combined count and the manifest hash
+
+* Concatenate every page's `eligible_manifest`; assert the unique `pair_id`
+  count equals `manifest_total` and equals `eligible_unmatured_count`
+  (the authoritative eligibility count). No pair may appear twice; none may be
+  missing.
+* `manifest_hash` is computed over IMMUTABLE identity only (cohort identity +
+  per-pair `pair_id` / `snapshot_date` / strategy + experiment identity),
+  canonicalized so it is **identical across page sizes and row order**. Record it
+  before maturation and re-request the plan afterwards: an unchanged hash proves
+  the cohort identity set did not drift. Changing any pair id or the cohort
+  identity changes the hash.
+
+### How duplicate symbol-sessions are interpreted
+
+The plan classifies every duplicate `(symbol, session)` group:
+
+* `benign_cross_campaign_overlap` — two DISTINCT pair IDs from two DIFFERENT
+  legitimate campaigns. **Does not block** maturation: overlapping campaign
+  windows can legitimately evaluate the same symbol on the same session, and the
+  two distinct pairs each mature independently.
+* `duplicate_within_same_campaign` / `duplicate_within_same_run` /
+  `identity_mismatch` / `unverifiable` — **block** maturation
+  (`safe_to_execute=false`), because they indicate double-counting, drift or
+  unattributable records that must be investigated first (never merged or
+  deleted from here).
+
+### Why the audit staging app cannot execute maturation
+
+`smart-scanner-be-staging` is intentionally audit-only: `AUDIT_ONLY_MODE=true`
+(only the read-only allowlist is exposed — the calculate route returns 404), the
+database connects through the SELECT-only `smart_scanner_audit_reader` role, and
+there are no provider credentials. The plan endpoint states this explicitly in
+its `planning.cannot_execute_reason`. It PLANS; it never matures.
+
+### Prerequisites for a later maintenance-only execution environment
+
+Maturation must run in a SEPARATE, short-lived maintenance environment with:
+
+* a write-capable but still bounded database role (INSERT/UPDATE only on the
+  migration-011 outcome tables + `daily_bars` cache — never the audit reader);
+* a real Massive provider credential (Basic = 5 requests/min);
+* `ENABLE_SCHEDULER=false` (never background work);
+* a mutation-route allowlist that exposes ONLY the calculate endpoint;
+* worker-token authentication;
+* the exact `manifest_hash` recorded from this plan.
+
+Do not build that environment as part of planning.
+
+### Exact separation between normal maturation and `include_recalc`
+
+* **Normal maturation** (`planning.requires_include_recalc=false`): feed the
+  `eligible_manifest` `pair_ids` in batches. These are pairs with no outcome row
+  yet — `include_recalc` is neither needed nor used.
+* **Targeted recalculation** (`retry_plan`, `requires_include_recalc=true`): the
+  retryable failures are EXISTING error rows and are kept OUT of the eligible
+  manifest. They are repaired separately with `include_recalc=true`, one bounded
+  request, so a normal batch never silently reprocesses a frozen row. Terminal
+  failures (`retryable=false`) are never retried.
+
+Recommended order when both are needed: (1) normal eligible maturation →
+(2) read-only plan/closeout → (3) targeted `include_recalc` retry →
+(4) final read-only plan/closeout, re-checking the manifest hash.
+
 ## 2. Bounded maturation of the eligible outcomes
 
 Maturation is the EXISTING endpoint (do not re-implement it):
