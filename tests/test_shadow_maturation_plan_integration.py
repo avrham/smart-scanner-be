@@ -87,8 +87,13 @@ def _build_fixture_sql() -> str:
     }
     run_ids = {name: _u(1000 + i) for i, name in enumerate(runs)}
     for name, (exp, camp) in runs.items():
-        tel = (f"'{{\"campaign\":{{\"campaign_id\":\"{camp}\"}}}}'::jsonb"
-               if camp else "NULL")
+        # A full VALID campaign telemetry block (campaign_id + experiment_code +
+        # as_of_date), matching the real _campaign_telemetry_block shape.
+        tel = (
+            "'{\"campaign\":{\"campaign_contract_version\":\"shadow_campaign.v1\","
+            f"\"campaign_id\":\"{camp}\",\"experiment_code\":\"{exp}\","
+            "\"chunk_index\":0,\"chunk_count\":1,\"as_of_date\":\"2026-06-01\"}}'::jsonb"
+            if camp else "NULL")
         stmts.append(
             "INSERT INTO public.strategy_shadow_runs"
             "(id,experiment_code,experiment_version,status,provider,telemetry,started_at) "
@@ -171,6 +176,56 @@ def _build_fixture_sql() -> str:
                 f"'shadow_forward_bars.v1','paired_decision_observation',{bars},'{status}',{err_sql});"
             )
             eval_seq += 1
+
+    # ---- extra campaign-scope scenarios (raw SQL) ------------------------- #
+    def _valid_block(camp, exp):
+        return ("'{\"campaign\":{\"campaign_contract_version\":\"shadow_campaign.v1\","
+                f"\"campaign_id\":\"{camp}\",\"experiment_code\":\"{exp}\","
+                "\"chunk_index\":0,\"chunk_count\":1,\"as_of_date\":\"2026-06-01\"}}'::jsonb")
+
+    def _run(rid, exp, tel):
+        return ("INSERT INTO public.strategy_shadow_runs"
+                "(id,experiment_code,experiment_version,status,provider,telemetry,started_at) "
+                f"VALUES ('{rid}','{exp}','wyckoff_v2_shadow.v2','completed','massive',{tel},NOW());")
+
+    def _pair(pid, exp, symbol, origin):
+        return ("INSERT INTO public.strategy_shadow_pairs"
+                "(id,origin_run_id,experiment_code,experiment_version,symbol,timeframe,provider,"
+                "snapshot_date,market_data_as_of,frame_snapshot_version,frame_hash,frame_bar_count,"
+                "frame_first_date,frame_last_date,frame_snapshot,pair_fingerprint,pair_fingerprint_version) "
+                f"VALUES ('{pid}','{origin}','{exp}','wyckoff_v2_shadow.v2','{symbol}','1d','massive',"
+                "'2026-06-01','2026-06-01T00:00:00Z','daily_ohlcv_snapshot.v1','fh-'||"
+                f"'{pid}',1,'2026-06-01','2026-06-01','[]'::jsonb,'fp-{pid}','shadow_pair_fingerprint.v1');")
+
+    def _link(rid, pid):
+        return ("INSERT INTO public.strategy_shadow_run_pairs(run_id,pair_id,created_new_pair) "
+                f"VALUES ('{rid}','{pid}',true);")
+
+    def _eval(eid, pid):
+        return ("INSERT INTO public.strategy_shadow_evaluations"
+                "(id,pair_id,arm_code,strategy_code,strategy_version,decision_policy_version,"
+                "config_hash,config_snapshot,verdict,details_snapshot,evaluation_fingerprint,"
+                f"evaluation_fingerprint_version) VALUES ('{eid}','{pid}','candidate_wyckoff_v2',"
+                "'wyckoff_mtf_v2','wyckoff_mtf.v2','wyckoff_mtf.policy.v1','cfg1','{}'::jsonb,'AVOID',"
+                f"'{{}}'::jsonb,'efp-{pid}','shadow_evaluation_fingerprint.v1');")
+
+    rmc1, rmc2 = _u(4001), _u(4002)
+    pmc = _u(4101)
+    stmts += [
+        _run(rmc1, "exp_multi", _valid_block("camp-mc1", "exp_multi")),
+        _run(rmc2, "exp_multi", _valid_block("camp-mc2", "exp_multi")),
+        _pair(pmc, "exp_multi", "MC", rmc1),
+        _link(rmc1, pmc), _link(rmc2, pmc),  # one pair linked to TWO campaigns
+        _eval(_u(4201), pmc),
+    ]
+    rcf = _u(4003)
+    pcf = _u(4102)
+    stmts += [
+        # campaign block whose experiment_code disagrees ⇒ conflicting telemetry
+        _run(rcf, "exp_conf", _valid_block("camp-cf", "other_experiment")),
+        _pair(pcf, "exp_conf", "CF", rcf),
+        _link(rcf, pcf), _eval(_u(4202), pcf),
+    ]
     return "\n".join(stmts)
 
 
@@ -273,8 +328,8 @@ async def _call_plan(dsn, params):
          settings.AUDIT_EXPECTED_DB_ROLE) = saved
 
 
-def _plan(pg, exp, **params):
-    params = {"experiment_code": exp, **params}
+def _plan(pg, exp, *, cohort_scope="campaign", **params):
+    params = {"experiment_code": exp, "cohort_scope": cohort_scope, **params}
     return asyncio.run(_call_plan(pg["audit_dsn"], params))
 
 
@@ -282,8 +337,11 @@ class TestCleanCohort:
     def test_exact_manifest_count_and_safe(self, pg):
         status, body = _plan(pg, "exp_clean", limit=500)
         assert status == 200, body
+        assert body["cohort_scope"] == "campaign"
         assert body["manifest_total"] == 8
-        assert body["eligible_unmatured_count"] == 8
+        assert body["campaign_eligible_unmatured_count"] == 8
+        assert body["experiment_eligible_unmatured_count"] == 8
+        assert body["excluded_non_campaign_eligible_count"] == 0
         assert body["returned_count"] == 8
         assert body["planning"]["safe_to_execute"] is True, body["planning"]
         assert body["planning"]["blocking_reasons"] == []
@@ -302,8 +360,8 @@ class TestCleanCohort:
 
     def test_membership_all_verifiable(self, pg):
         _, body = _plan(pg, "exp_clean", limit=500)
-        assert body["membership"]["membership_unverifiable_count"] == 0
-        assert body["membership"]["membership_verifiable_count"] == 8
+        assert body["membership"]["campaign_membership_unverifiable_count"] == 0
+        assert body["membership"]["campaign_membership_verifiable_count"] == 8
         assert set(body["membership"]["pairs_by_campaign"]) == {"camp-1", "camp-2"}
 
     def test_pagination_no_dupe_or_gap_and_hash_stable(self, pg):
@@ -348,16 +406,54 @@ class TestUnsafeCohorts:
         assert body["planning"]["safe_to_execute"] is False
         assert "blocking_duplicate_group" in body["planning"]["blocking_reasons"]
 
-    def test_membership_unverifiable_blocks(self, pg):
-        _, body = _plan(pg, "exp_unverif", limit=500)
-        assert body["membership"]["membership_unverifiable_count"] == 1
-        assert body["planning"]["safe_to_execute"] is False
-        assert "membership_unverifiable" in body["planning"]["blocking_reasons"]
-
     def test_strategy_version_mismatch_blocks(self, pg):
         _, body = _plan(pg, "exp_mismatch", limit=500)
         assert body["planning"]["safe_to_execute"] is False
         assert "non_uniform_strategy_version" in body["planning"]["blocking_reasons"]
+
+
+class TestCampaignScopeSemantics:
+    def test_manual_pair_excluded_in_campaign_scope(self, pg):
+        _, body = _plan(pg, "exp_unverif", cohort_scope="campaign", limit=500)
+        assert body["manifest_total"] == 0
+        assert body["excluded_non_campaign_eligible_count"] == 1
+        excl = body["excluded_non_campaign_evidence"]["records"]
+        assert [r["symbol"] for r in excl] == ["UNV"]
+        # excluded manual evidence does not itself block campaign maturation
+        assert "membership_unverifiable" not in body["planning"]["blocking_reasons"]
+        assert body["membership"]["campaign_membership_unverifiable_count"] == 0
+
+    def test_manual_pair_retained_and_blocks_in_experiment_scope(self, pg):
+        _, body = _plan(pg, "exp_unverif", cohort_scope="experiment", limit=500)
+        assert body["manifest_total"] == 1
+        assert body["excluded_non_campaign_eligible_count"] == 0
+        assert body["planning"]["safe_to_execute"] is False
+        assert "membership_unverifiable" in body["planning"]["blocking_reasons"]
+
+    def test_scope_hashes_are_distinct(self, pg):
+        _, camp = _plan(pg, "exp_clean", cohort_scope="campaign", limit=500)
+        _, exp = _plan(pg, "exp_clean", cohort_scope="experiment", limit=500)
+        assert camp["manifest_hash"] != exp["manifest_hash"]
+
+    def test_multiple_campaign_links_keep_one_pair(self, pg):
+        _, body = _plan(pg, "exp_multi", cohort_scope="campaign", limit=500)
+        assert body["manifest_total"] == 1
+        entry = body["eligible_manifest"][0]
+        assert set(entry["campaign_ids"]) == {"camp-mc1", "camp-mc2"}
+        assert body["membership"]["campaign_membership_verifiable_count"] == 1
+        assert body["planning"]["safe_to_execute"] is True
+
+    def test_conflicting_campaign_telemetry_blocks(self, pg):
+        _, body = _plan(pg, "exp_conf", cohort_scope="campaign", limit=500)
+        assert body["manifest_total"] == 0
+        assert body["campaign_conflicting_eligible_count"] == 1
+        assert body["planning"]["safe_to_execute"] is False
+        assert "campaign_membership_conflict" in body["planning"]["blocking_reasons"]
+
+    def test_cohort_scope_required(self, pg):
+        status, body = asyncio.run(_call_plan(
+            pg["audit_dsn"], {"experiment_code": "exp_clean"}))
+        assert status == 422
 
 
 class TestReadOnlyAndAccess:

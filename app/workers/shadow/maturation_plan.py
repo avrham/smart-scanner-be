@@ -55,10 +55,26 @@ from app.workers.shadow.outcomes.eligibility import (
 )
 
 
-MATURATION_PLAN_CONTRACT_VERSION = "shadow_maturation_plan.v1"
-MANIFEST_HASH_VERSION = "shadow_maturation_manifest_hash.v1"
+MATURATION_PLAN_CONTRACT_VERSION = "shadow_maturation_plan.v2"
+# v2: the hash preimage now includes the cohort SCOPE, so a campaign manifest and
+# an experiment manifest can never share an identity, and the old v1 329-pair
+# hash no longer describes any executable manifest.
+MANIFEST_HASH_VERSION = "shadow_maturation_manifest_hash.v2"
 RETRY_PLAN_CONTRACT_VERSION = "shadow_maturation_retry_plan.v1"
 DUPLICATE_AUDIT_CONTRACT_VERSION = "shadow_maturation_duplicate_audit.v1"
+
+# Cohort scope (closed vocabulary). `campaign` is the executable maturation
+# cohort (campaign-linked records only); `experiment` is the broader read-only
+# experiment-evidence view (includes manual/legacy records and stays unsafe for
+# campaign maturation while any non-campaign membership exists).
+COHORT_SCOPE_CAMPAIGN = "campaign"
+COHORT_SCOPE_EXPERIMENT = "experiment"
+COHORT_SCOPES = (COHORT_SCOPE_CAMPAIGN, COHORT_SCOPE_EXPERIMENT)
+
+# Per-pair campaign-membership verdicts (derived from persisted run telemetry).
+CAMPAIGN_MEMBERSHIP_VERIFIABLE = "verifiable"     # >=1 valid campaign block
+CAMPAIGN_MEMBERSHIP_NONE = "none"                 # no campaign telemetry at all
+CAMPAIGN_MEMBERSHIP_CONFLICTING = "conflicting"   # block(s) present but invalid
 
 # Deterministic manifest ordering (documented, hash-independent).
 MANIFEST_ORDERING = "snapshot_date_asc_symbol_asc_pair_id_asc"
@@ -175,18 +191,57 @@ def _sort_key(entry: Dict[str, Any]) -> Tuple[str, str, str]:
     )
 
 
+def classify_campaign_membership(
+    campaign_blocks: Optional[List[Any]], cohort_experiment: Optional[str]
+) -> Tuple[str, List[str]]:
+    """PURE: derive one pair's campaign membership from its linked campaign blocks.
+
+    A campaign block is VALID only when it carries a campaign_id, an as_of_date
+    and (when the cohort experiment is known) a matching experiment_code. Returns
+    (verdict, sorted valid campaign ids). Multiple valid campaigns is legitimate
+    cross-campaign reuse — still `verifiable`, ids reported, pair kept once.
+    """
+    blocks = campaign_blocks or []
+    if not blocks:
+        return CAMPAIGN_MEMBERSHIP_NONE, []
+    valid: set = set()
+    conflict = False
+    for b in blocks:
+        if not isinstance(b, dict):
+            conflict = True
+            continue
+        cid = b.get("campaign_id")
+        ec = b.get("experiment_code")
+        aod = b.get("as_of_date")
+        if not cid or not aod:
+            conflict = True
+            continue
+        if cohort_experiment and ec and ec != cohort_experiment:
+            conflict = True
+            continue
+        valid.add(str(cid))
+    if valid and not conflict:
+        return CAMPAIGN_MEMBERSHIP_VERIFIABLE, sorted(valid)
+    return CAMPAIGN_MEMBERSHIP_CONFLICTING, sorted(valid)
+
+
 def compute_manifest_hash(
-    cohort_identity: Dict[str, Any], eligible_entries: List[Dict[str, Any]]
+    cohort_identity: Dict[str, Any],
+    eligible_entries: List[Dict[str, Any]],
+    *,
+    scope: str,
 ) -> str:
     """Deterministic hash over IMMUTABLE identity only.
 
     Canonicalized (entries sorted by pair_id, keys sorted, no whitespace) so it
-    is independent of page size and row ordering. Cohort identity is part of the
-    preimage, so changing the cohort — or any pair id / snapshot / identity —
-    changes the hash; mutable error text and timestamps are never included.
+    is independent of page size and row ordering. Cohort identity AND the cohort
+    SCOPE are part of the preimage, so changing the cohort/scope — or any pair id
+    / snapshot / identity — changes the hash; mutable error text and timestamps
+    are never included.
     """
     canonical = {
         "hash_version": MANIFEST_HASH_VERSION,
+        "scope": scope,
         "cohort": {
             "strategy_code": cohort_identity.get("strategy_code"),
             "experiment_code": cohort_identity.get("experiment_code"),
@@ -322,6 +377,7 @@ def build_maturation_plan(
     records: List[Dict[str, Any]],
     outcome_rows: List[Dict[str, Any]],
     *,
+    cohort_scope: str,
     applied_filters: Dict[str, Any],
     session_dates: Optional[List[date]] = None,
     latest_completed_session: Optional[date] = None,
@@ -331,13 +387,22 @@ def build_maturation_plan(
     records_possibly_truncated: bool = False,
     duplicate_focus: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build the complete, paginated, hash-stamped maturation plan. PURE."""
+    """Build the complete, paginated, hash-stamped maturation plan. PURE.
+
+    `cohort_scope` selects the executable cohort: `campaign` (only campaign-
+    linked eligible pairs — the executable maturation manifest) or `experiment`
+    (every eligible pair, including manual/legacy evidence — read-only, stays
+    unsafe while any non-campaign membership exists).
+    """
+    if cohort_scope not in COHORT_SCOPES:
+        raise ValueError(f"cohort_scope must be one of {list(COHORT_SCOPES)}")
     session_dates = session_dates or []
     page_limit = max(1, min(int(page_limit), MAX_PAGE_LIMIT))
     page_offset = max(0, int(page_offset))
     error_by_pair = _error_code_by_pair(outcome_rows)
+    cohort_experiment = applied_filters.get("experiment_code")
 
-    eligible_entries: List[Dict[str, Any]] = []
+    all_eligible: List[Dict[str, Any]] = []      # every eligible pair (annotated)
     retry_entries: List[Dict[str, Any]] = []
     eligibility_inputs: List[Dict[str, Any]] = []
     records_by_group: Dict[str, List[Dict[str, Any]]] = {}
@@ -345,6 +410,10 @@ def build_maturation_plan(
     campaign_id_set = {str(c) for c in (campaign_ids or []) if c}
     terminal_count = 0
     missing_session_count = 0
+
+    def _membership_of(record: Dict[str, Any]) -> Tuple[str, List[str]]:
+        return classify_campaign_membership(
+            record.get("campaign_blocks"), cohort_experiment)
 
     for record in records:
         pid = str(record.get("pair_id")) if record.get("pair_id") else None
@@ -377,39 +446,63 @@ def build_maturation_plan(
         key = f"{str(record.get('symbol') or '').upper()}|{_iso(record.get('snapshot_date'))}"
         records_by_group.setdefault(key, []).append(record)
 
+        membership, valid_cids = _membership_of(record)
+
         if state == ELIGIBILITY_ELIGIBLE:
-            eligible_entries.append(_manifest_entry(view, state))
+            entry = _manifest_entry(view, state)
+            entry["campaign_membership"] = membership
+            entry["campaign_ids"] = valid_cids
+            all_eligible.append(entry)
         elif state == ELIGIBILITY_RETRYABLE:
             retry_entries.append({
-                "pair_id": view["pair_id"],
-                "symbol": view["symbol"],
+                "pair_id": view["pair_id"], "symbol": view["symbol"],
                 "snapshot_date": view["snapshot_date"],
                 "current_error_code": error_code,
-                "retryable": True,
-                "requires_include_recalc": True,
+                "retryable": True, "requires_include_recalc": True,
+                "campaign_membership": membership,
+                "campaign_ids": valid_cids,
+                "recommended_limit": 1,
             })
         elif state == ELIGIBILITY_TERMINAL:
             terminal_count += 1
             retry_entries.append({
-                "pair_id": view["pair_id"],
-                "symbol": view["symbol"],
+                "pair_id": view["pair_id"], "symbol": view["symbol"],
                 "snapshot_date": view["snapshot_date"],
                 "current_error_code": error_code,
-                "retryable": False,
-                "requires_include_recalc": False,
+                "retryable": False, "requires_include_recalc": False,
+                "campaign_membership": membership,
+                "campaign_ids": valid_cids,
             })
         elif state == ELIGIBILITY_MISSING_SESSION_DATA:
             missing_session_count += 1
 
     eligibility = summarize_eligibility(eligibility_inputs)
-    eligible_entries.sort(key=_sort_key)
+    experiment_eligible_count = eligibility["counts"][ELIGIBILITY_ELIGIBLE]
+
+    # ---- partition eligible pairs by campaign membership ------------------- #
+    campaign_verifiable = [e for e in all_eligible
+                           if e["campaign_membership"] == CAMPAIGN_MEMBERSHIP_VERIFIABLE]
+    campaign_none = [e for e in all_eligible
+                     if e["campaign_membership"] == CAMPAIGN_MEMBERSHIP_NONE]
+    campaign_conflicting = [e for e in all_eligible
+                            if e["campaign_membership"] == CAMPAIGN_MEMBERSHIP_CONFLICTING]
+
+    if cohort_scope == COHORT_SCOPE_CAMPAIGN:
+        manifest_entries = list(campaign_verifiable)
+        # Manual/legacy (no telemetry) are retained but excluded — never a
+        # blocker. Conflicting (campaign-intended but invalid) DO block below.
+        excluded_entries = list(campaign_none)
+    else:  # experiment scope: the broad read-only view keeps every eligible pair
+        manifest_entries = list(all_eligible)
+        excluded_entries = []
+
+    manifest_entries.sort(key=_sort_key)
     retry_entries.sort(key=lambda e: (str(e.get("snapshot_date") or ""),
                                       str(e.get("symbol") or ""),
                                       str(e.get("pair_id") or "")))
 
-    # ---- strategy identity (uniform expectation over eligible pairs) ------- #
     def _distinct(field: str) -> List[Any]:
-        return sorted({e.get(field) for e in eligible_entries if e.get(field) is not None},
+        return sorted({e.get(field) for e in manifest_entries if e.get(field) is not None},
                       key=lambda v: str(v))
 
     strategy_identity = {
@@ -419,56 +512,51 @@ def build_maturation_plan(
         "experiment_codes": _distinct("experiment_code"),
     }
 
-    # ---- membership -------------------------------------------------------- #
-    membership_verifiable = sum(1 for e in eligible_entries if e["campaign_ids"])
-    membership_unverifiable = len(eligible_entries) - membership_verifiable
+    # ---- membership counts WITHIN the manifest ----------------------------- #
+    manifest_verifiable = sum(
+        1 for e in manifest_entries
+        if e["campaign_membership"] == CAMPAIGN_MEMBERSHIP_VERIFIABLE)
+    manifest_unverifiable = len(manifest_entries) - manifest_verifiable
     pairs_by_campaign: Dict[str, int] = {}
-    for e in eligible_entries:
+    for e in manifest_entries:
         if not e["campaign_ids"]:
             pairs_by_campaign["__unverifiable__"] = (
-                pairs_by_campaign.get("__unverifiable__", 0) + 1
-            )
+                pairs_by_campaign.get("__unverifiable__", 0) + 1)
         else:
             for cid in e["campaign_ids"]:
                 pairs_by_campaign[cid] = pairs_by_campaign.get(cid, 0) + 1
 
     duplicate_audit = _duplicate_audit(records_by_group, duplicate_focus)
 
-    manifest_total = len(eligible_entries)
-    authoritative_eligible = eligibility["counts"][ELIGIBILITY_ELIGIBLE]
-
+    manifest_total = len(manifest_entries)
     cohort_identity = {
         "strategy_code": applied_filters.get("strategy_code"),
         "experiment_code": applied_filters.get("experiment_code"),
     }
-    manifest_hash = compute_manifest_hash(cohort_identity, eligible_entries)
+    manifest_hash = compute_manifest_hash(
+        cohort_identity, manifest_entries, scope=cohort_scope)
 
-    # ---- safety gate (every invariant is fail-closed) ---------------------- #
+    # ---- safety gate (fail-closed) ----------------------------------------- #
     blocking: List[str] = []
     duplicate_pair_ids = sorted(pid for pid, n in pair_id_counts.items() if n > 1)
     if records_possibly_truncated:
         blocking.append("cohort_exceeds_bounded_read")
-    if manifest_total != authoritative_eligible:
-        blocking.append("manifest_count_mismatch")
-    if any(e["eligibility_class"] != ELIGIBILITY_ELIGIBLE for e in eligible_entries):
+    if any(e["eligibility_class"] != ELIGIBILITY_ELIGIBLE for e in manifest_entries):
         blocking.append("non_eligible_entry_in_manifest")
-    # A retryable/terminal failure must never be in the eligible manifest.
     retry_pair_ids = {e["pair_id"] for e in retry_entries}
-    eligible_pair_ids = {e["pair_id"] for e in eligible_entries}
-    if retry_pair_ids & eligible_pair_ids:
+    manifest_pair_ids = {e["pair_id"] for e in manifest_entries}
+    if retry_pair_ids & manifest_pair_ids:
         blocking.append("retry_pair_in_manifest")
-    if duplicate_pair_ids:
+    # A duplicate pair id WITHIN the manifest is a real blocker.
+    if len(manifest_pair_ids) != len(manifest_entries):
         blocking.append("duplicate_pair_ids")
     if terminal_count > 0:
         blocking.append("terminal_failures_present")
-    if membership_unverifiable > 0:
-        blocking.append("membership_unverifiable")
     expected_strategy = applied_filters.get("strategy_code")
-    if any(e["strategy_code"] != expected_strategy for e in eligible_entries):
+    if any(e["strategy_code"] != expected_strategy for e in manifest_entries):
         blocking.append("strategy_code_mismatch")
-    expected_experiment = applied_filters.get("experiment_code")
-    if expected_experiment is not None and any(
-        e["experiment_code"] != expected_experiment for e in eligible_entries
+    if cohort_experiment is not None and any(
+        e["experiment_code"] != cohort_experiment for e in manifest_entries
     ):
         blocking.append("experiment_code_mismatch")
     if len(strategy_identity["strategy_versions"]) > 1:
@@ -478,31 +566,73 @@ def build_maturation_plan(
     if any(g["blocks_maturation"] for g in duplicate_audit["groups"]):
         blocking.append("blocking_duplicate_group")
 
+    if cohort_scope == COHORT_SCOPE_CAMPAIGN:
+        # Campaign-intended pairs whose telemetry is invalid/ambiguous block.
+        if campaign_conflicting:
+            blocking.append("campaign_membership_conflict")
+        # By construction the campaign manifest is all-verifiable; assert it.
+        if manifest_unverifiable > 0:
+            blocking.append("campaign_membership_unverifiable")
+    else:
+        # Experiment scope stays unsafe for maturation while any eligible pair
+        # lacks verifiable campaign membership (preserved v1 contract).
+        if manifest_unverifiable > 0:
+            blocking.append("membership_unverifiable")
+
     safe_to_execute = not blocking
 
-    # ---- batch sizing (deterministic; reasoning is transparent) ------------ #
+    # ---- batch sizing (deterministic; computed from the manifest) ---------- #
     batch_size = RECOMMENDED_MATURATION_BATCH_SIZE
     if manifest_total == 0:
-        batch_count = 0
-        final_batch_size = 0
+        batch_count = full_batch_count = final_batch_size = 0
     else:
         batch_count = (manifest_total + batch_size - 1) // batch_size
-        final_batch_size = manifest_total - batch_size * (batch_count - 1)
+        remainder = manifest_total % batch_size
+        if remainder == 0:
+            full_batch_count = batch_count
+            final_batch_size = batch_size
+        else:
+            full_batch_count = batch_count - 1
+            final_batch_size = remainder
 
     # ---- page the manifest (hash + totals are page-independent) ------------ #
-    page = eligible_entries[page_offset:page_offset + page_limit]
+    page = manifest_entries[page_offset:page_offset + page_limit]
     has_more = (page_offset + len(page)) < manifest_total
     next_offset = (page_offset + len(page)) if has_more else None
 
+    excluded_block = {
+        "count": len(excluded_entries),
+        "reason": "no_campaign_telemetry",
+        "records": [
+            {
+                "pair_id": e["pair_id"], "symbol": e["symbol"],
+                "snapshot_date": e["snapshot_date"],
+                "classification": "non_campaign_evidence",
+                "reason": "no_campaign_telemetry",
+            }
+            for e in sorted(excluded_entries, key=_sort_key)
+        ],
+    }
+
     return {
         "contract_version": MATURATION_PLAN_CONTRACT_VERSION,
+        "cohort_scope": cohort_scope,
         "applied_filters": applied_filters,
         "strategy_identity": strategy_identity,
         "campaign_ids": sorted(campaign_id_set),
         "campaign_count": len(campaign_id_set),
         "total_evaluations_considered": len(records),
         "total_pair_count": len(pair_id_counts),
-        "eligible_unmatured_count": authoritative_eligible,
+        # scoped eligibility totals
+        "experiment_eligible_unmatured_count": experiment_eligible_count,
+        "campaign_eligible_unmatured_count": len(campaign_verifiable),
+        # what is actually excluded from THIS scope's manifest (campaign scope
+        # excludes the no-telemetry pairs; experiment scope excludes nothing).
+        "excluded_non_campaign_eligible_count": len(excluded_entries),
+        "non_campaign_eligible_count": len(campaign_none),
+        "campaign_conflicting_eligible_count": len(campaign_conflicting),
+        # the scope's executable eligible count
+        "eligible_unmatured_count": manifest_total,
         "retryable_failure_count": eligibility["counts"][ELIGIBILITY_RETRYABLE],
         "terminal_failure_count": terminal_count,
         "not_yet_eligible_count": eligibility["counts"][ELIGIBILITY_NOT_YET],
@@ -520,18 +650,18 @@ def build_maturation_plan(
         "manifest_hash": manifest_hash,
         # collections
         "eligible_manifest": page,
+        "excluded_non_campaign_evidence": excluded_block,
         "retry_plan": {
             "contract_version": RETRY_PLAN_CONTRACT_VERSION,
             "retryable_failure_count": sum(1 for e in retry_entries if e["retryable"]),
             "terminal_failure_count": sum(
-                1 for e in retry_entries if not e["retryable"]
-            ),
+                1 for e in retry_entries if not e["retryable"]),
             "entries": retry_entries,
         },
         "duplicate_investigation": duplicate_audit,
         "membership": {
-            "membership_verifiable_count": membership_verifiable,
-            "membership_unverifiable_count": membership_unverifiable,
+            "campaign_membership_verifiable_count": manifest_verifiable,
+            "campaign_membership_unverifiable_count": manifest_unverifiable,
             "pairs_by_campaign": dict(sorted(pairs_by_campaign.items())),
         },
         "planning": {
@@ -539,6 +669,7 @@ def build_maturation_plan(
             "blocking_reasons": sorted(set(blocking)),
             "recommended_batch_size": batch_size,
             "recommended_batch_count": batch_count,
+            "full_batch_count": full_batch_count,
             "final_batch_size": final_batch_size,
             "ordering": MANIFEST_ORDERING,
             "calculation_selector": "explicit_pair_ids",
@@ -574,6 +705,13 @@ __all__ = [
     "DEFAULT_PAGE_LIMIT",
     "MAX_PAGE_LIMIT",
     "RECOMMENDED_MATURATION_BATCH_SIZE",
+    "COHORT_SCOPE_CAMPAIGN",
+    "COHORT_SCOPE_EXPERIMENT",
+    "COHORT_SCOPES",
+    "CAMPAIGN_MEMBERSHIP_VERIFIABLE",
+    "CAMPAIGN_MEMBERSHIP_NONE",
+    "CAMPAIGN_MEMBERSHIP_CONFLICTING",
+    "classify_campaign_membership",
     "DUP_BENIGN_CROSS_CAMPAIGN",
     "DUP_WITHIN_SAME_CAMPAIGN",
     "DUP_WITHIN_SAME_RUN",

@@ -52,7 +52,16 @@ def rec(
     strategy_code: str = "wyckoff_mtf_v2",
     config_hash: str = "cfg1",
     policy: str = "pol.v1",
+    campaign_blocks: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
+    # A valid campaign telemetry block per campaign id (unless overridden), so a
+    # record with campaigns=() has NO block (campaign membership = none).
+    if campaign_blocks is None:
+        campaign_blocks = [
+            {"campaign_id": c, "experiment_code": experiment_code,
+             "as_of_date": "2026-06-01"}
+            for c in campaigns
+        ]
     return {
         "evaluation_id": f"e-{pid}",
         "pair_id": pid,
@@ -68,6 +77,7 @@ def rec(
         "outcome_status": status,
         "has_outcome": status is not None,
         "campaign_ids": list(campaigns),
+        "campaign_blocks": campaign_blocks,
         "created_at": "2026-06-16T00:00:00+00:00",
     }
 
@@ -80,9 +90,9 @@ def outcome(pid: str, symbol: str, snapshot: str, status: str, error=None, retur
     }
 
 
-def _plan(records, outcome_rows=None, **kw):
+def _plan(records, outcome_rows=None, *, cohort_scope="campaign", **kw):
     return build_maturation_plan(
-        records, outcome_rows or [], applied_filters=AF,
+        records, outcome_rows or [], cohort_scope=cohort_scope, applied_filters=AF,
         session_dates=CAL, latest_completed_session=LATEST, **kw,
     )
 
@@ -181,11 +191,16 @@ class TestManifestHash:
                     "experiment_version": "ev"}]
         h1 = compute_manifest_hash(
             {"strategy_code": "wyckoff_mtf_v2", "experiment_code": "wyckoff_v2_vs_baseline"},
-            entries)
+            entries, scope="campaign")
         h2 = compute_manifest_hash(
             {"strategy_code": "wyckoff_mtf_v2", "experiment_code": "other_experiment"},
-            entries)
+            entries, scope="campaign")
         assert h1 != h2
+        # scope is part of the identity: same entries, different scope ⇒ new hash
+        h3 = compute_manifest_hash(
+            {"strategy_code": "wyckoff_mtf_v2", "experiment_code": "wyckoff_v2_vs_baseline"},
+            entries, scope="experiment")
+        assert h1 != h3
 
     def test_ordering_does_not_change_hash(self):
         r = [rec("p1", "AAA", "2026-06-12"), rec("p2", "BBB", "2026-06-13")]
@@ -229,12 +244,71 @@ class TestDuplicateClassification:
         assert "blocking_duplicate_group" in same["planning"]["blocking_reasons"]
 
 
+class TestCohortScope:
+    def test_campaign_excludes_manual_experiment_retains(self):
+        records = [
+            rec("p1", "AAA", "2026-06-12", campaigns=("camp-1",)),   # campaign
+            rec("m1", "BBB", "2026-06-12", campaigns=()),            # manual (no block)
+        ]
+        camp = _plan(records, cohort_scope="campaign")
+        assert camp["manifest_total"] == 1
+        assert {e["pair_id"] for e in camp["eligible_manifest"]} == {"p1"}
+        assert camp["experiment_eligible_unmatured_count"] == 2
+        assert camp["campaign_eligible_unmatured_count"] == 1
+        assert camp["excluded_non_campaign_eligible_count"] == 1
+        excl = camp["excluded_non_campaign_evidence"]
+        assert excl["count"] == 1
+        assert excl["records"][0]["pair_id"] == "m1"
+        assert camp["membership"]["campaign_membership_unverifiable_count"] == 0
+        assert camp["planning"]["safe_to_execute"] is True
+        # excluded pair appears in neither manifest nor retry plan
+        assert "m1" not in {e["pair_id"] for e in camp["eligible_manifest"]}
+        assert "m1" not in {e["pair_id"] for e in camp["retry_plan"]["entries"]}
+
+        exp = _plan(records, cohort_scope="experiment")
+        assert exp["manifest_total"] == 2
+        assert exp["planning"]["safe_to_execute"] is False
+        assert "membership_unverifiable" in exp["planning"]["blocking_reasons"]
+        assert exp["excluded_non_campaign_evidence"]["count"] == 0
+
+    def test_scope_hashes_are_distinct(self):
+        records = [rec("p1", "AAA", "2026-06-12", campaigns=("camp-1",))]
+        assert (_plan(records, cohort_scope="campaign")["manifest_hash"]
+                != _plan(records, cohort_scope="experiment")["manifest_hash"])
+
+    def test_multiple_campaign_links_keep_one_pair(self):
+        r = rec("p1", "AAA", "2026-06-12", campaigns=("camp-1", "camp-2"))
+        camp = _plan([r], cohort_scope="campaign")
+        assert camp["manifest_total"] == 1
+        entry = camp["eligible_manifest"][0]
+        assert set(entry["campaign_ids"]) == {"camp-1", "camp-2"}
+        assert camp["membership"]["campaign_membership_verifiable_count"] == 1
+        assert camp["planning"]["safe_to_execute"] is True
+
+    def test_conflicting_campaign_telemetry_blocks(self):
+        good = rec("p1", "AAA", "2026-06-12", campaigns=("camp-1",))
+        bad = rec("p2", "BBB", "2026-06-12", campaign_blocks=[
+            {"campaign_id": "cX", "experiment_code": "other_experiment",
+             "as_of_date": "2026-06-01"}])
+        camp = _plan([good, bad], cohort_scope="campaign")
+        assert camp["campaign_conflicting_eligible_count"] == 1
+        assert "p2" not in {e["pair_id"] for e in camp["eligible_manifest"]}
+        assert camp["planning"]["safe_to_execute"] is False
+        assert "campaign_membership_conflict" in camp["planning"]["blocking_reasons"]
+
+    def test_invalid_scope_raises(self):
+        with pytest.raises(ValueError):
+            _plan([rec("p1", "AAA", "2026-06-12")], cohort_scope="bogus")
+
+
 class TestSafetyGate:
-    def test_membership_unverifiable_blocks(self):
+    def test_manual_pair_excluded_not_blocking_in_campaign_scope(self):
         plan = _plan([rec("p1", "AAA", "2026-06-12", campaigns=())])
-        assert plan["membership"]["membership_unverifiable_count"] == 1
-        assert plan["planning"]["safe_to_execute"] is False
-        assert "membership_unverifiable" in plan["planning"]["blocking_reasons"]
+        assert plan["excluded_non_campaign_eligible_count"] == 1
+        assert plan["manifest_total"] == 0
+        assert plan["membership"]["campaign_membership_unverifiable_count"] == 0
+        # no campaign-intended records remain, so no blocker from membership
+        assert "campaign_membership_conflict" not in plan["planning"]["blocking_reasons"]
 
     def test_non_uniform_strategy_version_blocks(self):
         plan = _plan([
@@ -281,10 +355,25 @@ class _Boom:
 
 
 class _FakeConn:
-    """Minimal async connection: origin-run recovery returns nothing (run_id
-    is then None, which the plan tolerates — membership uses campaign_ids)."""
+    """Minimal async connection routing the endpoint's two read queries.
 
-    async def fetch(self, *a, **k):
+    `blocks` maps pair_id -> list of campaign telemetry block dicts; the origin
+    query returns null origin runs. Empty by default (campaign_blocks = [] for
+    every pair), so campaign scope yields an empty manifest unless blocks given.
+    """
+
+    def __init__(self, blocks=None):
+        self._blocks = blocks or {}
+
+    async def fetch(self, sql, ids=None):
+        if "origin_run_id" in sql:
+            return [{"id": pid, "origin_run_id": None} for pid in (ids or [])]
+        if "campaign" in sql:
+            rows = []
+            for pid in (ids or []):
+                for b in self._blocks.get(pid, []):
+                    rows.append({"pair_id": pid, "campaign": b})
+            return rows
         return []
 
 
@@ -323,16 +412,32 @@ def client():
 
 
 class TestHttpBoundary:
+    def test_cohort_scope_required_422(self, client, monkeypatch):
+        _patch_reads(monkeypatch, records=[], outcome_rows=[])
+        resp = client.get("/api/admin/shadow-cohort/maturation-plan",
+                          params={"experiment_code": "wyckoff_v2_vs_baseline"})
+        assert resp.status_code == 422
+        assert "cohort_scope is required" in resp.json()["detail"]
+
+    def test_invalid_cohort_scope_422(self, client, monkeypatch):
+        _patch_reads(monkeypatch, records=[], outcome_rows=[])
+        resp = client.get("/api/admin/shadow-cohort/maturation-plan",
+                          params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                  "cohort_scope": "bogus"})
+        assert resp.status_code == 422
+
     def test_missing_selector_422(self, client, monkeypatch):
         _patch_reads(monkeypatch, records=[], outcome_rows=[])
-        resp = client.get("/api/admin/shadow-cohort/maturation-plan")
+        resp = client.get("/api/admin/shadow-cohort/maturation-plan",
+                          params={"cohort_scope": "campaign"})
         assert resp.status_code == 422
         assert "cohort selector" in resp.json()["detail"]
 
     def test_unknown_experiment_is_empty_plan_not_all_history(self, client, monkeypatch):
         _patch_reads(monkeypatch, records=[], outcome_rows=[])
         resp = client.get("/api/admin/shadow-cohort/maturation-plan",
-                          params={"experiment_code": "does_not_exist"})
+                          params={"experiment_code": "does_not_exist",
+                                  "cohort_scope": "campaign"})
         assert resp.status_code == 200
         body = resp.json()
         assert body["manifest_total"] == 0
@@ -344,18 +449,21 @@ class TestHttpBoundary:
         _patch_reads(monkeypatch, records=records, outcome_rows=[])
         r1 = client.get("/api/admin/shadow-cohort/maturation-plan",
                         params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                "cohort_scope": "experiment",
                                 "limit": 5, "offset": 0}).json()
         assert r1["returned_count"] == 5 and r1["manifest_total"] == 12
         assert r1["has_more"] is True and r1["next_offset"] == 5
         r3 = client.get("/api/admin/shadow-cohort/maturation-plan",
                         params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                "cohort_scope": "experiment",
                                 "limit": 5, "offset": 10}).json()
         assert r3["returned_count"] == 2 and r3["has_more"] is False
 
     def test_limit_over_max_422(self, client, monkeypatch):
         _patch_reads(monkeypatch, records=[], outcome_rows=[])
         resp = client.get("/api/admin/shadow-cohort/maturation-plan",
-                          params={"experiment_code": "x", "limit": 100000})
+                          params={"experiment_code": "x", "cohort_scope": "campaign",
+                                  "limit": 100000})
         assert resp.status_code == 422
 
     def test_hash_stable_and_count_correct_across_page_sizes(self, client, monkeypatch):
@@ -365,17 +473,55 @@ class TestHttpBoundary:
         for size in (1, 3, 9, 500):
             body = client.get("/api/admin/shadow-cohort/maturation-plan",
                               params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                      "cohort_scope": "experiment",
                                       "limit": size}).json()
             assert body["manifest_total"] == 9
             hashes.add(body["manifest_hash"])
         assert len(hashes) == 1
+
+    def test_campaign_and_experiment_hashes_distinct_over_http(self, client, monkeypatch):
+        records = [rec(f"p{i:03d}", f"S{i:03d}", "2026-06-12") for i in range(4)]
+        _patch_reads(monkeypatch, records=records, outcome_rows=[])
+        exp = client.get("/api/admin/shadow-cohort/maturation-plan",
+                         params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                 "cohort_scope": "experiment"}).json()
+        # campaign scope with no blocks (FakeConn empty) → empty manifest, distinct hash
+        camp = client.get("/api/admin/shadow-cohort/maturation-plan",
+                          params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                  "cohort_scope": "campaign"}).json()
+        assert exp["manifest_hash"] != camp["manifest_hash"]
+        assert exp["cohort_scope"] == "experiment" and camp["cohort_scope"] == "campaign"
+
+    def test_campaign_scope_excludes_manual_via_blocks(self, monkeypatch):
+        # Two eligible pairs; only p1 has a valid campaign block → campaign
+        # manifest = {p1}, p2 excluded as non-campaign evidence.
+        records = [rec("p1", "AAA", "2026-06-12"), rec("p2", "BBB", "2026-06-12")]
+        _patch_reads(monkeypatch, records=records, outcome_rows=[])
+        blocks = {"p1": [{"campaign_id": "camp-1",
+                          "experiment_code": "wyckoff_v2_vs_baseline",
+                          "as_of_date": "2026-06-01"}]}
+        app.dependency_overrides[get_worker_token] = lambda: "t"
+        app.dependency_overrides[get_db] = lambda: _FakeConn(blocks=blocks)
+        try:
+            body = TestClient(app, raise_server_exceptions=False).get(
+                "/api/admin/shadow-cohort/maturation-plan",
+                params={"experiment_code": "wyckoff_v2_vs_baseline",
+                        "cohort_scope": "campaign"}).json()
+            assert body["manifest_total"] == 1
+            assert {e["pair_id"] for e in body["eligible_manifest"]} == {"p1"}
+            assert body["excluded_non_campaign_eligible_count"] == 1
+            assert body["excluded_non_campaign_evidence"]["records"][0]["pair_id"] == "p2"
+        finally:
+            app.dependency_overrides.pop(get_worker_token, None)
+            app.dependency_overrides.pop(get_db, None)
 
     def test_no_provider_constructed(self, client, monkeypatch):
         # _Boom raises if get_market_data_provider is ever called.
         records = [rec("p1", "AAA", "2026-06-12")]
         _patch_reads(monkeypatch, records=records, outcome_rows=[])
         resp = client.get("/api/admin/shadow-cohort/maturation-plan",
-                          params={"experiment_code": "wyckoff_v2_vs_baseline"})
+                          params={"experiment_code": "wyckoff_v2_vs_baseline",
+                                  "cohort_scope": "experiment"})
         assert resp.status_code == 200
 
 
@@ -396,20 +542,20 @@ class TestAuthAndAuditMode:
     def test_missing_token_rejected(self, auth_client):
         assert auth_client.get(
             "/api/admin/shadow-cohort/maturation-plan",
-            params={"experiment_code": "wyckoff_v2_vs_baseline"},
+            params={"experiment_code": "wyckoff_v2_vs_baseline", "cohort_scope": "campaign"},
         ).status_code == 401
 
     def test_invalid_token_rejected(self, auth_client):
         assert auth_client.get(
             "/api/admin/shadow-cohort/maturation-plan",
-            params={"experiment_code": "wyckoff_v2_vs_baseline"},
+            params={"experiment_code": "wyckoff_v2_vs_baseline", "cohort_scope": "campaign"},
             headers={"X-Worker-Token": "wrong"},
         ).status_code == 401
 
     def test_valid_token_reaches(self, auth_client):
         assert auth_client.get(
             "/api/admin/shadow-cohort/maturation-plan",
-            params={"experiment_code": "wyckoff_v2_vs_baseline"},
+            params={"experiment_code": "wyckoff_v2_vs_baseline", "cohort_scope": "campaign"},
             headers={"X-Worker-Token": "unit-test-token"},
         ).status_code == 200
 
@@ -439,7 +585,7 @@ class TestAuthAndAuditMode:
         try:
             client = TestClient(app, raise_server_exceptions=False)
             resp = client.get("/api/admin/shadow-cohort/maturation-plan",
-                              params={"experiment_code": "wyckoff_v2_vs_baseline"})
+                              params={"experiment_code": "wyckoff_v2_vs_baseline", "cohort_scope": "campaign"})
             assert resp.status_code == 200
         finally:
             app.dependency_overrides.pop(get_worker_token, None)
@@ -462,7 +608,7 @@ class TestAuthAndAuditMode:
         try:
             client = TestClient(app, raise_server_exceptions=False)
             resp = client.get("/api/admin/shadow-cohort/maturation-plan",
-                              params={"experiment_code": "wyckoff_v2_vs_baseline"})
+                              params={"experiment_code": "wyckoff_v2_vs_baseline", "cohort_scope": "campaign"})
             assert resp.status_code == 409
             assert resp.json()["detail"]["error"] == "maturation_plan_not_ready"
         finally:

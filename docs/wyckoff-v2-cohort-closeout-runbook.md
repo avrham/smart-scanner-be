@@ -194,6 +194,62 @@ Recommended order when both are needed: (1) normal eligible maturation →
 (2) read-only plan/closeout → (3) targeted `include_recalc` retry →
 (4) final read-only plan/closeout, re-checking the manifest hash.
 
+### Cohort scope: `campaign` vs `experiment` (REQUIRED)
+
+`GET /api/admin/shadow-cohort/maturation-plan` now REQUIRES an explicit
+`cohort_scope` (omitting it returns 422 — the endpoint never silently
+reinterprets a bare call as the executable manifest). Two deliberately-limited
+values:
+
+```bash
+# The EXECUTABLE campaign maturation manifest (campaign-linked records only):
+GET .../maturation-plan?experiment_code=wyckoff_v2_vs_baseline&cohort_scope=campaign
+# The broad read-only experiment-evidence view (manual/legacy records included):
+GET .../maturation-plan?experiment_code=wyckoff_v2_vs_baseline&cohort_scope=experiment
+```
+
+**Experiment evidence and campaign evidence are different scopes.** A pair is
+*campaign-linked* only when at least one persisted linked run carries a VALID
+`telemetry.campaign` block — validated on `campaign_id`, `experiment_code`
+(must match the cohort experiment) and `as_of_date`. Campaign membership is
+NEVER inferred from symbol, snapshot date, nearby campaigns, requested-symbol
+overlap, run creation time, or strategy identity alone. A pair legitimately
+linked to more than one campaign is kept ONCE in the manifest with all campaign
+ids reported — cross-campaign reuse is not a blocker.
+
+`cohort_scope=campaign` excludes valid manual `/shadow-run` records and legacy
+non-campaign evidence into a separate `excluded_non_campaign_evidence` block —
+those records remain fully visible for audit, are never deleted or relabelled,
+and never block campaign maturation. Only *campaign-intended* pairs whose
+telemetry is invalid/ambiguous (`campaign_conflicting_eligible_count > 0`) block
+the campaign scope. `cohort_scope=experiment` keeps every eligible pair and
+therefore stays `safe_to_execute=false` while any non-campaign membership
+exists; it must NOT be used as the execution manifest.
+
+**Why the old 329-pair manifest is invalid for campaign execution.** The two
+manual AAPL/MSFT pairs (`62438e8b-…` and `fb01b6d2-…`, snapshot 2026-07-23,
+classified `manual_non_campaign_shadow_run` by the lineage audit) are valid
+experiment evidence with no campaign telemetry by design. The old
+experiment-wide 329 manifest mixed them in and was `safe_to_execute=false`; its
+v1 hash `sha256:65eb5471…` no longer describes any executable manifest. The
+campaign scope excludes exactly those two → a **327-pair** manifest with a new
+scope-stamped v2 hash.
+
+**Requesting every page and verifying.** Page with `limit`≤500 and `offset`;
+page until `has_more=false`; assert the combined unique `pair_id` count equals
+`manifest_total` == `campaign_eligible_unmatured_count`. The `manifest_hash`
+(`shadow_maturation_manifest_hash.v2`) includes the scope, is identical across
+page sizes, and differs between `campaign` and `experiment` scopes so the two
+manifests can never be confused. Excluded non-campaign records never affect the
+campaign manifest hash. Record the new hash before any maturation and re-check
+it after.
+
+`pending=true` remains FORBIDDEN (it is not cohort-isolated — see below).
+Normal eligible maturation and the `include_recalc` retry remain separate. The
+execution prerequisites (a write-capable maintenance environment with a bounded
+write role, a Massive credential, scheduler disabled, a mutation-route
+allowlist, worker-token auth, and the recorded manifest hash) remain UNBUILT.
+
 ## 2. Bounded maturation of the eligible outcomes
 
 Maturation is the EXISTING endpoint (do not re-implement it):

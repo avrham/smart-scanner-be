@@ -1845,17 +1845,27 @@ async def shadow_cohort_maturation_plan(
     campaign_id: Optional[str] = None,
     min_snapshot_date: Optional[str] = None,
     max_snapshot_date: Optional[str] = None,
+    cohort_scope: Optional[str] = None,
     limit: int = 500,
     offset: int = 0,
     duplicate_focus: Optional[str] = None,
 ):
     """Read-only bounded maturation PLAN for an existing shadow cohort.
 
-    Produces the COMPLETE, deterministically ordered, paginated manifest of
-    every eligible-but-unmatured pair (the truncation-free superset of what the
-    closeout only samples), a SEPARATE retry plan for retryable failures,
-    per-record attribution of duplicate (symbol, session) groups, campaign-
-    membership verification and a stable manifest hash — then proves whether a
+    `cohort_scope` is REQUIRED and selects the cohort:
+      * `campaign`   — only campaign-linked eligible pairs (each with a valid
+        persisted `telemetry.campaign` block): the EXECUTABLE maturation
+        manifest. Manual/legacy non-campaign evidence is reported under
+        `excluded_non_campaign_evidence` and never blocks.
+      * `experiment` — every eligible pair (manual/legacy included): the broad
+        read-only experiment-evidence view. It stays `safe_to_execute=false`
+        while any eligible pair lacks verifiable campaign membership and must
+        NOT be used as the execution manifest.
+
+    Produces the COMPLETE, deterministically ordered, paginated manifest for the
+    chosen scope, a SEPARATE retry plan for retryable failures, per-record
+    attribution of duplicate (symbol, session) groups, campaign-membership
+    verification and a scope-stamped stable manifest hash — then proves whether a
     later bounded maturation run is safe to execute.
 
     It is strictly read-only: it never matures, never recalculates, never calls
@@ -1869,9 +1879,28 @@ async def shadow_cohort_maturation_plan(
         filters_for_response,
     )
     from app.workers.shadow.maturation_plan import (
+        COHORT_SCOPES,
         MAX_PAGE_LIMIT,
         build_maturation_plan,
     )
+
+    # cohort_scope is explicit and required — never silently reinterpret the
+    # legacy experiment-wide default as the executable campaign manifest.
+    if cohort_scope is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "cohort_scope is required and must be one of "
+                f"{list(COHORT_SCOPES)}: 'campaign' is the executable maturation "
+                "manifest (campaign-linked records only); 'experiment' is the "
+                "broad read-only experiment-evidence view"
+            ),
+        )
+    if cohort_scope not in COHORT_SCOPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"cohort_scope must be one of {list(COHORT_SCOPES)}",
+        )
 
     # Bounded-scope guard: identical to closeout — an operational cohort is
     # never "all history for a strategy".
@@ -1940,8 +1969,28 @@ async def shadow_cohort_maturation_plan(
             str(r["id"]): (str(r["origin_run_id"]) if r["origin_run_id"] else None)
             for r in run_rows
         }
+        # Per-pair campaign telemetry blocks from EVERY linked run (read-only,
+        # already-granted relations). Campaign membership is decided ONLY from
+        # persisted telemetry, never from symbol/date/overlap.
+        from app.workers.shadow.persistence import _maybe_json
+
+        block_rows = await db.fetch(
+            "SELECT rp.pair_id AS pair_id, r.telemetry->'campaign' AS campaign "
+            "FROM strategy_shadow_run_pairs rp "
+            "JOIN strategy_shadow_runs r ON r.id = rp.run_id "
+            "WHERE rp.pair_id = ANY($1::uuid[]) "
+            "AND r.telemetry->'campaign' IS NOT NULL",
+            pair_ids,
+        )
+        blocks_by_pair: dict = {}
+        for br in block_rows:
+            block = _maybe_json(br["campaign"])
+            if isinstance(block, dict):
+                blocks_by_pair.setdefault(str(br["pair_id"]), []).append(block)
         for record in records:
-            record["run_id"] = run_by_pair.get(str(record.get("pair_id")))
+            rpid = str(record.get("pair_id"))
+            record["run_id"] = run_by_pair.get(rpid)
+            record["campaign_blocks"] = blocks_by_pair.get(rpid, [])
 
     focus_keys = (
         [k.strip().upper() for k in duplicate_focus.split(",") if k.strip()]
@@ -1950,6 +1999,7 @@ async def shadow_cohort_maturation_plan(
     plan = build_maturation_plan(
         records,
         outcome_rows,
+        cohort_scope=cohort_scope,
         applied_filters=filters_for_response(filters),
         session_dates=session_dates,
         latest_completed_session=latest,
