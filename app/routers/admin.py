@@ -2351,10 +2351,11 @@ async def shadow_maintenance_execute(
         provider = get_market_data_provider()
         logger.info("[MAINT] executing %s (%d pairs, include_recalc=%s)",
                     batch_identity, len(validated), include_recalc)
+        # The service is synchronous by construction (no run_in_background arg);
+        # we deliberately never use background mode for maintenance execution.
         summary = await run_shadow_outcome_calculation(
             provider, pair_ids=validated, symbols=None, run_id=None, pending=False,
-            limit=len(validated), include_recalc=include_recalc,
-            run_in_background=False)
+            limit=len(validated), include_recalc=include_recalc)
         after = await db.fetch(
             "SELECT pair_id, outcome_status, error_code FROM "
             "strategy_shadow_pair_outcomes WHERE pair_id = ANY($1::uuid[])", validated)

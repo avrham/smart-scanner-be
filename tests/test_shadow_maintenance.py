@@ -399,6 +399,48 @@ class TestExecuteHttp:
         finally:
             _teardown()
 
+    def test_reaches_calc_service_with_valid_kwargs(self, monkeypatch):
+        # Drive the real service-call path (pairs NOT complete) with a stub that
+        # mirrors run_shadow_outcome_calculation's EXACT signature — a bad kwarg
+        # (e.g. run_in_background) would raise TypeError and fail this test.
+        plan = _build_plan(25)
+        called = {}
+
+        async def stub(provider, *, pair_ids=None, symbols=None, run_id=None,
+                       pending=False, limit=None, include_recalc=False,
+                       outcome_run_id=None, now_utc=None):
+            called["pair_ids"] = pair_ids
+            called["include_recalc"] = include_recalc
+            called["limit"] = limit
+            return {"status": "completed", "outcome_run_id": "run-x"}
+
+        class _Provider:  # a real-looking provider object (never network)
+            name = "massive"
+
+        monkeypatch.setattr(admin_mod.settings, "MAINTENANCE_ONLY_MODE", True)
+        monkeypatch.setattr(settings, "MAINTENANCE_ONLY_MODE", True)
+        monkeypatch.setattr(admin_mod.settings, "MAINTENANCE_LOCKED_COHORT_HASH",
+                            plan["cohort_lock_hash"])
+        app.dependency_overrides[get_worker_token] = lambda: "t"
+        app.dependency_overrides[get_db] = lambda: _FakeConn(statuses={})  # none complete
+        monkeypatch.setattr(admin_mod, "get_market_data_provider", lambda: _Provider())
+        monkeypatch.setattr(
+            "app.workers.shadow.outcomes.service.run_shadow_outcome_calculation", stub)
+
+        async def fake_plan(db, *, experiment_code, cohort_scope, batch_size=None):
+            return plan
+        monkeypatch.setattr(admin_mod, "_recompute_maintenance_plan", fake_plan)
+        try:
+            r = TestClient(app, raise_server_exceptions=False).post(
+                "/api/admin/shadow-maintenance/outcomes/execute", json=_v2_normal_req(plan))
+            assert r.status_code == 200, r.json()
+            assert r.json()["status"] == "executed"
+            assert called["include_recalc"] is False
+            assert called["pair_ids"] == plan["next_batch"]["pair_ids"]
+        finally:
+            app.dependency_overrides.pop(get_worker_token, None)
+            app.dependency_overrides.pop(get_db, None)
+
     def test_already_applied_replay_without_provider(self, monkeypatch):
         plan = _build_plan(25)
         batch = plan["next_batch"]["pair_ids"]
