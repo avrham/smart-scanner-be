@@ -219,8 +219,10 @@ def evaluate_maintenance_access(
         reasons.append("scheduler_enabled")
     if not maintenance_only_mode:
         reasons.append("maintenance_only_mode_disabled")
-    if max_batch_size != 10:
-        reasons.append(f"unexpected_max_batch_size:{max_batch_size}")
+    # Bounded batch size: 1..10 (the hard cap is 10; a reduced pilot size like 1
+    # is valid and must not block readiness).
+    if not (1 <= max_batch_size <= 10):
+        reasons.append(f"max_batch_size_out_of_range:{max_batch_size}")
     if mutation_route_count != 1:
         reasons.append(f"unexpected_mutation_route_count:{mutation_route_count}")
 

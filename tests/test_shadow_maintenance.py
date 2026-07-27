@@ -155,6 +155,16 @@ class TestAccessCheckLockedHash:
         r = _evaluate(current_cohort_lock_hash=None)
         assert "cohort_lock_unverifiable" in r["reasons"]
 
+    def test_reduced_batch_size_1_is_ready(self):
+        r = _evaluate(max_batch_size=1)
+        assert r["ready_for_maintenance_execution"] is True, r["reasons"]
+        assert r["max_batch_size"] == 1
+
+    def test_batch_size_over_cap_blocks(self):
+        r = _evaluate(max_batch_size=50)
+        assert r["ready_for_maintenance_execution"] is False
+        assert any("max_batch_size_out_of_range" in x for x in r["reasons"])
+
 
 class TestRegressionFixedHashFlaw:
     """Step 2: prove the ORIGINAL fixed-hash / fixed-batch-index protocol cannot
