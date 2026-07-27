@@ -456,6 +456,27 @@ class TestCampaignScopeSemantics:
         assert status == 422
 
 
+class TestCohortLockProgressionReal:
+    def test_stable_lock_and_dynamic_remaining(self, pg):
+        _, body = _plan(pg, "exp_clean", cohort_scope="campaign", limit=500)
+        # cohort = all campaign-verifiable pairs (8 eligible + 1 matured + 1 not_yet)
+        assert body["cohort_pair_count"] == 10
+        assert body["remaining_pair_count"] == 8
+        assert body["cohort_lock_hash"].startswith("sha256:")
+        assert body["cohort_lock_hash"] != body["remaining_manifest_hash"]
+        assert body["normal_execution_complete"] is False
+        nb = body["next_batch"]
+        assert nb["available"] is True and nb["pair_count"] == 8
+        assert nb["next_batch_hash"].startswith("sha256:")
+
+    def test_cohort_lock_stable_across_scopes_experiment_has_more(self, pg):
+        _, camp = _plan(pg, "exp_clean", cohort_scope="campaign", limit=500)
+        _, exp = _plan(pg, "exp_clean", cohort_scope="experiment", limit=500)
+        # cohort lock (campaign-membership) is identical regardless of scope
+        assert camp["cohort_lock_hash"] == exp["cohort_lock_hash"]
+        assert camp["cohort_pair_count"] == exp["cohort_pair_count"] == 10
+
+
 class TestReadOnlyAndAccess:
     def test_access_is_audit_reader(self, pg):
         async def drive():

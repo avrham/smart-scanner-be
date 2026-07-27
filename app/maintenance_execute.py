@@ -24,7 +24,7 @@ import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 
-EXECUTE_CONTRACT_VERSION = "shadow_maintenance_execute.v1"
+EXECUTE_CONTRACT_VERSION = "shadow_maintenance_execute.v2"
 MODE_NORMAL = "normal"
 MODE_RETRY = "retry"
 RETRYABLE_ERROR_CODE = "forward_fetch_error"
@@ -34,10 +34,12 @@ RETRYABLE_ERROR_CODE = "forward_fetch_error"
 # is session-scoped on the request connection and always released in `finally`.
 MAINTENANCE_ADVISORY_LOCK_KEY = 0x53484144  # 'SHAD' → 1397244228
 
-# Request fields a caller may NEVER supply (broadening / unsafe selectors).
+# Request fields a caller may NEVER supply (broadening / unsafe selectors, or
+# the deprecated v1 fixed batch-index into the shrinking manifest).
 FORBIDDEN_REQUEST_FIELDS = (
     "pending", "symbols", "run_id", "run_ids", "campaign_id", "campaign_ids",
     "run_in_background", "include_recalc", "strategy_code", "strategy_version",
+    "batch_index", "manifest_hash",  # v1 progression fields — no longer accepted
 )
 
 
@@ -88,8 +90,15 @@ def validate_normal(
     allowed_experiment: str,
     allowed_scope: str,
     max_batch_size: int,
+    locked_cohort_hash: Optional[str],
 ) -> Dict[str, Any]:
-    """Validate a normal-mode batch against the live campaign plan."""
+    """Validate a v2 normal-mode batch against the live plan.
+
+    Progression is driven by the STABLE cohort lock + the DYNAMIC remaining
+    manifest + the deterministic next-batch slice — never a fixed batch index
+    into the shrinking manifest. All three hashes must match the recomputed
+    plan, and the supplied pair_ids must be exactly the current next batch.
+    """
     forbidden = _reject_forbidden(request)
     if forbidden:
         return _fail(forbidden)
@@ -110,25 +119,31 @@ def validate_normal(
     if (plan.get("applied_filters") or {}).get("experiment_code") != allowed_experiment:
         return _fail("plan_experiment_mismatch")
 
-    manifest_hash = plan.get("manifest_hash")
-    if request.get("manifest_hash") != manifest_hash:
-        return _fail("manifest_hash_mismatch")
+    # ---- stable cohort lock ------------------------------------------------ #
+    cohort_lock_hash = plan.get("cohort_lock_hash")
+    if not (locked_cohort_hash or "").strip():
+        return _fail("locked_cohort_hash_not_configured")
+    if cohort_lock_hash != locked_cohort_hash:
+        return _fail("cohort_lock_drift")
+    if request.get("cohort_lock_hash") != cohort_lock_hash:
+        return _fail("cohort_lock_hash_mismatch")
 
+    # ---- dynamic remaining manifest ---------------------------------------- #
+    remaining_hash = plan.get("remaining_manifest_hash")
+    if request.get("remaining_manifest_hash") != remaining_hash:
+        return _fail("remaining_manifest_hash_mismatch")
     entries = plan.get("eligible_manifest") or []
-    manifest_total = plan.get("manifest_total")
-    if len(entries) != manifest_total:
-        # the endpoint must recompute the FULL manifest (unpaginated)
-        return _fail("manifest_not_complete")
-    if manifest_total != plan.get("campaign_eligible_unmatured_count"):
-        return _fail("manifest_count_mismatch")
+    remaining_total = plan.get("remaining_pair_count")
+    if len(entries) != remaining_total:
+        return _fail("manifest_not_complete")  # endpoint must recompute unpaginated
 
-    batch_index = request.get("batch_index")
-    if not isinstance(batch_index, int) or batch_index < 0:
-        return _fail("bad_batch_index")
-    total_batches = (manifest_total + max_batch_size - 1) // max_batch_size
-    if batch_index >= total_batches:
-        return _fail("batch_index_out_of_range")
-
+    # ---- exact next batch -------------------------------------------------- #
+    nb = plan.get("next_batch") or {}
+    if not nb.get("available"):
+        return _fail("no_next_batch")
+    if request.get("next_batch_hash") != nb.get("next_batch_hash"):
+        return _fail("next_batch_hash_mismatch")
+    expected_ids = list(nb.get("pair_ids") or [])
     pair_ids = request.get("pair_ids")
     if not isinstance(pair_ids, list) or not pair_ids:
         return _fail("pair_ids_required")
@@ -138,11 +153,8 @@ def validate_normal(
         return _fail("batch_size_out_of_range")
     if request.get("limit") != len(pair_ids):
         return _fail("limit_must_equal_pair_count")
-
-    expected = expected_batch_slice(entries, batch_index, max_batch_size)
-    if list(pair_ids) != expected:
-        # exact set AND order must match the server-computed slice
-        return _fail("pair_ids_not_expected_batch_slice")
+    if list(pair_ids) != expected_ids:
+        return _fail("pair_ids_not_expected_next_batch")
 
     excluded = {r["pair_id"] for r in
                 (plan.get("excluded_non_campaign_evidence") or {}).get("records", [])}
@@ -152,16 +164,13 @@ def validate_normal(
                  (plan.get("retry_plan") or {}).get("entries", [])}
     if set(pair_ids) & retry_ids:
         return _fail("pair_in_retry_plan")
-
-    manifest_ids = {e["pair_id"] for e in entries}
-    if not set(pair_ids).issubset(manifest_ids):
+    if not set(pair_ids).issubset({e["pair_id"] for e in entries}):
         return _fail("pair_not_in_manifest")
 
     return {
         "ok": True, "reason": None, "validated_pair_ids": list(pair_ids),
         "include_recalc": False,
-        "batch_identity": safe_batch_identity(
-            manifest_hash, MODE_NORMAL, batch_index, pair_ids),
+        "batch_identity": nb.get("next_batch_hash"),
     }
 
 
@@ -171,12 +180,10 @@ def validate_retry(
     *,
     allowed_experiment: str,
     allowed_scope: str,
+    locked_cohort_hash: Optional[str],
 ) -> Dict[str, Any]:
-    """Validate a retry-mode request against the live retry plan.
-
-    (Contract implemented + tested; retry execution is NOT run in the
-    environment-readiness task.)
-    """
+    """Validate a v2 retry-mode request. Only permitted once normal execution is
+    complete; the stable cohort lock must still match. (Not run in this task.)"""
     forbidden = _reject_forbidden(request)
     if forbidden:
         return _fail(forbidden)
@@ -188,6 +195,18 @@ def validate_retry(
         return _fail("experiment_not_allowed")
     if request.get("cohort_scope") != allowed_scope:
         return _fail("cohort_scope_not_allowed")
+
+    # retry only after ALL normal campaign pairs are matured
+    if not plan.get("normal_execution_complete"):
+        return _fail("normal_execution_not_complete")
+
+    cohort_lock_hash = plan.get("cohort_lock_hash")
+    if not (locked_cohort_hash or "").strip():
+        return _fail("locked_cohort_hash_not_configured")
+    if cohort_lock_hash != locked_cohort_hash:
+        return _fail("cohort_lock_drift")
+    if request.get("cohort_lock_hash") != cohort_lock_hash:
+        return _fail("cohort_lock_hash_mismatch")
 
     retry_plan = plan.get("retry_plan") or {}
     if request.get("retry_plan_hash") != retry_plan.get("retry_plan_hash"):

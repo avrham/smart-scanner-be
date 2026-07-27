@@ -276,7 +276,10 @@ class TestAccessCheckAndAuditUnchanged:
                         connection_mode="maintenance_explicit", provider="massive",
                         provider_credential_configured=True, scheduler_enabled=False,
                         maintenance_only_mode=True, max_batch_size=10,
-                        mutation_route_count=1)
+                        mutation_route_count=1,
+                        locked_cohort_hash="sha256:LOCK",
+                        current_cohort_lock_hash="sha256:LOCK",
+                        cohort_pair_count=0)
             finally:
                 await c.close()
         r = asyncio.run(drive())

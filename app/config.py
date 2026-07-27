@@ -111,6 +111,11 @@ class Settings(BaseSettings):
     MAINTENANCE_ALLOWED_COHORT_SCOPE: str = "campaign"
     # Hard cap on a single bounded execution batch (never exceeded server-side).
     MAINTENANCE_MAX_BATCH_SIZE: int = 10
+    # STABLE campaign-cohort membership lock (a sha256:... value). Required for
+    # ready_for_maintenance_execution; compared against the recomputed cohort
+    # lock hash (NEVER the dynamic remaining hash). Empty by default; installed
+    # as a Fly secret / runtime value after independent audit verification.
+    MAINTENANCE_LOCKED_COHORT_HASH: str = ""
 
     SCAN_BATCH_SIZE: int = 150
     SCAN_TIMES: List[str] = ["10:00", "14:00", "18:00"]  # UTC times

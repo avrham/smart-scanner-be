@@ -2088,7 +2088,8 @@ def _require_maintenance_mode():
         raise HTTPException(status_code=404, detail="Not Found")
 
 
-async def _recompute_maintenance_plan(db, *, experiment_code, cohort_scope):
+async def _recompute_maintenance_plan(db, *, experiment_code, cohort_scope,
+                                      batch_size=None):
     """Recompute the COMPLETE campaign maturation plan with the maintenance
     identity — the same read the audit planner produces. Read-only."""
     from app.workers.shadow.evidence_review import (
@@ -2128,12 +2129,14 @@ async def _recompute_maintenance_plan(db, *, experiment_code, cohort_scope):
             rpid = str(record.get("pair_id"))
             record["run_id"] = run_by_pair.get(rpid)
             record["campaign_blocks"] = blocks_by_pair.get(rpid, [])
+    kw = {} if batch_size is None else {"batch_size": batch_size}
     return build_maturation_plan(
         records, outcome_rows, cohort_scope=cohort_scope,
         applied_filters=filters_for_response(filters),
         session_dates=session_dates, latest_completed_session=latest,
         page_limit=MAX_RECORD_LIMIT, page_offset=0,
         records_possibly_truncated=(len(records) >= MAX_RECORD_LIMIT),
+        **kw,
     )
 
 
@@ -2153,6 +2156,18 @@ async def shadow_maintenance_access_check(
 
     provider = (settings.MARKET_DATA_PROVIDER or "").lower()
     credential = bool((settings.MASSIVE_API_KEY or "").strip()) if provider == "massive" else False
+    # Recompute the STABLE cohort lock hash (read-only) so the configured lock
+    # can be verified. Never derived from the dynamic remaining manifest.
+    current_lock = None
+    cohort_pair_count = None
+    try:
+        plan = await _recompute_maintenance_plan(
+            db, experiment_code=settings.MAINTENANCE_ALLOWED_EXPERIMENT_CODE,
+            cohort_scope=settings.MAINTENANCE_ALLOWED_COHORT_SCOPE)
+        current_lock = plan.get("cohort_lock_hash")
+        cohort_pair_count = plan.get("cohort_pair_count")
+    except Exception:
+        current_lock = None  # evaluate() flags cohort_lock_unverifiable
     return await run_maintenance_access_check(
         db,
         expected_role=(settings.MAINTENANCE_EXPECTED_DB_ROLE or None),
@@ -2163,6 +2178,9 @@ async def shadow_maintenance_access_check(
         maintenance_only_mode=settings.MAINTENANCE_ONLY_MODE,
         max_batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE,
         mutation_route_count=1,
+        locked_cohort_hash=(settings.MAINTENANCE_LOCKED_COHORT_HASH or None),
+        current_cohort_lock_hash=current_lock,
+        cohort_pair_count=cohort_pair_count,
     )
 
 
@@ -2178,36 +2196,42 @@ async def shadow_maintenance_preflight(
     _require_maintenance_mode()
     exp = settings.MAINTENANCE_ALLOWED_EXPERIMENT_CODE
     scope = settings.MAINTENANCE_ALLOWED_COHORT_SCOPE
-    plan = await _recompute_maintenance_plan(db, experiment_code=exp, cohort_scope=scope)
+    plan = await _recompute_maintenance_plan(
+        db, experiment_code=exp, cohort_scope=scope,
+        batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE)
     planning = plan["planning"]
+    locked = (settings.MAINTENANCE_LOCKED_COHORT_HASH or "").strip()
+    locked_matches = bool(locked) and locked == plan["cohort_lock_hash"]
     return {
-        "contract_version": "shadow_maintenance_preflight.v1",
+        "contract_version": "shadow_maintenance_preflight.v2",
         "experiment_code": exp,
         "cohort_scope": scope,
-        "manifest_count": plan["manifest_total"],
-        "manifest_hash": plan["manifest_hash"],
-        "manifest_hash_version": plan["manifest_hash_version"],
-        "manifest_ordering": plan["manifest_ordering"],
+        # STABLE cohort-membership lock (outcome-status blind)
+        "cohort_lock_hash": plan["cohort_lock_hash"],
+        "cohort_lock_hash_version": plan["cohort_lock_hash_version"],
+        "cohort_pair_count": plan["cohort_pair_count"],
+        "locked_cohort_hash_configured": bool(locked),
+        "locked_cohort_hash_matches": locked_matches,
+        # DYNAMIC remaining-work manifest (shrinks after each successful batch)
+        "remaining_manifest_hash": plan["remaining_manifest_hash"],
+        "remaining_manifest_hash_version": plan["remaining_manifest_hash_version"],
+        "remaining_pair_count": plan["remaining_pair_count"],
+        "normal_execution_complete": plan["normal_execution_complete"],
+        "next_batch": plan["next_batch"],
+        # retry stays separate
+        "retry_plan_hash": plan["retry_plan"]["retry_plan_hash"],
+        "retryable_failure_count": plan["retryable_failure_count"],
+        "terminal_failure_count": plan["terminal_failure_count"],
+        # context
         "safe_to_execute": planning["safe_to_execute"],
         "blocking_reasons": planning["blocking_reasons"],
         "experiment_eligible_unmatured_count": plan["experiment_eligible_unmatured_count"],
-        "campaign_eligible_unmatured_count": plan["campaign_eligible_unmatured_count"],
         "excluded_non_campaign_count": plan["excluded_non_campaign_eligible_count"],
         "campaign_membership_unverifiable_count": (
             plan["membership"]["campaign_membership_unverifiable_count"]),
-        "retryable_failure_count": plan["retryable_failure_count"],
-        "terminal_failure_count": plan["terminal_failure_count"],
-        "retry_plan_hash": plan["retry_plan"]["retry_plan_hash"],
-        "batch_plan": {
-            "recommended_batch_size": planning["recommended_batch_size"],
-            "recommended_batch_count": planning["recommended_batch_count"],
-            "full_batch_count": planning["full_batch_count"],
-            "final_batch_size": planning["final_batch_size"],
-        },
-        # execution is available only when the live plan proves itself safe; the
-        # operator compares this hash to the recorded locked hash (the execute
-        # route enforces the exact match before any write).
-        "execution_available": bool(planning["safe_to_execute"]),
+        # execution available only when safe AND the stable lock matches
+        "execution_available": bool(planning["safe_to_execute"] and locked_matches
+                                    and plan["next_batch"]["available"]),
     }
 
 
@@ -2232,25 +2256,63 @@ async def shadow_maintenance_execute(
 
     exp = settings.MAINTENANCE_ALLOWED_EXPERIMENT_CODE
     scope = settings.MAINTENANCE_ALLOWED_COHORT_SCOPE
+    locked = (settings.MAINTENANCE_LOCKED_COHORT_HASH or None)
+    logger = logging.getLogger(__name__)
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="request body must be a JSON object")
-    plan = await _recompute_maintenance_plan(db, experiment_code=exp, cohort_scope=scope)
-
     mode = body.get("mode")
-    if mode == MODE_RETRY:
-        verdict = validate_retry(plan, body, allowed_experiment=exp, allowed_scope=scope)
-    else:
-        verdict = validate_normal(
-            plan, body, allowed_experiment=exp, allowed_scope=scope,
-            max_batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE)
+
+    async def _statuses(pair_ids):
+        if not pair_ids:
+            return {}
+        rows = await db.fetch(
+            "SELECT pair_id, outcome_status FROM strategy_shadow_pair_outcomes "
+            "WHERE pair_id = ANY($1::uuid[])", pair_ids)
+        return {str(r["pair_id"]): r["outcome_status"] for r in rows}
+
+    def _validate(p):
+        if mode == MODE_RETRY:
+            return validate_retry(p, body, allowed_experiment=exp,
+                                  allowed_scope=scope, locked_cohort_hash=locked)
+        return validate_normal(p, body, allowed_experiment=exp, allowed_scope=scope,
+                               max_batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE,
+                               locked_cohort_hash=locked)
+
+    plan = await _recompute_maintenance_plan(
+        db, experiment_code=exp, cohort_scope=scope,
+        batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE)
+    verdict = _validate(plan)
+
+    # ---- replay / drift handling when strict validation fails -------------- #
+    REPLAY_REASONS = {"remaining_manifest_hash_mismatch", "next_batch_hash_mismatch",
+                      "pair_ids_not_expected_next_batch", "no_next_batch"}
     if not verdict["ok"]:
+        reason = verdict["reason"]
+        if reason == "cohort_lock_drift":
+            raise HTTPException(status_code=409, detail={
+                "error": "cohort_lock_drift",
+                "detail": "the stable cohort membership changed — investigate; "
+                          "this is NOT an idempotent replay"})
+        if (mode != MODE_RETRY and reason in REPLAY_REASONS
+                and body.get("cohort_lock_hash") == plan.get("cohort_lock_hash")):
+            supplied = [str(p) for p in (body.get("pair_ids") or [])]
+            st = await _statuses(supplied)
+            complete = [p for p in supplied if st.get(p) == "complete"]
+            if supplied and len(complete) == len(supplied):
+                return {"status": "already_applied",
+                        "detail": "this batch already matured; obtain a fresh preflight",
+                        "pairs": [{"pair_id": p, "outcome_status": "complete"}
+                                  for p in supplied]}
+            if complete:
+                raise HTTPException(status_code=409, detail={
+                    "error": "stale_partial_batch",
+                    "detail": "some pairs matured, others not — obtain a fresh preflight"})
         raise HTTPException(status_code=422, detail={
-            "error": "maintenance_validation_failed", "reason": verdict["reason"]})
+            "error": "maintenance_validation_failed", "reason": reason})
 
     validated = verdict["validated_pair_ids"]
     include_recalc = verdict["include_recalc"]
     batch_identity = verdict["batch_identity"]
-    logger = logging.getLogger(__name__)
 
     got_lock = await db.fetchval(
         "SELECT pg_try_advisory_lock($1)", MAINTENANCE_ADVISORY_LOCK_KEY)
@@ -2258,15 +2320,24 @@ async def shadow_maintenance_execute(
         raise HTTPException(status_code=409, detail={
             "error": "maintenance_execution_in_progress", "batch_identity": batch_identity})
     try:
+        # DOUBLE-CHECK under the lock: recompute + re-validate so a preflight/
+        # execution race cannot slip a stale batch past the first check.
+        plan2 = await _recompute_maintenance_plan(
+            db, experiment_code=exp, cohort_scope=scope,
+            batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE)
+        verdict2 = _validate(plan2)
+        if not verdict2["ok"] or verdict2["validated_pair_ids"] != validated:
+            raise HTTPException(status_code=409, detail={
+                "error": "maintenance_plan_changed_under_lock",
+                "reason": verdict2.get("reason"),
+                "detail": "obtain a fresh preflight and retry"})
+
         # Idempotency: inspect current outcome statuses BEFORE any provider call.
-        rows = await db.fetch(
-            "SELECT pair_id, outcome_status FROM strategy_shadow_pair_outcomes "
-            "WHERE pair_id = ANY($1::uuid[])", validated)
-        status_by = {str(r["pair_id"]): r["outcome_status"] for r in rows}
+        status_by = await _statuses(validated)
         complete = [p for p in validated if status_by.get(p) == "complete"]
         if complete and len(complete) == len(validated):
-            return {"status": "already_complete", "batch_identity": batch_identity,
-                    "pairs": [{"pair_id": p, "status": "already_complete",
+            return {"status": "already_applied", "batch_identity": batch_identity,
+                    "pairs": [{"pair_id": p, "status": "already_applied",
                                "outcome_status": "complete", "error_code": None,
                                "created_or_reused": "reused"} for p in validated]}
         if mode != MODE_RETRY and (complete or

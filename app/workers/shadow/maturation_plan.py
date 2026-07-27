@@ -62,6 +62,12 @@ MATURATION_PLAN_CONTRACT_VERSION = "shadow_maturation_plan.v2"
 MANIFEST_HASH_VERSION = "shadow_maturation_manifest_hash.v2"
 RETRY_PLAN_CONTRACT_VERSION = "shadow_maturation_retry_plan.v1"
 DUPLICATE_AUDIT_CONTRACT_VERSION = "shadow_maturation_duplicate_audit.v1"
+# STABLE campaign-cohort membership lock: covers every campaign-linked pair of
+# the cohort regardless of outcome status, so normal/retry writes never change
+# it. Distinct from the DYNAMIC remaining-work manifest hash (which shrinks as
+# pairs mature). next_batch hash binds the two + the exact first remaining slice.
+COHORT_LOCK_HASH_VERSION = "shadow_maturation_cohort_lock.v1"
+NEXT_BATCH_HASH_VERSION = "shadow_maturation_next_batch.v1"
 
 # Cohort scope (closed vocabulary). `campaign` is the executable maturation
 # cohort (campaign-linked records only); `experiment` is the broader read-only
@@ -223,6 +229,65 @@ def classify_campaign_membership(
     if valid and not conflict:
         return CAMPAIGN_MEMBERSHIP_VERIFIABLE, sorted(valid)
     return CAMPAIGN_MEMBERSHIP_CONFLICTING, sorted(valid)
+
+
+def compute_cohort_lock_hash(
+    cohort_identity: Dict[str, Any], cohort_entries: List[Dict[str, Any]]
+) -> str:
+    """STABLE hash over the campaign-cohort MEMBERSHIP — outcome-status blind.
+
+    Covers every campaign-linked pair of the cohort (complete, pending,
+    retryable — all statuses) by IMMUTABLE identity only, so normal/retry
+    outcome writes never change it; adding/removing a campaign pair or changing
+    any identity field does. Canonicalized (sorted by pair_id) → page/order
+    independent. Excludes outcome/error/eligibility/session/timestamp state.
+    """
+    canonical = {
+        "hash_version": COHORT_LOCK_HASH_VERSION,
+        "cohort": {
+            "strategy_code": cohort_identity.get("strategy_code"),
+            "experiment_code": cohort_identity.get("experiment_code"),
+        },
+        "entries": sorted(
+            (
+                {
+                    "pair_id": e["pair_id"],
+                    "symbol": e["symbol"],
+                    "snapshot_date": e["snapshot_date"],
+                    "experiment_code": e["experiment_code"],
+                    "experiment_version": e.get("experiment_version"),
+                    "strategy_code": e["strategy_code"],
+                    "strategy_version": e["strategy_version"],
+                    "decision_policy_version": e.get("decision_policy_version"),
+                    "config_hash": e.get("config_hash"),
+                    "campaign_ids": sorted(str(c) for c in (e.get("campaign_ids") or [])),
+                }
+                for e in cohort_entries
+            ),
+            key=lambda x: str(x["pair_id"]),
+        ),
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def compute_next_batch_hash(
+    cohort_lock_hash: str, remaining_manifest_hash: str,
+    pair_ids: List[str], batch_size: int, mode: str = "normal",
+) -> str:
+    """Deterministic identity of the exact next slice: binds the stable cohort
+    lock, the dynamic remaining hash, the ordered slice pair_ids, the batch size
+    and the mode — NOT a long-lived index into the shrinking manifest."""
+    canonical = {
+        "hash_version": NEXT_BATCH_HASH_VERSION,
+        "cohort_lock_hash": cohort_lock_hash,
+        "remaining_manifest_hash": remaining_manifest_hash,
+        "mode": mode,
+        "batch_size": int(batch_size),
+        "pair_ids": [str(p) for p in pair_ids],  # order-significant (the slice)
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def compute_retry_plan_hash(
@@ -418,6 +483,7 @@ def build_maturation_plan(
     page_offset: int = 0,
     records_possibly_truncated: bool = False,
     duplicate_focus: Optional[List[str]] = None,
+    batch_size: int = RECOMMENDED_MATURATION_BATCH_SIZE,
 ) -> Dict[str, Any]:
     """Build the complete, paginated, hash-stamped maturation plan. PURE.
 
@@ -440,6 +506,9 @@ def build_maturation_plan(
     records_by_group: Dict[str, List[Dict[str, Any]]] = {}
     pair_id_counts: Dict[str, int] = {}
     campaign_id_set = {str(c) for c in (campaign_ids or []) if c}
+    # STABLE cohort-lock membership: EVERY campaign-verifiable pair regardless of
+    # outcome status, deduped by pair_id (immutable identity only).
+    cohort_lock_by_pair: Dict[str, Dict[str, Any]] = {}
     terminal_count = 0
     missing_session_count = 0
 
@@ -479,6 +548,20 @@ def build_maturation_plan(
         records_by_group.setdefault(key, []).append(record)
 
         membership, valid_cids = _membership_of(record)
+
+        # Stable cohort membership: any campaign-verifiable pair, ALL statuses.
+        if membership == CAMPAIGN_MEMBERSHIP_VERIFIABLE and pid is not None:
+            cohort_lock_by_pair[pid] = {
+                "pair_id": view["pair_id"], "symbol": view["symbol"],
+                "snapshot_date": view["snapshot_date"],
+                "experiment_code": view["experiment_code"],
+                "experiment_version": view["experiment_version"],
+                "strategy_code": view["strategy_code"],
+                "strategy_version": view["strategy_version"],
+                "decision_policy_version": view["decision_policy_version"],
+                "config_hash": view["config_hash"],
+                "campaign_ids": valid_cids,
+            }
 
         if state == ELIGIBILITY_ELIGIBLE:
             entry = _manifest_entry(view, state)
@@ -567,6 +650,32 @@ def build_maturation_plan(
     }
     manifest_hash = compute_manifest_hash(
         cohort_identity, manifest_entries, scope=cohort_scope)
+
+    # ---- STABLE cohort lock + DYNAMIC remaining + deterministic next batch --- #
+    cohort_lock_entries = list(cohort_lock_by_pair.values())
+    cohort_lock_hash = compute_cohort_lock_hash(cohort_identity, cohort_lock_entries)
+    cohort_pair_count = len(cohort_lock_entries)
+    # The remaining-work manifest IS this scope's executable manifest (shrinks as
+    # pairs mature); its hash is the same value the v1 field exposed.
+    remaining_manifest_hash = manifest_hash
+    remaining_pair_count = manifest_total
+    normal_execution_complete = (remaining_pair_count == 0)
+    # The next batch is ALWAYS the first deterministic slice of the CURRENT
+    # remaining manifest (never a fixed index into the original shrinking set).
+    batch_size = max(1, int(batch_size))
+    _next_slice = manifest_entries[:batch_size]
+    _next_ids = [e["pair_id"] for e in _next_slice]
+    next_batch = {
+        "available": bool(_next_ids),
+        "pair_count": len(_next_ids),
+        "pair_ids": _next_ids,
+        "ordering": MANIFEST_ORDERING,
+        "next_batch_hash": (
+            compute_next_batch_hash(cohort_lock_hash, remaining_manifest_hash,
+                                    _next_ids, batch_size, mode="normal")
+            if _next_ids else None),
+        "remaining_pair_count_before": remaining_pair_count,
+    }
 
     # ---- safety gate (fail-closed) ----------------------------------------- #
     blocking: List[str] = []
@@ -680,6 +789,17 @@ def build_maturation_plan(
         "manifest_ordering": MANIFEST_ORDERING,
         "manifest_hash_version": MANIFEST_HASH_VERSION,
         "manifest_hash": manifest_hash,
+        # stable cohort-membership lock (outcome-status blind; never changes on
+        # a valid outcome write)
+        "cohort_lock_hash": cohort_lock_hash,
+        "cohort_lock_hash_version": COHORT_LOCK_HASH_VERSION,
+        "cohort_pair_count": cohort_pair_count,
+        # dynamic remaining-work manifest (shrinks after every successful batch)
+        "remaining_manifest_hash": remaining_manifest_hash,
+        "remaining_manifest_hash_version": MANIFEST_HASH_VERSION,
+        "remaining_pair_count": remaining_pair_count,
+        "normal_execution_complete": normal_execution_complete,
+        "next_batch": next_batch,
         # collections
         "eligible_manifest": page,
         "excluded_non_campaign_evidence": excluded_block,
@@ -751,7 +871,11 @@ __all__ = [
     "DUP_IDENTITY_MISMATCH",
     "DUP_UNVERIFIABLE",
     "BLOCKING_DUPLICATE_CLASSES",
+    "COHORT_LOCK_HASH_VERSION",
+    "NEXT_BATCH_HASH_VERSION",
     "compute_manifest_hash",
+    "compute_cohort_lock_hash",
+    "compute_next_batch_hash",
     "compute_retry_plan_hash",
     "classify_duplicate_group",
     "build_maturation_plan",

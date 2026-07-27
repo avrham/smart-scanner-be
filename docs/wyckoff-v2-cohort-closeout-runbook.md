@@ -250,6 +250,55 @@ execution prerequisites (a write-capable maintenance environment with a bounded
 write role, a Massive credential, scheduler disabled, a mutation-route
 allowlist, worker-token auth, and the recorded manifest hash) remain UNBUILT.
 
+### Progressive locked maturation (stable cohort lock vs dynamic remaining)
+
+The initial eligible-manifest hash CANNOT be a fixed execution lock across
+batches: after the first 10 outcomes complete they leave the eligible-unmatured
+set, the count drops 327→317 and the manifest hash changes — so a protocol that
+required the original hash for later batches would stall after batch 0. The
+maintenance protocol therefore separates three identities (all from the same
+pure builder, exposed by the audit planner AND the maintenance preflight):
+
+* **Stable cohort lock** — `cohort_lock_hash` (`shadow_maturation_cohort_lock.v1`),
+  `cohort_pair_count`. Covers EVERY campaign-linked pair of the cohort
+  regardless of outcome status (complete + eligible + retryable ≈ 502), over
+  immutable identity only (`pair_id, symbol, snapshot_date, experiment_code,
+  experiment_version, strategy_code, strategy_version, decision_policy_version,
+  config_hash, sorted campaign_ids`). It NEVER changes on a valid normal/retry
+  outcome write; it changes only if a campaign pair is added/removed or an
+  identity/membership field changes. Excluded manual/non-campaign records never
+  affect it. Installed as the `MAINTENANCE_LOCKED_COHORT_HASH` secret after
+  independent audit verification.
+* **Dynamic remaining manifest** — `remaining_manifest_hash`,
+  `remaining_pair_count`. Only the normal campaign pairs still needing
+  maturation (starts at 327 / `sha256:f8947f83…`). It MUST change after every
+  successful batch: 327 → 317 → … → 0.
+* **Deterministic next batch** — `next_batch` = the first slice of the CURRENT
+  remaining manifest (`snapshot_date_asc_symbol_asc_pair_id_asc`) with
+  `next_batch_hash` over `cohort_lock_hash + remaining_manifest_hash + ordered
+  pair_ids + batch_size + mode`. Fixed `batch_index` into the shrinking manifest
+  is no longer used.
+
+**Every batch requires a FRESH preflight.** The v2 execute request
+(`shadow_maintenance_execute.v2`) carries `cohort_lock_hash` +
+`remaining_manifest_hash` + `next_batch_hash` + the exact current `pair_ids`;
+the server recomputes all three (before AND again under the advisory lock) and
+rejects any drift or arbitrary slice. Progression: preflight → execute the
+returned `next_batch` → preflight again (new remaining hash + new next_batch,
+same cohort lock) → repeat until `normal_execution_complete=true` /
+`next_batch.available=false`.
+
+**Stop on stable cohort drift.** If `cohort_lock_hash` ever differs from the
+recorded `MAINTENANCE_LOCKED_COHORT_HASH`, the access-check/preflight/execute
+report `cohort_lock_drift` — stop and investigate; do NOT overwrite the lock.
+**Replay:** re-sending a just-completed batch (stale remaining/next-batch hash,
+cohort lock unchanged, its pairs now complete) returns `already_applied` with no
+provider call; a partially-complete batch returns 409 `stale_partial_batch`.
+**Retry** (`include_recalc`, server-set) is permitted only once
+`normal_execution_complete=true`, still gated on the stable cohort lock. The
+manifest-hash the audit planner surfaces as `manifest_hash` remains the campaign
+remaining hash (alias of `remaining_manifest_hash`).
+
 ## 2. Bounded maturation of the eligible outcomes
 
 Maturation is the EXISTING endpoint (do not re-implement it):

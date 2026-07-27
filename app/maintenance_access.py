@@ -133,6 +133,9 @@ def evaluate_maintenance_access(
     maintenance_only_mode: bool,
     max_batch_size: int,
     mutation_route_count: int,
+    locked_cohort_hash: Optional[str] = None,
+    current_cohort_lock_hash: Optional[str] = None,
+    cohort_pair_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """PURE verdict from the gathered probes + process configuration."""
     reasons: List[str] = []
@@ -221,6 +224,19 @@ def evaluate_maintenance_access(
     if mutation_route_count != 1:
         reasons.append(f"unexpected_mutation_route_count:{mutation_route_count}")
 
+    # stable cohort lock: must be configured AND match the recomputed cohort
+    # lock hash (never the dynamic remaining hash).
+    locked_configured = bool((locked_cohort_hash or "").strip())
+    locked_matches = (
+        locked_configured and current_cohort_lock_hash is not None
+        and locked_cohort_hash == current_cohort_lock_hash)
+    if not locked_configured:
+        reasons.append("locked_cohort_hash_not_configured")
+    elif current_cohort_lock_hash is None:
+        reasons.append("cohort_lock_unverifiable")
+    elif not locked_matches:
+        reasons.append("cohort_lock_drift")
+
     ready = not reasons
     return {
         "access_check_contract_version": MAINTENANCE_ACCESS_CHECK_CONTRACT_VERSION,
@@ -240,6 +256,10 @@ def evaluate_maintenance_access(
         "maintenance_only_mode": maintenance_only_mode,
         "max_batch_size": max_batch_size,
         "mutation_route_count": mutation_route_count,
+        "locked_cohort_hash_configured": locked_configured,
+        "locked_cohort_hash_matches": locked_matches,
+        "current_cohort_lock_hash": current_cohort_lock_hash,
+        "cohort_pair_count": cohort_pair_count,
         "ready_for_maintenance_execution": ready,
         "reasons": reasons,
     }
@@ -256,6 +276,9 @@ async def run_maintenance_access_check(
     maintenance_only_mode: bool,
     max_batch_size: int,
     mutation_route_count: int,
+    locked_cohort_hash: Optional[str] = None,
+    current_cohort_lock_hash: Optional[str] = None,
+    cohort_pair_count: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Gather read-only capability probes and return the maintenance verdict.
 
@@ -292,6 +315,9 @@ async def run_maintenance_access_check(
         maintenance_only_mode=maintenance_only_mode,
         max_batch_size=max_batch_size,
         mutation_route_count=mutation_route_count,
+        locked_cohort_hash=locked_cohort_hash,
+        current_cohort_lock_hash=current_cohort_lock_hash,
+        cohort_pair_count=cohort_pair_count,
     )
 
 
