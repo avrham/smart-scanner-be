@@ -18,8 +18,8 @@ from typing import Set
 
 # Exact, static paths allowed in audit-only mode. All are read-only:
 #   * revision proof + liveness (public);
-#   * the shadow-cohort audit routes — access-check, closeout and the
-#     maturation-plan (worker-token protected — their own dependencies still
+#   * the shadow-cohort audit routes — access-check, closeout, maturation-plan
+#     and pair-lineage (worker-token protected — their own dependencies still
 #     enforce the token; this gate never bypasses auth).
 AUDIT_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/",
@@ -30,6 +30,7 @@ AUDIT_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/api/admin/shadow-cohort/access-check",
     "/api/admin/shadow-cohort/closeout",
     "/api/admin/shadow-cohort/maturation-plan",
+    "/api/admin/shadow-cohort/pair-lineage",
 })
 
 # Read-only HTTP methods permitted for allowlisted routes (HEAD supported so

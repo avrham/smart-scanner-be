@@ -1962,6 +1962,72 @@ async def shadow_cohort_maturation_plan(
     return plan
 
 
+@router.get("/shadow-cohort/pair-lineage")
+async def shadow_cohort_pair_lineage(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    pair_ids: Optional[str] = None,
+):
+    """Read-only lineage/provenance audit for an explicit bounded set of pairs.
+
+    Joins each requested pair to its evaluations, every linked run (origin +
+    run_pairs), each run's bounded/redacted telemetry (campaign block only —
+    never an unrelated JSON dump), the run's sibling pairs and the outcome
+    status, then deterministically classifies why the pair does or does not
+    carry campaign membership. Requires explicit pair_ids (comma-separated, at
+    most 20); no all-history mode. Strictly read-only: reuses the closeout audit
+    access gate, constructs no provider and issues no mutation SQL.
+    """
+    from app.workers.shadow.pair_lineage import (
+        MAX_LINEAGE_PAIR_IDS,
+        build_pair_lineage,
+        read_pair_lineage,
+    )
+
+    ids = [i.strip() for i in (pair_ids or "").split(",") if i.strip()]
+    if not ids:
+        raise HTTPException(
+            status_code=422,
+            detail="pair_ids is required (comma-separated UUIDs; the lineage "
+                   "audit never scans all history)",
+        )
+    if len(ids) > MAX_LINEAGE_PAIR_IDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"at most {MAX_LINEAGE_PAIR_IDS} pair_ids per request",
+        )
+    seen: set = set()
+    canonical: List[str] = []
+    for i in ids:
+        try:
+            cu = str(uuid.UUID(i))
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=422, detail="pair_ids contains a malformed UUID"
+            )
+        if cu not in seen:
+            seen.add(cu)
+            canonical.append(cu)
+
+    # Same fail-closed readiness gate as closeout/maturation-plan.
+    if settings.AUDIT_ONLY_MODE:
+        access = await _run_configured_access_check(db)
+        if not access["ready_for_closeout_audit"]:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "pair_lineage_not_ready",
+                    "database_connection_mode": access.get(
+                        "database_connection_mode"
+                    ),
+                    "reasons": access["reasons"],
+                },
+            )
+
+    raw = await read_pair_lineage(db, canonical)
+    return build_pair_lineage(raw, canonical)
+
+
 @router.get("/shadow-evidence/readiness")
 async def shadow_evidence_readiness(
     _: str = Depends(get_worker_token),
