@@ -1,0 +1,56 @@
+# fly.maintenance.toml — smart-scanner-be-maintenance
+#
+# SHADOW OUTCOME MAINTENANCE ENVIRONMENT. A separate, short-lived, write-capable
+# app that can later execute ONLY the locked campaign maturation manifest via
+# POST /api/admin/shadow-maintenance/outcomes/execute. It connects through the
+# dedicated least-privilege role smart_scanner_outcome_maintainer (never the
+# audit reader, never the default Supabase identity), runs NO scheduler and NO
+# background work, and exposes exactly one mutation route.
+#
+# The Git SHA is supplied at deploy time via --build-arg APP_GIT_SHA so /version
+# reflects the exact deployed commit. Secrets (MAINTENANCE_DATABASE_URL,
+# MASSIVE_API_KEY, WORKER_TOKEN) are set via `fly secrets set` — never here.
+
+app = 'smart-scanner-be-maintenance'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+# Non-secret, safety-critical maintenance toggles.
+[env]
+  APP_ENVIRONMENT = 'maintenance'
+  MAINTENANCE_ONLY_MODE = 'true'   # expose ONLY liveness + the 3 maintenance routes
+  AUDIT_ONLY_MODE = 'false'        # mutually exclusive with maintenance mode
+  ENABLE_SCHEDULER = 'false'       # never any background work
+  REQUIRE_WORKER_TOKEN = 'true'    # the mutation surface stays protected
+  MARKET_DATA_PROVIDER = 'massive'
+  LOG_FORMAT = 'json'
+  # Non-secret role name the maintenance DSN MUST authenticate as. The actual
+  # MAINTENANCE_DATABASE_URL is a SECRET set via `fly secrets set`.
+  MAINTENANCE_EXPECTED_DB_ROLE = 'smart_scanner_outcome_maintainer'
+  MAINTENANCE_ALLOWED_EXPERIMENT_CODE = 'wyckoff_v2_vs_baseline'
+  MAINTENANCE_ALLOWED_COHORT_SCOPE = 'campaign'
+  MAINTENANCE_MAX_BATCH_SIZE = '10'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  # Health check hits /version (always 200, no DB/provider needed).
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/version'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512

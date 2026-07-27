@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.audit_mode import is_audit_route_allowed
+from app.maintenance_mode import is_maintenance_route_allowed
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
 from app.routers import public, admin, outcomes, shadow
@@ -39,10 +40,27 @@ async def lifespan(app: FastAPI):
             "ENABLE_SCHEDULER=false (audit-only mode never runs background work)"
         )
 
-    # Start scheduler if enabled — never in audit-only mode.
-    if settings.ENABLE_SCHEDULER and not settings.AUDIT_ONLY_MODE:
+    # Maintenance-only mode guards (Shadow Outcome Maintenance Environment):
+    #   * mutually exclusive with audit-only mode;
+    #   * never runs the scheduler / background work.
+    if settings.MAINTENANCE_ONLY_MODE and settings.AUDIT_ONLY_MODE:
+        raise RuntimeError(
+            "invalid configuration: MAINTENANCE_ONLY_MODE and AUDIT_ONLY_MODE "
+            "are mutually exclusive"
+        )
+    if settings.MAINTENANCE_ONLY_MODE and settings.ENABLE_SCHEDULER:
+        raise RuntimeError(
+            "invalid configuration: MAINTENANCE_ONLY_MODE=true requires "
+            "ENABLE_SCHEDULER=false (maintenance mode never runs background work)"
+        )
+
+    # Start scheduler if enabled — never in audit-only or maintenance-only mode.
+    if (settings.ENABLE_SCHEDULER and not settings.AUDIT_ONLY_MODE
+            and not settings.MAINTENANCE_ONLY_MODE):
         start_scheduler()
         logger.info("Scheduler started")
+    elif settings.MAINTENANCE_ONLY_MODE:
+        logger.info("Maintenance-only mode: scheduler and background work disabled")
     elif settings.AUDIT_ONLY_MODE:
         logger.info("Audit-only mode: scheduler and background work disabled")
 
@@ -76,12 +94,18 @@ app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 
 @app.middleware("http")
 async def audit_only_gate(request, call_next):
-    """Reject any non-allowlisted route BEFORE its handler when audit-only mode
-    is on. Blocked routes get a stable 404 (never a healthy handler, never a
-    hint at the allowlist). Allowlisted audit routes still run their own
-    worker-token dependency — this gate never bypasses authentication. When
-    AUDIT_ONLY_MODE is false (the default), every request passes through
-    unchanged."""
+    """Reject any non-allowlisted route BEFORE its handler when audit-only OR
+    maintenance-only mode is on. Blocked routes get a stable 404 (never a
+    healthy handler, never a hint at the allowlist). Allowlisted routes still
+    run their own worker-token dependency — this gate never bypasses
+    authentication. When both modes are false (the default), every request
+    passes through unchanged. Maintenance mode allows exactly one mutation route
+    (POST execute); every other write path — including the generic calculate
+    endpoint — is rejected here before its handler."""
+    if settings.MAINTENANCE_ONLY_MODE and not is_maintenance_route_allowed(
+        request.method, request.url.path
+    ):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if settings.AUDIT_ONLY_MODE and not is_audit_route_allowed(
         request.method, request.url.path
     ):

@@ -34,6 +34,8 @@ ALLOWED_QUERY_PARAMS = ("sslmode", "application_name", "connect_timeout")
 MODE_DEFAULT_SUPABASE = "default_supabase"
 MODE_AUDIT_EXPLICIT = "audit_explicit"
 MODE_AUDIT_UNCONFIGURED = "audit_unconfigured"
+MODE_MAINTENANCE_EXPLICIT = "maintenance_explicit"
+MODE_MAINTENANCE_UNCONFIGURED = "maintenance_unconfigured"
 
 # asyncpg pool kwargs for the AUDIT pool. statement_cache_size=0 disables
 # prepared statements so the pool is safe behind a Supavisor pooler (and
@@ -42,6 +44,15 @@ AUDIT_POOL_KWARGS = {
     "min_size": 1,
     "max_size": 5,
     "command_timeout": 30,
+    "statement_cache_size": 0,
+}
+# Maintenance pool: WRITE-capable (never read-only). statement_cache_size=0 for
+# Supavisor safety; a bounded command_timeout matches the role's server-side
+# statement_timeout so a stuck write can never hang a batch indefinitely.
+MAINTENANCE_POOL_KWARGS = {
+    "min_size": 1,
+    "max_size": 5,
+    "command_timeout": 60,
     "statement_cache_size": 0,
 }
 DEFAULT_POOL_KWARGS = {"min_size": 1, "max_size": 10, "command_timeout": 60}
@@ -54,6 +65,14 @@ class AuditDatabaseError(ValueError):
 
 def _audit_url() -> str:
     return (getattr(settings, "AUDIT_DATABASE_URL", "") or "").strip()
+
+
+def _maintenance_url() -> str:
+    return (getattr(settings, "MAINTENANCE_DATABASE_URL", "") or "").strip()
+
+
+def maintenance_database_configured() -> bool:
+    return bool(_maintenance_url())
 
 
 def validate_audit_database_url(url: str) -> Dict[str, Any]:
@@ -136,6 +155,9 @@ def audit_dsn_diagnostic() -> Dict[str, Any]:
 
 def get_connection_mode() -> str:
     """The selected connection mode (safe to log/report; never the DSN)."""
+    if getattr(settings, "MAINTENANCE_ONLY_MODE", False):
+        return (MODE_MAINTENANCE_EXPLICIT if _maintenance_url()
+                else MODE_MAINTENANCE_UNCONFIGURED)
     if not settings.AUDIT_ONLY_MODE:
         return MODE_DEFAULT_SUPABASE
     return MODE_AUDIT_EXPLICIT if _audit_url() else MODE_AUDIT_UNCONFIGURED
@@ -152,6 +174,18 @@ def select_connection_plan() -> Tuple[str, List[Tuple[str, str]], Dict[str, Any]
     it uses only the explicit audit DSN, or fails closed when none is set.
     """
     from app.deps import build_connection_dsns
+
+    if getattr(settings, "MAINTENANCE_ONLY_MODE", False):
+        raw = _maintenance_url()
+        if not raw:
+            raise AuditDatabaseError(
+                "maintenance database not configured: MAINTENANCE_ONLY_MODE=true "
+                "requires MAINTENANCE_DATABASE_URL (no fallback to the audit or "
+                "default database)"
+            )
+        validate_audit_database_url(raw)  # same DSN validation; raises on invalid
+        return (MODE_MAINTENANCE_EXPLICIT, [("maintenance_explicit", raw)],
+                dict(MAINTENANCE_POOL_KWARGS))
 
     if settings.AUDIT_ONLY_MODE:
         raw = _audit_url()
@@ -176,10 +210,13 @@ __all__ = [
     "MODE_DEFAULT_SUPABASE",
     "MODE_AUDIT_EXPLICIT",
     "MODE_AUDIT_UNCONFIGURED",
+    "MODE_MAINTENANCE_EXPLICIT",
+    "MODE_MAINTENANCE_UNCONFIGURED",
     "AuditDatabaseError",
     "validate_audit_database_url",
     "audit_dsn_diagnostic",
     "get_connection_mode",
     "audit_database_configured",
+    "maintenance_database_configured",
     "select_connection_plan",
 ]

@@ -87,6 +87,31 @@ class Settings(BaseSettings):
     # once AUDIT_DATABASE_URL is set in audit mode; the access-check refuses
     # readiness if current_user differs or is broader.
     AUDIT_EXPECTED_DB_ROLE: str = ""
+
+    # Maintenance-only mode (Shadow Outcome Maintenance Environment). When true,
+    # the app exposes ONLY the maintenance allowlist (revision/liveness + the
+    # three shadow-maintenance routes) and connects through a dedicated
+    # least-privilege WRITE-capable role — never the audit reader, never the
+    # default Supabase identity. Mutually exclusive with AUDIT_ONLY_MODE and
+    # incompatible with ENABLE_SCHEDULER=true. Default false leaves local, test
+    # and normal deployments completely unchanged.
+    MAINTENANCE_ONLY_MODE: bool = False
+    # Explicit maintenance database identity. A COMPLETE PostgreSQL DSN used ONLY
+    # when MAINTENANCE_ONLY_MODE=true (fail closed if absent — never falls back
+    # to AUDIT_DATABASE_URL or the Supabase-derived identity). SECRET: never
+    # logged, never returned by any endpoint, never committed. Supplied via
+    # `fly secrets set`.
+    MAINTENANCE_DATABASE_URL: str = ""
+    # The PostgreSQL role the maintenance connection MUST authenticate as
+    # (current_user must equal this). Required once MAINTENANCE_DATABASE_URL is
+    # set in maintenance mode.
+    MAINTENANCE_EXPECTED_DB_ROLE: str = ""
+    # The single experiment + cohort scope maintenance execution is locked to.
+    MAINTENANCE_ALLOWED_EXPERIMENT_CODE: str = "wyckoff_v2_vs_baseline"
+    MAINTENANCE_ALLOWED_COHORT_SCOPE: str = "campaign"
+    # Hard cap on a single bounded execution batch (never exceeded server-side).
+    MAINTENANCE_MAX_BATCH_SIZE: int = 10
+
     SCAN_BATCH_SIZE: int = 150
     SCAN_TIMES: List[str] = ["10:00", "14:00", "18:00"]  # UTC times
     

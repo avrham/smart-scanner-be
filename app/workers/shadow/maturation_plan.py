@@ -225,6 +225,38 @@ def classify_campaign_membership(
     return CAMPAIGN_MEMBERSHIP_CONFLICTING, sorted(valid)
 
 
+def compute_retry_plan_hash(
+    cohort_identity: Dict[str, Any], retry_entries: List[Dict[str, Any]]
+) -> str:
+    """Deterministic hash over the retryable-failure set's immutable identity.
+
+    Canonicalized (sorted by pair_id) so it is page/order independent; includes
+    the cohort identity and each retryable pair's {pair_id, snapshot_date,
+    current_error_code}. Mutable text/timestamps are never included.
+    """
+    canonical = {
+        "hash_version": MANIFEST_HASH_VERSION,
+        "kind": "retry_plan",
+        "cohort": {
+            "strategy_code": cohort_identity.get("strategy_code"),
+            "experiment_code": cohort_identity.get("experiment_code"),
+        },
+        "entries": sorted(
+            (
+                {
+                    "pair_id": e["pair_id"],
+                    "snapshot_date": e["snapshot_date"],
+                    "current_error_code": e.get("current_error_code"),
+                }
+                for e in retry_entries if e.get("retryable")
+            ),
+            key=lambda x: str(x["pair_id"]),
+        ),
+    }
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def compute_manifest_hash(
     cohort_identity: Dict[str, Any],
     eligible_entries: List[Dict[str, Any]],
@@ -653,6 +685,7 @@ def build_maturation_plan(
         "excluded_non_campaign_evidence": excluded_block,
         "retry_plan": {
             "contract_version": RETRY_PLAN_CONTRACT_VERSION,
+            "retry_plan_hash": compute_retry_plan_hash(cohort_identity, retry_entries),
             "retryable_failure_count": sum(1 for e in retry_entries if e["retryable"]),
             "terminal_failure_count": sum(
                 1 for e in retry_entries if not e["retryable"]),
@@ -719,6 +752,7 @@ __all__ = [
     "DUP_UNVERIFIABLE",
     "BLOCKING_DUPLICATE_CLASSES",
     "compute_manifest_hash",
+    "compute_retry_plan_hash",
     "classify_duplicate_group",
     "build_maturation_plan",
 ]

@@ -2078,6 +2078,229 @@ async def shadow_cohort_pair_lineage(
     return build_pair_lineage(raw, canonical)
 
 
+# --------------------------------------------------------------------------- #
+# Shadow Outcome Maintenance Environment (maintenance-only mode).
+# --------------------------------------------------------------------------- #
+def _require_maintenance_mode():
+    """Maintenance routes only function on the maintenance app; elsewhere they
+    return the stable hidden-route 404 (defence in depth on top of the gate)."""
+    if not settings.MAINTENANCE_ONLY_MODE:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+async def _recompute_maintenance_plan(db, *, experiment_code, cohort_scope):
+    """Recompute the COMPLETE campaign maturation plan with the maintenance
+    identity — the same read the audit planner produces. Read-only."""
+    from app.workers.shadow.evidence_review import (
+        MAX_RECORD_LIMIT,
+        fetch_evidence_records,
+        filters_for_response,
+    )
+    from app.workers.shadow.maturation_plan import build_maturation_plan
+    from app.workers.shadow.persistence import _maybe_json
+
+    filters = _evidence_filters(
+        "wyckoff_mtf_v2", experiment_code, None, None, None, None, None,
+        None, None, None, None, None, None, MAX_RECORD_LIMIT,
+    )
+    records = await fetch_evidence_records(filters)
+    outcome_rows = await _evidence_outcome_rows(filters)
+    session_dates, latest = await _cohort_trading_calendar(records)
+    pair_ids = [str(r["pair_id"]) for r in records if r.get("pair_id")]
+    if pair_ids:
+        run_rows = await db.fetch(
+            "SELECT id, origin_run_id FROM strategy_shadow_pairs "
+            "WHERE id = ANY($1::uuid[])", pair_ids)
+        run_by_pair = {str(r["id"]): (str(r["origin_run_id"]) if r["origin_run_id"]
+                                      else None) for r in run_rows}
+        block_rows = await db.fetch(
+            "SELECT rp.pair_id AS pair_id, r.telemetry->'campaign' AS campaign "
+            "FROM strategy_shadow_run_pairs rp "
+            "JOIN strategy_shadow_runs r ON r.id = rp.run_id "
+            "WHERE rp.pair_id = ANY($1::uuid[]) "
+            "AND r.telemetry->'campaign' IS NOT NULL", pair_ids)
+        blocks_by_pair: dict = {}
+        for br in block_rows:
+            block = _maybe_json(br["campaign"])
+            if isinstance(block, dict):
+                blocks_by_pair.setdefault(str(br["pair_id"]), []).append(block)
+        for record in records:
+            rpid = str(record.get("pair_id"))
+            record["run_id"] = run_by_pair.get(rpid)
+            record["campaign_blocks"] = blocks_by_pair.get(rpid, [])
+    return build_maturation_plan(
+        records, outcome_rows, cohort_scope=cohort_scope,
+        applied_filters=filters_for_response(filters),
+        session_dates=session_dates, latest_completed_session=latest,
+        page_limit=MAX_RECORD_LIMIT, page_offset=0,
+        records_possibly_truncated=(len(records) >= MAX_RECORD_LIMIT),
+    )
+
+
+@router.get("/shadow-maintenance/access-check")
+async def shadow_maintenance_access_check(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Read-only proof the connected identity is EXACTLY the least-privilege
+    outcome-maintenance role and the process is a maintenance-only, Massive-
+    backed, scheduler-disabled, single-mutation-route app. Never mutates, never
+    constructs a provider, never calls Massive; returns only safe capability
+    metadata (no DSN / host / password / API key / token)."""
+    _require_maintenance_mode()
+    from app.audit_db import get_connection_mode
+    from app.maintenance_access import run_maintenance_access_check
+
+    provider = (settings.MARKET_DATA_PROVIDER or "").lower()
+    credential = bool((settings.MASSIVE_API_KEY or "").strip()) if provider == "massive" else False
+    return await run_maintenance_access_check(
+        db,
+        expected_role=(settings.MAINTENANCE_EXPECTED_DB_ROLE or None),
+        connection_mode=get_connection_mode(),
+        provider=provider,
+        provider_credential_configured=credential,
+        scheduler_enabled=settings.ENABLE_SCHEDULER,
+        maintenance_only_mode=settings.MAINTENANCE_ONLY_MODE,
+        max_batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE,
+        mutation_route_count=1,
+    )
+
+
+@router.get("/shadow-maintenance/preflight")
+async def shadow_maintenance_preflight(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Read-only manifest-locked preflight: recomputes the current campaign plan
+    with the SAME identity execution uses, reports the live manifest count/hash,
+    safe_to_execute, the excluded non-campaign records, the separate retry plan
+    and the batch plan. Never writes, never calls Massive."""
+    _require_maintenance_mode()
+    exp = settings.MAINTENANCE_ALLOWED_EXPERIMENT_CODE
+    scope = settings.MAINTENANCE_ALLOWED_COHORT_SCOPE
+    plan = await _recompute_maintenance_plan(db, experiment_code=exp, cohort_scope=scope)
+    planning = plan["planning"]
+    return {
+        "contract_version": "shadow_maintenance_preflight.v1",
+        "experiment_code": exp,
+        "cohort_scope": scope,
+        "manifest_count": plan["manifest_total"],
+        "manifest_hash": plan["manifest_hash"],
+        "manifest_hash_version": plan["manifest_hash_version"],
+        "manifest_ordering": plan["manifest_ordering"],
+        "safe_to_execute": planning["safe_to_execute"],
+        "blocking_reasons": planning["blocking_reasons"],
+        "experiment_eligible_unmatured_count": plan["experiment_eligible_unmatured_count"],
+        "campaign_eligible_unmatured_count": plan["campaign_eligible_unmatured_count"],
+        "excluded_non_campaign_count": plan["excluded_non_campaign_eligible_count"],
+        "campaign_membership_unverifiable_count": (
+            plan["membership"]["campaign_membership_unverifiable_count"]),
+        "retryable_failure_count": plan["retryable_failure_count"],
+        "terminal_failure_count": plan["terminal_failure_count"],
+        "retry_plan_hash": plan["retry_plan"]["retry_plan_hash"],
+        "batch_plan": {
+            "recommended_batch_size": planning["recommended_batch_size"],
+            "recommended_batch_count": planning["recommended_batch_count"],
+            "full_batch_count": planning["full_batch_count"],
+            "final_batch_size": planning["final_batch_size"],
+        },
+        # execution is available only when the live plan proves itself safe; the
+        # operator compares this hash to the recorded locked hash (the execute
+        # route enforces the exact match before any write).
+        "execution_available": bool(planning["safe_to_execute"]),
+    }
+
+
+@router.post("/shadow-maintenance/outcomes/execute")
+async def shadow_maintenance_execute(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...),
+):
+    """The ONE tightly-validated maintenance mutation route. Recomputes the live
+    plan, validates the request against the manifest/retry hash and the exact
+    server-computed batch slice, takes a single advisory lock, enforces
+    idempotency, then reuses the existing outcome-calculation service. NOT
+    invoked during the environment-readiness task."""
+    _require_maintenance_mode()
+    from app.maintenance_execute import (
+        MAINTENANCE_ADVISORY_LOCK_KEY,
+        MODE_RETRY,
+        validate_normal,
+        validate_retry,
+    )
+
+    exp = settings.MAINTENANCE_ALLOWED_EXPERIMENT_CODE
+    scope = settings.MAINTENANCE_ALLOWED_COHORT_SCOPE
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    plan = await _recompute_maintenance_plan(db, experiment_code=exp, cohort_scope=scope)
+
+    mode = body.get("mode")
+    if mode == MODE_RETRY:
+        verdict = validate_retry(plan, body, allowed_experiment=exp, allowed_scope=scope)
+    else:
+        verdict = validate_normal(
+            plan, body, allowed_experiment=exp, allowed_scope=scope,
+            max_batch_size=settings.MAINTENANCE_MAX_BATCH_SIZE)
+    if not verdict["ok"]:
+        raise HTTPException(status_code=422, detail={
+            "error": "maintenance_validation_failed", "reason": verdict["reason"]})
+
+    validated = verdict["validated_pair_ids"]
+    include_recalc = verdict["include_recalc"]
+    batch_identity = verdict["batch_identity"]
+    logger = logging.getLogger(__name__)
+
+    got_lock = await db.fetchval(
+        "SELECT pg_try_advisory_lock($1)", MAINTENANCE_ADVISORY_LOCK_KEY)
+    if not got_lock:
+        raise HTTPException(status_code=409, detail={
+            "error": "maintenance_execution_in_progress", "batch_identity": batch_identity})
+    try:
+        # Idempotency: inspect current outcome statuses BEFORE any provider call.
+        rows = await db.fetch(
+            "SELECT pair_id, outcome_status FROM strategy_shadow_pair_outcomes "
+            "WHERE pair_id = ANY($1::uuid[])", validated)
+        status_by = {str(r["pair_id"]): r["outcome_status"] for r in rows}
+        complete = [p for p in validated if status_by.get(p) == "complete"]
+        if complete and len(complete) == len(validated):
+            return {"status": "already_complete", "batch_identity": batch_identity,
+                    "pairs": [{"pair_id": p, "status": "already_complete",
+                               "outcome_status": "complete", "error_code": None,
+                               "created_or_reused": "reused"} for p in validated]}
+        if mode != MODE_RETRY and (complete or
+                                   any(status_by.get(p) == "error" for p in validated)):
+            raise HTTPException(status_code=409, detail={
+                "error": "stale_partial_batch", "batch_identity": batch_identity,
+                "detail": "some pairs already resolved — obtain a fresh preflight/manifest"})
+
+        # Execute via the EXISTING service (not invoked in the readiness task).
+        from app.workers.shadow.outcomes.service import run_shadow_outcome_calculation
+        provider = get_market_data_provider()
+        logger.info("[MAINT] executing %s (%d pairs, include_recalc=%s)",
+                    batch_identity, len(validated), include_recalc)
+        summary = await run_shadow_outcome_calculation(
+            provider, pair_ids=validated, symbols=None, run_id=None, pending=False,
+            limit=len(validated), include_recalc=include_recalc,
+            run_in_background=False)
+        after = await db.fetch(
+            "SELECT pair_id, outcome_status, error_code FROM "
+            "strategy_shadow_pair_outcomes WHERE pair_id = ANY($1::uuid[])", validated)
+        st = {str(r["pair_id"]): r for r in after}
+        return {
+            "status": "executed", "batch_identity": batch_identity,
+            "mode": mode, "outcome_run_id": summary.get("outcome_run_id"),
+            "pairs": [{"pair_id": p,
+                       "status": "processed",
+                       "outcome_status": (st.get(p) or {}).get("outcome_status"),
+                       "error_code": (st.get(p) or {}).get("error_code"),
+                       "created_or_reused": "created_or_updated"} for p in validated],
+        }
+    finally:
+        await db.fetchval("SELECT pg_advisory_unlock($1)", MAINTENANCE_ADVISORY_LOCK_KEY)
+
+
 @router.get("/shadow-evidence/readiness")
 async def shadow_evidence_readiness(
     _: str = Depends(get_worker_token),
