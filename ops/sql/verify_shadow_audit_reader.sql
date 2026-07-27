@@ -76,16 +76,20 @@ SELECT rolname, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole,
 FROM pg_roles
 WHERE rolname = current_user;
 
--- 5) RLS state of the 8 relations. Per this repo's migrations RLS is expected
---    OFF (relrowsecurity=f). If any row shows relrowsecurity=t WITHOUT a SELECT
---    policy granting this role access, plain SELECT grants are NOT sufficient —
---    resolve it (add a narrow read policy) before trusting the audit.
+-- 5) RLS state + intended-policy presence for the 8 relations. The live DB has
+--    RLS ENABLED; the audit role therefore needs a PERMISSIVE full-row SELECT
+--    policy (smart_scanner_audit_reader_select) on each table. select_policy is
+--    the count of the intended policy (expected 1 each).
 SELECT n.nspname AS schema, c.relname AS relation,
        c.relrowsecurity   AS rls_enabled,
        c.relforcerowsecurity AS rls_forced,
        (SELECT count(*) FROM pg_policies p
          WHERE p.schemaname = n.nspname AND p.tablename = c.relname
-           AND p.cmd IN ('SELECT', 'ALL')) AS select_policy_count
+           AND p.policyname = 'smart_scanner_audit_reader_select'
+           AND p.permissive = 'PERMISSIVE' AND p.cmd IN ('SELECT', 'ALL')
+           AND 'smart_scanner_audit_reader' = ANY(p.roles)
+           AND regexp_replace(coalesce(p.qual, ''), '[[:space:]()]', '', 'g') = 'true'
+       ) AS intended_full_row_select_policy
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = 'public'
@@ -95,18 +99,51 @@ WHERE n.nspname = 'public'
     'strategy_shadow_runs', 'daily_bars', 'patterns', 'pattern_configs')
 ORDER BY c.relname;
 
--- 6) Fail loudly if RLS is enabled on any required relation without a SELECT
---    policy this role could use. Expected result: zero rows.
-SELECT n.nspname || '.' || c.relname AS relation, 'RLS_WITHOUT_POLICY' AS status
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public'
-  AND c.relname IN (
-    'strategy_shadow_evaluations', 'strategy_shadow_pairs',
-    'strategy_shadow_pair_outcomes', 'strategy_shadow_run_pairs',
-    'strategy_shadow_runs', 'daily_bars', 'patterns', 'pattern_configs')
-  AND c.relrowsecurity = true
-  AND NOT EXISTS (
-    SELECT 1 FROM pg_policies p
-    WHERE p.schemaname = n.nspname AND p.tablename = c.relname
-      AND p.cmd IN ('SELECT', 'ALL'));
+-- 6) STRICT gate: RAISE (non-zero exit) on the FIRST relation that is missing,
+--    lacks SELECT, holds any write privilege, has RLS disabled, lacks the
+--    intended full-row SELECT policy, or has a narrowing restrictive policy.
+DO $$
+DECLARE
+  t          text;
+  rel_oid    regclass;
+  qname      text;
+  rels       constant text[] := ARRAY[
+    'public.strategy_shadow_evaluations','public.strategy_shadow_pairs',
+    'public.strategy_shadow_pair_outcomes','public.strategy_shadow_run_pairs',
+    'public.strategy_shadow_runs','public.daily_bars','public.patterns',
+    'public.pattern_configs'];
+BEGIN
+  FOREACH t IN ARRAY rels LOOP
+    rel_oid := to_regclass(t);
+    IF rel_oid IS NULL THEN
+      RAISE EXCEPTION 'VERIFY FAIL: relation % missing', t; END IF;
+    IF NOT has_table_privilege(t, 'SELECT') THEN
+      RAISE EXCEPTION 'VERIFY FAIL: no SELECT on %', t; END IF;
+    IF has_table_privilege(t,'INSERT') OR has_table_privilege(t,'UPDATE')
+       OR has_table_privilege(t,'DELETE') OR has_table_privilege(t,'TRUNCATE')
+       OR has_table_privilege(t,'TRIGGER') THEN
+      RAISE EXCEPTION 'VERIFY FAIL: unexpected write privilege on %', t; END IF;
+    IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = rel_oid) THEN
+      RAISE EXCEPTION 'VERIFY FAIL: RLS not enabled on %', t; END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies p
+      WHERE p.schemaname = split_part(t,'.',1) AND p.tablename = split_part(t,'.',2)
+        AND p.policyname = 'smart_scanner_audit_reader_select'
+        AND p.permissive = 'PERMISSIVE' AND p.cmd IN ('SELECT','ALL')
+        AND 'smart_scanner_audit_reader' = ANY(p.roles)
+        AND regexp_replace(coalesce(p.qual,''),'[[:space:]()]','','g') = 'true'
+    ) THEN
+      RAISE EXCEPTION 'VERIFY FAIL: intended full-row SELECT policy missing on %', t; END IF;
+    IF EXISTS (
+      SELECT 1 FROM pg_policies p
+      WHERE p.schemaname = split_part(t,'.',1) AND p.tablename = split_part(t,'.',2)
+        AND p.permissive = 'RESTRICTIVE' AND p.cmd IN ('SELECT','ALL')
+        AND (p.roles @> ARRAY['public']::name[]
+             OR 'smart_scanner_audit_reader' = ANY(p.roles))
+        AND regexp_replace(coalesce(p.qual,''),'[[:space:]()]','','g') <> 'true'
+    ) THEN
+      RAISE EXCEPTION 'VERIFY FAIL: narrowing restrictive policy on %', t; END IF;
+  END LOOP;
+  RAISE NOTICE 'VERIFY OK: all 8 relations SELECT-only + RLS full-row policy present';
+END
+$$;

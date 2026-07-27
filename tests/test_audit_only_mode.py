@@ -190,8 +190,14 @@ class _CleanConn:
             return {"rolsuper": False, "rolcreaterole": False,
                     "rolcreatedb": False, "rolreplication": False,
                     "rolbypassrls": False}
+        if "relrowsecurity" in q:
+            return {"rls_enabled": False, "rls_forced": False,
+                    "rls_active": False}
         return {"can_select": True, "can_insert": False, "can_update": False,
                 "can_delete": False, "can_truncate": False, "can_trigger": False}
+
+    async def fetch(self, q, *a):
+        return []
 
 
 class _Txn:

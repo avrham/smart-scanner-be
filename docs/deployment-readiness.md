@@ -375,3 +375,49 @@ are owned by the migration runner. Plain `SELECT` grants are therefore
 sufficient and **no** read policy is required for `smart_scanner_audit_reader`.
 `BYPASSRLS` is never granted. `verify_shadow_audit_reader.sql` re-checks RLS at
 apply time and fails readiness if RLS is ever enabled without a SELECT policy.
+
+## 14. Live RLS drift + effective-visibility contract
+
+**Discovered live (dev DB, ref redacted):** the repository migrations enable no
+Row Level Security, but the live Smart Scanner database has **RLS ENABLED on all
+eight audit relations with zero policies**. The legacy app connects as the table
+**owner** (`postgres`), which bypasses RLS, so this was invisible until a
+non-owner least-privilege role was introduced.
+
+**Why grants are not enough:** table `SELECT` grants and RLS policies are
+**separate enforcement layers**. With RLS enabled and no applicable policy, the
+non-owner `smart_scanner_audit_reader` reads **zero rows** even though
+`has_table_privilege(...,'SELECT')` is true. The audit role needs **both** a
+SELECT grant **and** a full-row SELECT policy.
+
+**Access-check now validates effective RLS visibility** (`shadow_audit_access_check.v2`).
+Per relation it reports `rls_enabled`, `rls_forced`, `rls_active_for_current_user`,
+`applicable_select_policies` (safe: policyname/command/permissive/`unconditional_true`
+only — never the raw predicate), `full_row_select_policy_present`,
+`applicable_restrictive_policies`, and `rls_ready`. Readiness rules:
+
+* RLS disabled → a SELECT grant is sufficient.
+* RLS enabled → an **applicable PERMISSIVE SELECT policy with `USING (true)`**
+  must exist, and no applicable RESTRICTIVE policy may narrow it. The owner
+  bypass is **never** treated as evidence the audit role can read.
+* Reason codes: `rls_select_policy_missing`, `rls_full_row_visibility_unproven`,
+  `rls_restrictive_policy_present`.
+
+**The intended policies** (`ops/sql/create_shadow_audit_rls_policies.sql`) create
+exactly one policy per table:
+
+```sql
+CREATE POLICY smart_scanner_audit_reader_select
+  ON public.<table> AS PERMISSIVE FOR SELECT
+  TO smart_scanner_audit_reader USING (true);
+```
+
+They are SELECT-only and allow **all rows** because a cohort audit needs the full
+historical evidence across the scoped relations; query scoping is enforced by the
+closeout endpoint selectors, while database mutation remains impossible (SELECT
+grant only, `default_transaction_read_only=on`). The script is rerunnable and
+**fails** if a policy of the intended name exists with a different definition; it
+never enables/disables RLS. Rules: never disable RLS to make the audit work,
+never grant `BYPASSRLS`, never use the owner role for the audit connection.
+`verify_shadow_audit_reader.sql` re-checks RLS + the intended policy and exits
+non-zero on any mismatch.

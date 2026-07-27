@@ -101,9 +101,11 @@ class _FakeTxn:
 class _FakeConn:
     """Records every SQL statement and returns a clean read-only role."""
 
-    def __init__(self, *, select=True, writes=False, exists=True):
+    def __init__(self, *, select=True, writes=False, exists=True,
+                 rls=False, policies=()):
         self.sql: List[str] = []
         self._select, self._writes, self._exists = select, writes, exists
+        self._rls, self._policies = rls, list(policies)
 
     def transaction(self, readonly=False):
         self.sql.append(f"transaction(readonly={readonly})")
@@ -130,12 +132,22 @@ class _FakeConn:
                 "rolcreatedb": False, "rolreplication": False,
                 "rolbypassrls": False,
             }
+        if "relrowsecurity" in q:
+            self.sql.append("rls_flags")
+            # RLS disabled by default -> grant sufficiency (ready path).
+            return {"rls_enabled": self._rls, "rls_forced": False,
+                    "rls_active": self._rls}
         self.sql.append("has_table_privilege")
         return {
             "can_select": self._select, "can_insert": self._writes,
             "can_update": self._writes, "can_delete": self._writes,
             "can_truncate": self._writes, "can_trigger": self._writes,
         }
+
+    async def fetch(self, q, *a):
+        # pg_policies query -> no applicable policies by default.
+        self.sql.append("applicable_policies")
+        return list(self._policies)
 
 
 class TestRunAccessCheckReadOnly:

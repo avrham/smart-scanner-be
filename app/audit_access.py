@@ -27,12 +27,13 @@ queries use only built-in functions, which are executable by PUBLIC).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
 
-ACCESS_CHECK_CONTRACT_VERSION = "shadow_audit_access_check.v1"
+ACCESS_CHECK_CONTRACT_VERSION = "shadow_audit_access_check.v2"
 
 # Exact relations the closeout read path requires (schema-qualified). SELECT
 # only; every write privilege here must be absent on the audit role.
@@ -70,6 +71,70 @@ DENYLISTED_ROLES: frozenset = frozenset({
     "rds_superuser", "pg_read_all_data", "pg_write_all_data",
 })
 
+# RLS readiness reason codes. Table SELECT grants and RLS policies are SEPARATE
+# enforcement layers: a granted SELECT still returns ZERO rows when RLS is
+# enabled with no applicable full-row policy. The owner-bypass (row_security
+# inactive for a table owner) must NEVER be treated as evidence the non-owner
+# audit role can read — readiness is decided on POLICY presence, not on
+# row_security_active.
+RLS_REASON_POLICY_MISSING = "rls_select_policy_missing"
+RLS_REASON_VISIBILITY_UNPROVEN = "rls_full_row_visibility_unproven"
+RLS_REASON_RESTRICTIVE = "rls_restrictive_policy_present"
+
+
+def _is_unconditional_true(value: Any) -> bool:
+    """True only when a policy predicate is the literal `true` (full-row)."""
+    if value is None:
+        return False
+    return re.sub(r"[\s()]", "", str(value)).lower() == "true"
+
+
+def classify_relation_rls(relation: Dict[str, Any]) -> Dict[str, Any]:
+    """PURE: derive RLS readiness for one relation from its raw RLS metadata.
+
+    Expects `applicable_select_policies` as a list of normalized policies
+    ({policyname, command, permissive, unconditional_true}) — the raw USING
+    expression is NEVER carried into the response. Owner-bypass is ignored: a
+    non-owner audit role needs an applicable PERMISSIVE full-row SELECT policy
+    and no narrowing RESTRICTIVE policy.
+    """
+    rls_enabled = bool(relation.get("rls_enabled"))
+    policies = relation.get("applicable_select_policies") or []
+    permissive = [
+        p for p in policies
+        if str(p.get("permissive")).upper() == "PERMISSIVE"
+    ]
+    restrictive = [
+        p for p in policies
+        if str(p.get("permissive")).upper() == "RESTRICTIVE"
+    ]
+    full_row = any(p.get("unconditional_true") is True for p in permissive)
+    blocking_restrictive = [
+        p for p in restrictive if p.get("unconditional_true") is not True
+    ]
+
+    rls_reasons: List[str] = []
+    if rls_enabled:
+        if not permissive:
+            rls_reasons.append(RLS_REASON_POLICY_MISSING)
+        elif not full_row:
+            rls_reasons.append(RLS_REASON_VISIBILITY_UNPROVEN)
+        if blocking_restrictive:
+            rls_reasons.append(RLS_REASON_RESTRICTIVE)
+
+    rls_ready = (not rls_enabled) or (not rls_reasons)
+    return {
+        "full_row_select_policy_present": full_row,
+        "applicable_restrictive_policies": sorted(
+            str(p.get("policyname")) for p in restrictive
+        ),
+        "blocking_restrictive_policies": sorted(
+            str(p.get("policyname")) for p in blocking_restrictive
+        ),
+        "rls_ready": rls_ready,
+        "rls_reasons": rls_reasons,
+    }
+
 
 def _is_on(value: Any) -> Optional[bool]:
     """Interpret a PostgreSQL on/off setting; None when unknown."""
@@ -105,11 +170,13 @@ def evaluate_access(
     unexpected_write: List[Dict[str, Any]] = []
     missing_relations: List[str] = []
     missing_select: List[str] = []
+    rls_not_ready: Dict[str, List[str]] = {}
 
     for row in relation_privileges:
         rel = row.get("relation")
         if not row.get("exists"):
             missing_relations.append(rel)
+            row["rls_ready"] = False
             continue
         if not row.get("can_select"):
             missing_select.append(rel)
@@ -119,6 +186,13 @@ def evaluate_access(
         ]
         if held:
             unexpected_write.append({"relation": rel, "privileges": held})
+        # RLS effective-visibility: a SELECT grant is NOT sufficient when RLS
+        # is enabled without an applicable full-row policy. Derived fields are
+        # merged back onto the relation for transparency.
+        rls = classify_relation_rls(row)
+        row.update({k: v for k, v in rls.items() if k != "rls_reasons"})
+        if not rls["rls_ready"]:
+            rls_not_ready[rel] = rls["rls_reasons"]
 
     default_ro = _is_on(default_transaction_read_only)
     elevated = _elevated_attributes(role_attributes)
@@ -146,6 +220,14 @@ def evaluate_access(
     if default_ro is not True:
         reasons.append("default_transaction_read_only_not_on")
 
+    # ---- RLS effective-visibility (per distinct reason code) --------------- #
+    for code in (RLS_REASON_POLICY_MISSING, RLS_REASON_VISIBILITY_UNPROVEN,
+                 RLS_REASON_RESTRICTIVE):
+        affected = sorted(r for r, codes in rls_not_ready.items()
+                          if code in codes)
+        if affected:
+            reasons.append(f"{code}:{affected}")
+
     ready = not reasons
     return {
         "access_check_contract_version": ACCESS_CHECK_CONTRACT_VERSION,
@@ -168,8 +250,62 @@ def evaluate_access(
     }
 
 
+async def _relation_rls(conn, rel: str) -> Dict[str, Any]:
+    """Read-only RLS metadata for one relation: flags + the SELECT/ALL policies
+    that APPLY to current_user (public or a role current_user is a member of).
+
+    Only SAFE, normalized policy fields are returned (policyname, command,
+    permissive, unconditional_true) — the raw USING expression is used solely
+    to compute `unconditional_true` and is never surfaced."""
+    flags = await conn.fetchrow(
+        """
+        SELECT c.relrowsecurity      AS rls_enabled,
+               c.relforcerowsecurity AS rls_forced,
+               row_security_active(($1::text)::regclass) AS rls_active
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = split_part($1::text, '.', 1)
+          AND c.relname = split_part($1::text, '.', 2)
+        """,
+        rel,
+    )
+    rows = await conn.fetch(
+        """
+        SELECT p.policyname, p.cmd, p.permissive,
+               (p.qual IS NOT NULL
+                AND regexp_replace(p.qual, '[[:space:]()]', '', 'g') = 'true')
+               AS unconditional_true
+        FROM pg_policies p
+        WHERE p.schemaname = split_part($1, '.', 1)
+          AND p.tablename  = split_part($1, '.', 2)
+          AND p.cmd IN ('SELECT', 'ALL')
+          AND EXISTS (
+            SELECT 1 FROM unnest(p.roles) rn
+            WHERE rn = 'public'
+               OR (rn <> 'public' AND pg_has_role(current_user, rn, 'MEMBER'))
+          )
+        """,
+        rel,
+    )
+    return {
+        "rls_enabled": bool(flags["rls_enabled"]) if flags else False,
+        "rls_forced": bool(flags["rls_forced"]) if flags else False,
+        "rls_active_for_current_user": (
+            bool(flags["rls_active"]) if flags else False
+        ),
+        "applicable_select_policies": [
+            {
+                "policyname": r["policyname"],
+                "command": r["cmd"],
+                "permissive": r["permissive"],
+                "unconditional_true": bool(r["unconditional_true"]),
+            }
+            for r in rows
+        ],
+    }
+
+
 async def _relation_privileges(conn) -> List[Dict[str, Any]]:
-    """Probe existence + table privileges for each required relation.
+    """Probe existence + table privileges + RLS visibility for each relation.
 
     Existence is checked with to_regclass FIRST so has_table_privilege is only
     called on relations that exist (it errors on a missing relation). All
@@ -183,6 +319,9 @@ async def _relation_privileges(conn) -> List[Dict[str, Any]]:
                 "relation": rel, "exists": False, "can_select": False,
                 "can_insert": False, "can_update": False, "can_delete": False,
                 "can_truncate": False, "can_trigger": False,
+                "rls_enabled": None, "rls_forced": None,
+                "rls_active_for_current_user": None,
+                "applicable_select_policies": [],
             })
             continue
         row = await conn.fetchrow(
@@ -196,7 +335,7 @@ async def _relation_privileges(conn) -> List[Dict[str, Any]]:
             """,
             rel,
         )
-        out.append({
+        entry = {
             "relation": rel, "exists": True,
             "can_select": bool(row["can_select"]),
             "can_insert": bool(row["can_insert"]),
@@ -204,7 +343,9 @@ async def _relation_privileges(conn) -> List[Dict[str, Any]]:
             "can_delete": bool(row["can_delete"]),
             "can_truncate": bool(row["can_truncate"]),
             "can_trigger": bool(row["can_trigger"]),
-        })
+        }
+        entry.update(await _relation_rls(conn, rel))
+        out.append(entry)
     return out
 
 
@@ -265,6 +406,10 @@ __all__ = [
     "REQUIRED_RELATIONS",
     "REQUIRED_FUNCTIONS",
     "WRITE_PRIVILEGES",
+    "RLS_REASON_POLICY_MISSING",
+    "RLS_REASON_VISIBILITY_UNPROVEN",
+    "RLS_REASON_RESTRICTIVE",
+    "classify_relation_rls",
     "evaluate_access",
     "run_access_check",
 ]
