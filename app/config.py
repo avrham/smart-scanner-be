@@ -120,6 +120,17 @@ class Settings(BaseSettings):
     # Fly runtime configuration, needs no secret treatment. Ignored outside
     # maintenance mode.
     MAINTENANCE_MIN_BATCH_INTERVAL_SECONDS: int = 75
+
+    # History-Warmup-only mode (4H/daily local-warmup foundation). When true the
+    # app exposes ONLY liveness/version + the read-only history-warmup foundation
+    # routes (access-check + preflight) and connects as the dedicated
+    # least-privilege smart_scanner_history_warmer role. Mutually exclusive with
+    # AUDIT_ONLY_MODE and MAINTENANCE_ONLY_MODE; incompatible with
+    # ENABLE_SCHEDULER=true. Default false leaves all deployments unchanged.
+    # NOTE: this task adds NO provider-backed execute route under this mode.
+    HISTORY_WARMUP_ONLY_MODE: bool = False
+    # The PostgreSQL role the history-warmup connection must authenticate as.
+    HISTORY_WARMUP_EXPECTED_DB_ROLE: str = "smart_scanner_history_warmer"
     # STABLE campaign-cohort membership lock (a sha256:... value). Required for
     # ready_for_maintenance_execution; compared against the recomputed cohort
     # lock hash (NEVER the dynamic remaining hash). Empty by default; installed

@@ -219,3 +219,189 @@ __all__ = [
     "evaluate_symbol",
     "build_prospective_readiness",
 ]
+
+
+# =========================================================================== #
+# v2: four-state per-timeframe readiness backed by local daily + 4H data.
+# =========================================================================== #
+from datetime import datetime, timezone, date as _date  # noqa: E402
+
+PROSPECTIVE_READINESS_V2_CONTRACT_VERSION = "shadow_prospective_readiness.v2"
+
+FOUR_HOUR_MIN_COMPLETED_BARS = 11          # trigger_lookback_4h(10) + 1
+# Bounded freshness rule (pending a shared market-calendar abstraction): a
+# timeframe is STALE if its latest completed bar/session is older than N calendar
+# days from `now` — sized to absorb a weekend + a holiday, so a symbol with
+# enough bars but no RECENT completed bar is NOT launch-ready.
+DAILY_FRESHNESS_MAX_CALENDAR_DAYS = 5
+FOUR_HOUR_FRESHNESS_MAX_CALENDAR_DAYS = 5
+
+STATE_UNKNOWN = "unknown_no_local_storage"
+STATE_NOT_READY = "not_ready_insufficient_count"
+STATE_STALE = "stale_latest_bar_too_old"
+STATE_READY = "ready"
+
+THRESHOLDS_V2 = dict(THRESHOLDS, **{
+    "candidate_min_4h_completed_bars": FOUR_HOUR_MIN_COMPLETED_BARS,
+    "daily_freshness_max_calendar_days": DAILY_FRESHNESS_MAX_CALENDAR_DAYS,
+    "four_hour_freshness_max_calendar_days": FOUR_HOUR_FRESHNESS_MAX_CALENDAR_DAYS,
+})
+
+
+def _to_date(v) -> Optional[_date]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, _date):
+        return v
+    try:
+        return datetime.fromisoformat(str(v)[:19]).date()
+    except (ValueError, TypeError):
+        try:
+            return _date.fromisoformat(str(v)[:10])
+        except (ValueError, TypeError):
+            return None
+
+
+def _timeframe_state(*, available: bool, count: int, required: int,
+                     latest, now_date: _date, max_stale_days: int) -> Dict[str, Any]:
+    """Four-state readiness for one timeframe (never silently 'ready')."""
+    if not available:
+        return {"state": STATE_UNKNOWN, "completed": None, "required": required,
+                "missing": None, "latest": None, "stale_days": None}
+    latest_d = _to_date(latest)
+    if count < required:
+        state = STATE_NOT_READY
+    else:
+        stale_days = (now_date - latest_d).days if latest_d else None
+        state = STATE_STALE if (stale_days is None or stale_days > max_stale_days) else STATE_READY
+    return {"state": state, "completed": count, "required": required,
+            "missing": max(0, required - count),
+            "latest": latest_d.isoformat() if latest_d else None,
+            "stale_days": ((now_date - latest_d).days if latest_d else None)}
+
+
+def evaluate_symbol_v2(*, symbol: str, daily: Dict[str, Any],
+                       fourh: Optional[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    """Pure per-symbol v2 readiness. `daily` = aggregate daily row; `fourh` =
+    aggregate 4H row, or None when the local 4H store is UNAVAILABLE (relation
+    missing / not readable) → 4H state unknown_no_local_storage."""
+    now_date = now.astimezone(timezone.utc).date()
+    d_count = int(daily.get("daily_bars") or 0)
+    completed_weeks = _completed_from_groups(daily.get("week_groups"))
+    completed_months = _completed_from_groups(daily.get("month_groups"))
+
+    daily_tf = _timeframe_state(available=True, count=d_count,
+                                required=CANDIDATE_MIN_DAILY_BARS, latest=daily.get("latest"),
+                                now_date=now_date, max_stale_days=DAILY_FRESHNESS_MAX_CALENDAR_DAYS)
+    weekly_tf = _timeframe_state(available=True, count=completed_weeks,
+                                 required=CANDIDATE_MIN_WEEKLY_PERIODS, latest=daily.get("latest"),
+                                 now_date=now_date, max_stale_days=DAILY_FRESHNESS_MAX_CALENDAR_DAYS)
+    monthly_tf = _timeframe_state(available=True, count=completed_months,
+                                  required=CANDIDATE_MIN_MONTHLY_PERIODS, latest=daily.get("latest"),
+                                  now_date=now_date, max_stale_days=31)
+    fourh_available = fourh is not None
+    fh_count = int((fourh or {}).get("completed_4h_bars") or 0)
+    fourh_tf = _timeframe_state(available=fourh_available, count=fh_count,
+                                required=FOUR_HOUR_MIN_COMPLETED_BARS,
+                                latest=(fourh or {}).get("latest_4h"),
+                                now_date=now_date, max_stale_days=FOUR_HOUR_FRESHNESS_MAX_CALENDAR_DAYS)
+    control_tf = _timeframe_state(available=True, count=d_count,
+                                  required=CONTROL_MIN_DAILY_BARS, latest=daily.get("latest"),
+                                  now_date=now_date, max_stale_days=DAILY_FRESHNESS_MAX_CALENDAR_DAYS)
+
+    candidate_states = [daily_tf["state"], weekly_tf["state"], monthly_tf["state"], fourh_tf["state"]]
+    candidate_overall = STATE_READY if all(s == STATE_READY for s in candidate_states) else (
+        STATE_UNKNOWN if STATE_UNKNOWN in candidate_states else (
+            STATE_STALE if STATE_STALE in candidate_states else STATE_NOT_READY))
+    both_ready = candidate_overall == STATE_READY and control_tf["state"] == STATE_READY
+
+    blocking: List[str] = []
+    for name, tf in (("daily", daily_tf), ("weekly", weekly_tf), ("monthly", monthly_tf),
+                     ("four_hour", fourh_tf), ("control_daily", control_tf)):
+        if tf["state"] != STATE_READY:
+            blocking.append(f"{name}:{tf['state']}")
+
+    return {
+        "symbol": symbol,
+        "daily": daily_tf, "weekly": weekly_tf, "monthly": monthly_tf,
+        "four_hour": fourh_tf, "control": control_tf,
+        "oldest_daily": _to_date(daily.get("oldest")).isoformat() if _to_date(daily.get("oldest")) else None,
+        "latest_daily": daily_tf["latest"],
+        "oldest_4h": (_to_date((fourh or {}).get("oldest_4h")).isoformat()
+                      if fourh_available and _to_date((fourh or {}).get("oldest_4h")) else None),
+        "latest_4h": fourh_tf["latest"],
+        "candidate_overall_state": candidate_overall,
+        "control_state": control_tf["state"],
+        "both_ready": both_ready,
+        "blocking_reasons": blocking,
+    }
+
+
+def build_prospective_readiness_v2(symbols: List[str], daily_rows: List[Dict[str, Any]],
+                                   fourh_rows: Optional[List[Dict[str, Any]]], *,
+                                   now: datetime) -> Dict[str, Any]:
+    """shadow_prospective_readiness.v2. `fourh_rows=None` ⇒ local 4H store
+    UNAVAILABLE (relation missing) ⇒ every symbol's 4H state is
+    unknown_no_local_storage. `fourh_rows=[]` ⇒ store exists but no rows ⇒
+    not_ready_insufficient_count."""
+    norm = sorted({s.strip().upper() for s in symbols if s and s.strip()})
+    daily_by = {str(r.get("symbol", "")).upper(): r for r in daily_rows}
+    fourh_available = fourh_rows is not None
+    fourh_by = {str(r.get("symbol", "")).upper(): r for r in (fourh_rows or [])}
+
+    per: List[Dict[str, Any]] = []
+    for sym in norm:
+        d = dict(daily_by.get(sym, {"daily_bars": 0, "month_groups": 0, "week_groups": 0,
+                                    "oldest": None, "latest": None}))
+        fh = (fourh_by.get(sym, {"completed_4h_bars": 0, "oldest_4h": None, "latest_4h": None})
+              if fourh_available else None)
+        per.append(evaluate_symbol_v2(symbol=sym, daily=d, fourh=fh, now=now))
+
+    n = len(per)
+    both = sum(1 for r in per if r["both_ready"])
+    fourh_ready = sum(1 for r in per if r["four_hour"]["state"] == STATE_READY)
+    fourh_unknown = sum(1 for r in per if r["four_hour"]["state"] == STATE_UNKNOWN)
+    fourh_stale = sum(1 for r in per if r["four_hour"]["state"] == STATE_STALE)
+    fully_launch_ready = both
+    depths = sorted(int(r["daily"]["completed"] or 0) for r in per)
+
+    def _dist(vals):
+        s = sorted(vals)
+        return {"minimum": s[0] if s else None, "median": _percentile(s, 0.5),
+                "p90": _percentile(s, 0.9), "maximum": s[-1] if s else None} if s else \
+               {"minimum": None, "median": None, "p90": None, "maximum": None}
+
+    daily_manifest = [{"s": r["symbol"], "st": r["daily"]["state"], "n": r["daily"]["completed"]} for r in per]
+    fourh_manifest = [{"s": r["symbol"], "st": r["four_hour"]["state"], "n": r["four_hour"]["completed"]} for r in per]
+    combined_manifest = [{"s": r["symbol"], "cand": r["candidate_overall_state"],
+                          "ctrl": r["control_state"], "both": r["both_ready"]} for r in per]
+
+    return {
+        "contract_version": PROSPECTIVE_READINESS_V2_CONTRACT_VERSION,
+        "candidate_strategy": "wyckoff_mtf_v2", "control_strategy": "sma150_bounce",
+        "thresholds": THRESHOLDS_V2,
+        "provider_called": False,
+        "data_source": "local_daily_bars_and_market_bars_4h",
+        "four_hour_local_store_available": fourh_available,
+        "universe_size": n,
+        "both_ready_count": both,
+        "fully_launch_ready_count": fully_launch_ready,
+        "four_hour_ready_count": fourh_ready,
+        "four_hour_unknown_count": fourh_unknown,
+        "four_hour_stale_count": fourh_stale,
+        "not_ready_count": n - both,
+        "readiness_percentage": round(both / n, 6) if n else None,
+        "daily_distribution": _dist(depths),
+        "weekly_distribution": _dist([int(r["weekly"]["completed"] or 0) for r in per]),
+        "monthly_distribution": _dist([int(r["monthly"]["completed"] or 0) for r in per]),
+        "four_hour_distribution": _dist([int(r["four_hour"]["completed"] or 0) for r in per
+                                         if r["four_hour"]["completed"] is not None]),
+        "universe_hash": _sha(norm),
+        "config_hash": _sha(THRESHOLDS_V2),
+        "daily_manifest_hash": _sha(daily_manifest),
+        "four_hour_manifest_hash": _sha(fourh_manifest),
+        "combined_readiness_manifest_hash": _sha(combined_manifest),
+        "symbols": per,
+    }

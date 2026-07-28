@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.audit_mode import is_audit_route_allowed
 from app.maintenance_mode import is_maintenance_route_allowed
+from app.history_warmup_mode import is_history_warmup_route_allowed
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
 from app.routers import public, admin, outcomes, shadow
@@ -54,9 +55,25 @@ async def lifespan(app: FastAPI):
             "ENABLE_SCHEDULER=false (maintenance mode never runs background work)"
         )
 
-    # Start scheduler if enabled — never in audit-only or maintenance-only mode.
+    # History-warmup-only mode guards (read-only 4H/daily warmup foundation):
+    #   * mutually exclusive with audit-only AND maintenance-only modes;
+    #   * never runs the scheduler / background work.
+    if settings.HISTORY_WARMUP_ONLY_MODE and (
+            settings.AUDIT_ONLY_MODE or settings.MAINTENANCE_ONLY_MODE):
+        raise RuntimeError(
+            "invalid configuration: HISTORY_WARMUP_ONLY_MODE is mutually "
+            "exclusive with AUDIT_ONLY_MODE and MAINTENANCE_ONLY_MODE"
+        )
+    if settings.HISTORY_WARMUP_ONLY_MODE and settings.ENABLE_SCHEDULER:
+        raise RuntimeError(
+            "invalid configuration: HISTORY_WARMUP_ONLY_MODE=true requires "
+            "ENABLE_SCHEDULER=false (warmup foundation never runs background work)"
+        )
+
+    # Start scheduler if enabled — never in audit / maintenance / warmup mode.
     if (settings.ENABLE_SCHEDULER and not settings.AUDIT_ONLY_MODE
-            and not settings.MAINTENANCE_ONLY_MODE):
+            and not settings.MAINTENANCE_ONLY_MODE
+            and not settings.HISTORY_WARMUP_ONLY_MODE):
         start_scheduler()
         logger.info("Scheduler started")
     elif settings.MAINTENANCE_ONLY_MODE:
@@ -85,6 +102,8 @@ async def lifespan(app: FastAPI):
             _MaintenanceCacheWriteNoise())
     elif settings.AUDIT_ONLY_MODE:
         logger.info("Audit-only mode: scheduler and background work disabled")
+    elif settings.HISTORY_WARMUP_ONLY_MODE:
+        logger.info("History-warmup-only mode: scheduler and background work disabled")
 
     yield
     
@@ -129,6 +148,10 @@ async def audit_only_gate(request, call_next):
     ):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if settings.AUDIT_ONLY_MODE and not is_audit_route_allowed(
+        request.method, request.url.path
+    ):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    if settings.HISTORY_WARMUP_ONLY_MODE and not is_history_warmup_route_allowed(
         request.method, request.url.path
     ):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})

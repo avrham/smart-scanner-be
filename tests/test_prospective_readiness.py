@@ -148,7 +148,8 @@ def _teardown():
 
 
 class TestHttp:
-    def test_readiness_ok_no_provider_no_write(self, monkeypatch):
+    def test_readiness_v2_no_provider_no_write(self, monkeypatch):
+        # market_bars_4h query returns [] (store present, empty) -> 4H not-ready
         conn = _ReadinessConn([hist("AAA", 520, 26, 54), hist("BBB", 100, 5, 20)])
         _audit_on(monkeypatch, conn)
         try:
@@ -156,10 +157,13 @@ class TestHttp:
                 "/api/admin/shadow-cohort/prospective-readiness?symbols=AAA,BBB")
             assert r.status_code == 200, r.json()
             b = r.json()
-            assert b["contract_version"] == "shadow_prospective_readiness.v1"
+            assert b["contract_version"] == "shadow_prospective_readiness.v2"
             assert b["provider_called"] is False
-            assert b["universe_size"] == 2 and b["both_ready_count"] == 1
-            assert conn.write_calls == []  # no write query issued
+            assert b["universe_size"] == 2
+            assert b["four_hour_local_store_available"] is True  # [] rows returned
+            assert b["four_hour_ready_count"] == 0                # empty 4H store
+            assert b["both_ready_count"] == 0                     # 4H not ready
+            assert conn.write_calls == []                         # no write query
         finally:
             _teardown()
 

@@ -381,7 +381,8 @@ class TestPhase9C3Boundaries:
         assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
             "013_wyckoff_v2_shadow_arms.sql"
         ]
-        assert not list(MIGRATIONS.glob("014_*"))
+        assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
+        assert not list(MIGRATIONS.glob("015_*"))
         assert (MIGRATIONS / "012_wyckoff_mtf_v2.sql").exists()
 
     def test_forbidden_surfaces_unmodified(self):

@@ -107,7 +107,8 @@ class TestMigration012:
         assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
             "013_wyckoff_v2_shadow_arms.sql"
         ]
-        assert not list(MIGRATIONS.glob("014_*"))
+        assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
+        assert not list(MIGRATIONS.glob("015_*"))
     def test_registers_canonical_identifier_disabled(self):
         sql = MIGRATION_012.read_text(encoding="utf-8")
         stmts = _sql_statements()

@@ -79,7 +79,8 @@ def test_migration_012_is_wyckoff_v2_only():
     assert [p.name for p in sorted(MIGRATIONS.glob("013_*"))] == [
         "013_wyckoff_v2_shadow_arms.sql"
     ]
-    assert not list(MIGRATIONS.glob("014_*"))
+    assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
+    assert not list(MIGRATIONS.glob("015_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
     sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
     assert "wyckoff_mtf_v2" in sql

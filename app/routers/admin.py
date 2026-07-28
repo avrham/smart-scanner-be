@@ -2192,17 +2192,7 @@ async def shadow_cohort_paired_metrics(
         recon, experiment_code=experiment_code or "", campaign_scope=campaign_scope)
 
 
-@router.get("/shadow-cohort/prospective-readiness")
-async def shadow_cohort_prospective_readiness(
-    _: str = Depends(get_worker_token),
-    db: asyncpg.Connection = Depends(get_db),
-    symbols: Optional[str] = None,
-):
-    """Read-only prospective history-readiness of a bounded frozen-universe
-    proposal (`shadow_prospective_readiness.v1`). Inspects LOCAL daily_bars only
-    — constructs no provider, calls no market-data API, issues no mutation. GET
-    (not POST) so the audit-only read-only method gate is preserved."""
-    from app.prospective_readiness import build_prospective_readiness
+def _parse_symbols(symbols: Optional[str]) -> List[str]:
     syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
     if not syms:
         raise HTTPException(status_code=422,
@@ -2210,25 +2200,129 @@ async def shadow_cohort_prospective_readiness(
     syms = list(dict.fromkeys(syms))
     if len(syms) > 100:
         raise HTTPException(status_code=422, detail="at most 100 symbols per request")
-    await _paired_readiness_gate(db)
-    # Bounded, read-only aggregate over local daily_bars (no raw bar dump, no
-    # provider). Weekly/monthly completed periods derived from distinct present
-    # period-groups minus the trailing partial (mirrors production resample).
-    rows = await db.fetch(
+    return syms
+
+
+async def _fetch_local_readiness(db, syms):
+    """Read-only local aggregates: daily_bars (always) + market_bars_4h (graceful
+    — returns fourh_rows=None when the 4H relation is absent / not readable, so
+    the v2 builder reports unknown_no_local_storage rather than erroring).
+    Constructs no provider; issues no mutation."""
+    daily = await db.fetch(
         """
-        SELECT symbol,
-               COUNT(*)::int AS daily_bars,
-               MIN(trading_date) AS oldest,
-               MAX(trading_date) AS latest,
+        SELECT symbol, COUNT(*)::int AS daily_bars,
+               MIN(trading_date) AS oldest, MAX(trading_date) AS latest,
                COUNT(DISTINCT date_trunc('month', trading_date))::int AS month_groups,
                COUNT(DISTINCT date_trunc('week', trading_date))::int AS week_groups
-        FROM daily_bars
-        WHERE symbol = ANY($1::text[])
-        GROUP BY symbol
-        """,
-        syms)
-    history_rows = [dict(r) for r in rows]
-    return build_prospective_readiness(syms, history_rows)
+        FROM daily_bars WHERE symbol = ANY($1::text[]) GROUP BY symbol
+        """, syms)
+    daily_rows = [dict(r) for r in daily]
+    fourh_rows = None
+    try:
+        fh = await db.fetch(
+            """
+            SELECT symbol,
+                   COUNT(*) FILTER (WHERE is_completed)::int AS completed_4h_bars,
+                   MIN(bar_end) FILTER (WHERE is_completed) AS oldest_4h,
+                   MAX(bar_end) FILTER (WHERE is_completed) AS latest_4h
+            FROM market_bars_4h WHERE symbol = ANY($1::text[]) GROUP BY symbol
+            """, syms)
+        fourh_rows = [dict(r) for r in fh]
+    except (asyncpg.UndefinedTableError, asyncpg.InsufficientPrivilegeError):
+        fourh_rows = None  # local 4H store not present/readable yet
+    return daily_rows, fourh_rows
+
+
+@router.get("/shadow-cohort/prospective-readiness")
+async def shadow_cohort_prospective_readiness(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    symbols: Optional[str] = None,
+):
+    """Read-only prospective history-readiness (`shadow_prospective_readiness.v2`).
+    Reads LOCAL daily_bars + market_bars_4h only — four-state per timeframe;
+    constructs no provider, calls no market-data API, issues no mutation. GET
+    only (audit-only read-only method gate). Degrades gracefully to
+    unknown_no_local_storage for 4H when that table is not yet present."""
+    from datetime import datetime, timezone
+    from app.prospective_readiness import build_prospective_readiness_v2
+    syms = _parse_symbols(symbols)
+    await _paired_readiness_gate(db)
+    daily_rows, fourh_rows = await _fetch_local_readiness(db, syms)
+    return build_prospective_readiness_v2(syms, daily_rows, fourh_rows,
+                                          now=datetime.now(timezone.utc))
+
+
+# --------------------------------------------------------------------------- #
+# History-Warmup foundation (read-only; HISTORY_WARMUP_ONLY_MODE routes).
+# No provider-backed execute route exists in this task.
+# --------------------------------------------------------------------------- #
+def _require_history_warmup_mode():
+    if not settings.HISTORY_WARMUP_ONLY_MODE:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.get("/history-warmup/access-check")
+async def history_warmup_access_check(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """Read-only proof the connected identity is the least-privilege
+    history-warmer role in warmup-only mode. Constructs NO provider, calls no
+    market-data API, issues no mutation. `history_warmup_access_check.v1`."""
+    _require_history_warmup_mode()
+    from app.history_warmup import run_history_warmup_access_check
+    provider = (settings.MARKET_DATA_PROVIDER or "").lower()
+    credential = bool((settings.MASSIVE_API_KEY or "").strip()) if provider == "massive" else False
+    return await run_history_warmup_access_check(
+        db, expected_role=(settings.HISTORY_WARMUP_EXPECTED_DB_ROLE or None),
+        history_warmup_only_mode=settings.HISTORY_WARMUP_ONLY_MODE,
+        scheduler_enabled=settings.ENABLE_SCHEDULER,
+        provider_name=provider or None,
+        provider_credential_configured=credential)
+
+
+@router.get("/history-warmup/preflight")
+async def history_warmup_preflight(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    symbols: Optional[str] = None,
+):
+    """Read-only, local-data-only history-warmup preflight
+    (`history_warmup_preflight.v1`): per-symbol readiness (v2 four-state) + a
+    provider-request ESTIMATE (never a call). No write/execute capability."""
+    _require_history_warmup_mode()
+    from datetime import datetime, timezone
+    from app.prospective_readiness import build_prospective_readiness_v2
+    syms = _parse_symbols(symbols)
+    daily_rows, fourh_rows = await _fetch_local_readiness(db, syms)
+    readiness = build_prospective_readiness_v2(syms, daily_rows, fourh_rows,
+                                               now=datetime.now(timezone.utc))
+    # provider-request ESTIMATE only (no provider constructed). One daily request
+    # per symbol needing daily warmup + one 4H request per symbol needing 4H
+    # warmup + 2 shared benchmark daily; retry allowance ×2 worst case; 5/min.
+    daily_needed = sum(1 for r in readiness["symbols"]
+                       if r["daily"]["state"] != "ready" or r["control"]["state"] != "ready")
+    fourh_needed = sum(1 for r in readiness["symbols"]
+                       if r["four_hour"]["state"] != "ready")
+    base = daily_needed + fourh_needed + 2
+    return {
+        "contract_version": "history_warmup_preflight.v1",
+        "provider_called": False,
+        "provider_constructed": False,
+        "readiness": readiness,
+        "provider_budget_estimate": {
+            "daily_symbols_requiring_warmup": daily_needed,
+            "four_hour_symbols_requiring_warmup": fourh_needed,
+            "shared_benchmark_requests": 2,
+            "estimated_base_requests": base,
+            "estimated_worst_case_requests": base * 2,
+            "rate_limit_per_minute": settings.MASSIVE_REQUESTS_PER_MINUTE,
+            "estimated_min_duration_seconds": round(base / max(1, settings.MASSIVE_REQUESTS_PER_MINUTE) * 60),
+            "estimated_safe_duration_seconds": base * 15,
+            "note": "estimate only; no provider constructed or called",
+        },
+    }
 
 
 # --------------------------------------------------------------------------- #
