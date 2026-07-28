@@ -31,6 +31,11 @@ AUDIT_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/api/admin/shadow-cohort/closeout",
     "/api/admin/shadow-cohort/maturation-plan",
     "/api/admin/shadow-cohort/pair-lineage",
+    # Prospective-experiment analytical surface (read-only; GET only so the
+    # audit-only read-only method gate is preserved — no POST).
+    "/api/admin/shadow-cohort/paired-comparison",
+    "/api/admin/shadow-cohort/paired-metrics",
+    "/api/admin/shadow-cohort/prospective-readiness",
 })
 
 # Read-only HTTP methods permitted for allowlisted routes (HEAD supported so

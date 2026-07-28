@@ -447,3 +447,66 @@ class TestMaintenanceCooldownPersistence:
             finally:
                 await c2.close()
         asyncio.run(drive())
+
+
+# Prospective history-readiness: local-only, read-only, reconnect-stable.
+_PROSPECTIVE_SQL = (
+    "SELECT symbol, COUNT(*)::int AS daily_bars, MIN(trading_date) AS oldest, "
+    "MAX(trading_date) AS latest, "
+    "COUNT(DISTINCT date_trunc('month', trading_date))::int AS month_groups, "
+    "COUNT(DISTINCT date_trunc('week', trading_date))::int AS week_groups "
+    "FROM daily_bars WHERE symbol = ANY($1::text[]) GROUP BY symbol")
+
+
+class TestProspectiveReadinessLocalReadOnly:
+    def _seed(self, pg):
+        # AAAP: ~29 months of daily bars (>= all candidate/control gates);
+        # BBBP: ~1 month (not ready). Seeded as owner (postgres).
+        sql = (
+            "INSERT INTO public.daily_bars(symbol,trading_date,open,high,low,close,volume) "
+            "SELECT 'AAAP', d, 1,1,1,1,1 FROM generate_series("
+            "'2024-01-02'::date, '2026-05-29'::date, '1 day') AS d "
+            "ON CONFLICT (symbol,trading_date) DO NOTHING; "
+            "INSERT INTO public.daily_bars(symbol,trading_date,open,high,low,close,volume) "
+            "SELECT 'BBBP', d, 1,1,1,1,1 FROM generate_series("
+            "'2026-05-01'::date, '2026-05-29'::date, '1 day') AS d "
+            "ON CONFLICT (symbol,trading_date) DO NOTHING;")
+        r = _psql(pg["cid"], sql)
+        assert r.returncode == 0, r.stderr[-300:]
+
+    def test_readiness_local_and_readonly(self, pg):
+        from app.prospective_readiness import build_prospective_readiness
+        self._seed(pg)
+
+        async def drive():
+            c = await _connect(pg["audit_dsn"])
+            try:
+                assert await c.fetchval("SELECT current_user") == AUDIT_ROLE
+                rows = [dict(r) for r in await c.fetch(_PROSPECTIVE_SQL, ["AAAP", "BBBP"])]
+                out = build_prospective_readiness(["AAAP", "BBBP"], rows)
+                assert out["provider_called"] is False
+                by = {s["symbol"]: s for s in out["symbols"]}
+                assert by["AAAP"]["candidate_overall_ready"] is True
+                assert by["AAAP"]["control_ready"] is True
+                assert by["BBBP"]["both_ready"] is False
+                # audit reader is READ-ONLY: writing daily_bars must fail
+                import asyncpg as _a
+                with pytest.raises(_a.PostgresError):
+                    await c.execute(
+                        "INSERT INTO daily_bars(symbol,trading_date,open,high,low,close,volume) "
+                        "VALUES('QQQP','2020-01-01',1,1,1,1,1)")
+                return out["readiness_manifest_hash"]
+            finally:
+                await c.close()
+        h1 = asyncio.run(drive())
+
+        # survives a brand-new connection: identical manifest hash
+        async def drive2():
+            from app.prospective_readiness import build_prospective_readiness
+            c = await _connect(pg["audit_dsn"])
+            try:
+                rows = [dict(r) for r in await c.fetch(_PROSPECTIVE_SQL, ["AAAP", "BBBP"])]
+                return build_prospective_readiness(["AAAP", "BBBP"], rows)["readiness_manifest_hash"]
+            finally:
+                await c.close()
+        assert asyncio.run(drive2()) == h1

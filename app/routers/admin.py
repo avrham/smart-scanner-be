@@ -2079,6 +2079,159 @@ async def shadow_cohort_pair_lineage(
 
 
 # --------------------------------------------------------------------------- #
+# Prospective-experiment analytical surface (read-only; audit-only allowlist).
+# --------------------------------------------------------------------------- #
+async def _paired_reconciliation(db, *, experiment_code, campaign_id, symbol,
+                                 strategy_version, config_hash, min_snapshot_date,
+                                 max_snapshot_date, limit):
+    """Fetch candidate + control evaluation rows and paired outcome rows through
+    the EXISTING frozen readers and reconcile them. Read-only."""
+    from app.workers.shadow.evidence_review import fetch_evidence_records
+    from app.paired_comparison import (
+        CANDIDATE_STRATEGY, CONTROL_STRATEGY, reconcile_pairs)
+
+    cand_filters = _evidence_filters(
+        CANDIDATE_STRATEGY, experiment_code, strategy_version, None, config_hash,
+        symbol, campaign_id, min_snapshot_date, max_snapshot_date,
+        None, None, None, None, limit)
+    ctrl_filters = _evidence_filters(
+        CONTROL_STRATEGY, experiment_code, None, None, None,
+        symbol, campaign_id, min_snapshot_date, max_snapshot_date,
+        None, None, None, None, limit)
+    cand_records = await fetch_evidence_records(cand_filters)
+    ctrl_records = await fetch_evidence_records(ctrl_filters)
+    outcome_rows = await _evidence_outcome_rows(cand_filters)
+    return reconcile_pairs(cand_records, ctrl_records, outcome_rows), cand_filters
+
+
+def _require_paired_audit_gate_selector(experiment_code, campaign_id, symbol,
+                                        strategy_version, config_hash,
+                                        min_snapshot_date, max_snapshot_date):
+    if not any([experiment_code, campaign_id, strategy_version, config_hash,
+                symbol, min_snapshot_date, max_snapshot_date]):
+        raise HTTPException(
+            status_code=422,
+            detail="a cohort selector is required (experiment_code / campaign_id "
+                   "/ strategy_version / config_hash / symbol / snapshot dates) — "
+                   "the paired surface never scans all shadow history")
+
+
+async def _paired_readiness_gate(db):
+    if settings.AUDIT_ONLY_MODE:
+        access = await _run_configured_access_check(db)
+        if not access["ready_for_closeout_audit"]:
+            raise HTTPException(status_code=409, detail={
+                "error": "paired_surface_not_ready",
+                "database_connection_mode": access.get("database_connection_mode"),
+                "reasons": access["reasons"]})
+
+
+@router.get("/shadow-cohort/paired-comparison")
+async def shadow_cohort_paired_comparison(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    experiment_code: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    campaign_scope: str = "campaign",
+    symbol: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    horizon: Optional[str] = None,
+    decision_population: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+    cursor: int = 0,
+    limit: int = 100,
+):
+    """Read-only, bounded, cursor-paginated paired candidate-vs-control dataset
+    (`shadow_paired_comparison.v1`). Reuses the frozen evidence/outcome readers;
+    constructs no provider and issues no mutation SQL. Never exposes secrets."""
+    from app.paired_comparison import build_paired_comparison
+    _require_paired_audit_gate_selector(experiment_code, campaign_id, symbol,
+                                        strategy_version, config_hash,
+                                        min_snapshot_date, max_snapshot_date)
+    await _paired_readiness_gate(db)
+    recon, _ = await _paired_reconciliation(
+        db, experiment_code=experiment_code, campaign_id=campaign_id, symbol=symbol,
+        strategy_version=strategy_version, config_hash=config_hash,
+        min_snapshot_date=min_snapshot_date, max_snapshot_date=max_snapshot_date,
+        limit=2000)
+    return build_paired_comparison(
+        recon, experiment_code=experiment_code or "", campaign_scope=campaign_scope,
+        horizon=horizon, decision_population=decision_population,
+        cursor=cursor, limit=limit)
+
+
+@router.get("/shadow-cohort/paired-metrics")
+async def shadow_cohort_paired_metrics(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    experiment_code: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    campaign_scope: str = "campaign",
+    symbol: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    config_hash: Optional[str] = None,
+    min_snapshot_date: Optional[str] = None,
+    max_snapshot_date: Optional[str] = None,
+):
+    """Read-only symmetric candidate/control population counts + per-horizon
+    effect sizes and (min-sample-gated) paired statistics
+    (`shadow_paired_metrics.v1`)."""
+    from app.paired_comparison import build_paired_metrics
+    _require_paired_audit_gate_selector(experiment_code, campaign_id, symbol,
+                                        strategy_version, config_hash,
+                                        min_snapshot_date, max_snapshot_date)
+    await _paired_readiness_gate(db)
+    recon, _ = await _paired_reconciliation(
+        db, experiment_code=experiment_code, campaign_id=campaign_id, symbol=symbol,
+        strategy_version=strategy_version, config_hash=config_hash,
+        min_snapshot_date=min_snapshot_date, max_snapshot_date=max_snapshot_date,
+        limit=2000)
+    return build_paired_metrics(
+        recon, experiment_code=experiment_code or "", campaign_scope=campaign_scope)
+
+
+@router.get("/shadow-cohort/prospective-readiness")
+async def shadow_cohort_prospective_readiness(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    symbols: Optional[str] = None,
+):
+    """Read-only prospective history-readiness of a bounded frozen-universe
+    proposal (`shadow_prospective_readiness.v1`). Inspects LOCAL daily_bars only
+    — constructs no provider, calls no market-data API, issues no mutation. GET
+    (not POST) so the audit-only read-only method gate is preserved."""
+    from app.prospective_readiness import build_prospective_readiness
+    syms = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
+    if not syms:
+        raise HTTPException(status_code=422,
+                            detail="symbols is required (comma-separated; bounded)")
+    syms = list(dict.fromkeys(syms))
+    if len(syms) > 100:
+        raise HTTPException(status_code=422, detail="at most 100 symbols per request")
+    await _paired_readiness_gate(db)
+    # Bounded, read-only aggregate over local daily_bars (no raw bar dump, no
+    # provider). Weekly/monthly completed periods derived from distinct present
+    # period-groups minus the trailing partial (mirrors production resample).
+    rows = await db.fetch(
+        """
+        SELECT symbol,
+               COUNT(*)::int AS daily_bars,
+               MIN(trading_date) AS oldest,
+               MAX(trading_date) AS latest,
+               COUNT(DISTINCT date_trunc('month', trading_date))::int AS month_groups,
+               COUNT(DISTINCT date_trunc('week', trading_date))::int AS week_groups
+        FROM daily_bars
+        WHERE symbol = ANY($1::text[])
+        GROUP BY symbol
+        """,
+        syms)
+    history_rows = [dict(r) for r in rows]
+    return build_prospective_readiness(syms, history_rows)
+
+
+# --------------------------------------------------------------------------- #
 # Shadow Outcome Maintenance Environment (maintenance-only mode).
 # --------------------------------------------------------------------------- #
 def _require_maintenance_mode():
