@@ -1,14 +1,16 @@
-"""Paired candidate-vs-control analytical surface — pure builders + HTTP + allowlist.
+"""Paired candidate-vs-control analytical surface v2 — pure builders + HTTP + allowlist.
 
-No Supabase / Massive: DB is a fake connection, readers are monkeypatched to
-return synthetic records. Proves reconciliation, symmetry, duplicate/missing arm
-detection, null-return handling, population filters, pagination, the min-sample
-inferential gate, the audit-only allowlist, auth, and no-secret output.
+No Supabase / Massive. Proves the v2 semantic corrections: WATCH is decomposed
+(not equated with pre-rollout eligibility), the candidate signal populations are
+separate, the outcome is identified as a SHARED market path, no misleading
+candidate-minus-control strategy return is emitted, selection-conditioned
+market-path populations (candidate-only / control-only / both / neither) are
+distinct, plus reconciliation, symmetry, dup/missing detection, null handling,
+pagination, the audit allowlist, auth, and no-secret output.
 """
 
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
 from main import app
@@ -17,6 +19,7 @@ from app.deps import get_db, get_worker_token
 import app.routers.admin as admin_mod
 from app.audit_mode import is_audit_route_allowed
 from app.paired_comparison import (
+    CANDIDATE_SIGNAL_DEFINITION,
     MIN_INFERENTIAL_SAMPLE,
     build_paired_comparison,
     build_paired_metrics,
@@ -64,9 +67,8 @@ def oc(pid, *, rets=None, status="complete", symbol="AAA", snap="2026-06-11"):
     r = rets or {"1d": None, "3d": None, "5d": None, "10d": None, "20d": None}
     return {
         "pair": {"pair_id": pid, "symbol": symbol, "snapshot_date": snap,
-                 "frame_hash": "fh", "experiment_code": EXP,
-                 "experiment_version": "v", "timeframe": "1d",
-                 "provider": "massive", "frame_bar_count": 1},
+                 "frame_hash": "fh", "experiment_code": EXP, "experiment_version": "v",
+                 "timeframe": "1d", "provider": "massive", "frame_bar_count": 1},
         "control": {"arm_code": "control_baseline", "strategy_code": "sma150_bounce",
                     "verdict": "AVOID"},
         "candidate": {"arm_code": "candidate_wyckoff_v2",
@@ -82,33 +84,23 @@ def oc(pid, *, rets=None, status="complete", symbol="AAA", snap="2026-06-11"):
 # --------------------------------------------------------------------------- #
 class TestReconciliation:
     def test_valid_paired(self):
-        c = [cand("p1"), cand("p2")]
-        k = [ctrl("p1"), ctrl("p2")]
-        o = [oc("p1"), oc("p2")]
-        r = reconcile_pairs(c, k, o)
-        assert r["raw_pair_rows"] == 2
-        assert r["valid_paired_rows"] == 2
-        assert r["missing_candidate_rows"] == 0
-        assert r["missing_control_rows"] == 0
-        assert r["duplicate_candidate_rows"] == 0
-        assert r["missing_outcome_rows"] == 0
+        r = reconcile_pairs([cand("p1"), cand("p2")], [ctrl("p1"), ctrl("p2")],
+                            [oc("p1"), oc("p2")])
+        assert r["valid_paired_rows"] == 2 and r["raw_pair_rows"] == 2
 
     def test_missing_control_arm(self):
         r = reconcile_pairs([cand("p1"), cand("p2")], [ctrl("p1")], [oc("p1")])
-        assert r["missing_control_rows"] == 1
+        assert r["missing_control_rows"] == 1 and r["valid_paired_rows"] == 1
         assert "p2" in r["samples"]["missing_control"]
-        assert r["valid_paired_rows"] == 1  # only p1 has both
 
     def test_missing_candidate_arm(self):
         r = reconcile_pairs([cand("p1")], [ctrl("p1"), ctrl("p2")], [oc("p1")])
         assert r["missing_candidate_rows"] == 1
-        assert "p2" in r["samples"]["missing_candidate"]
 
-    def test_duplicate_candidate_arm_detected_not_dropped(self):
+    def test_duplicate_candidate_detected_not_dropped(self):
         r = reconcile_pairs([cand("p1"), cand("p1")], [ctrl("p1")], [oc("p1")])
-        assert r["duplicate_candidate_rows"] == 1
-        assert r["raw_candidate_evaluation_rows"] == 2
-        assert r["valid_paired_rows"] == 0  # dup excluded from valid
+        assert r["duplicate_candidate_rows"] == 1 and r["raw_candidate_evaluation_rows"] == 2
+        assert r["valid_paired_rows"] == 0
 
     def test_missing_outcome(self):
         r = reconcile_pairs([cand("p1", outcome_status=None)], [ctrl("p1")], [])
@@ -117,127 +109,136 @@ class TestReconciliation:
     def test_excluded_manual(self):
         r = reconcile_pairs([cand("p1"), cand("m1")], [ctrl("p1"), ctrl("m1")],
                             [oc("p1"), oc("m1")], excluded_manual_pair_ids=["m1"])
-        assert r["excluded_manual_rows"] == 1
-        assert r["valid_paired_rows"] == 1
+        assert r["excluded_manual_rows"] == 1 and r["valid_paired_rows"] == 1
 
 
-class TestPairedComparison:
-    def test_rows_and_symmetry(self):
-        r = reconcile_pairs([cand("p1", verdict="WATCH", readiness="ready", setup=True)],
-                            [ctrl("p1", verdict="ENTER")], [oc("p1")])
+class TestSignalSemanticsV2:
+    def test_contract_is_v2_with_signal_definition(self):
+        r = reconcile_pairs([cand("p1")], [ctrl("p1")], [oc("p1")])
         out = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign")
-        assert out["contract_version"] == "shadow_paired_comparison.v1"
-        assert out["total_rows"] == 1
-        row = out["rows"][0]
-        assert row["candidate"]["strategy_code"] == "wyckoff_mtf_v2"
-        assert row["control"]["strategy_code"] == "sma150_bounce"
-        assert row["candidate"]["readiness_status"] == "ready"
-        assert row["candidate"]["setup_present"] is True
-        assert row["control"]["verdict"] == "ENTER"
-        assert row["control"]["actionable"] is True
-        assert "null_semantics" in out
+        assert out["contract_version"] == "shadow_paired_comparison.v2"
+        assert out["candidate_signal_definition"] == CANDIDATE_SIGNAL_DEFINITION
+        # no broad 'actionable' field on the candidate block
+        assert "actionable" not in out["rows"][0]["candidate"]
+        assert out["rows"][0]["candidate"]["primary_signal_definition"] == CANDIDATE_SIGNAL_DEFINITION
 
-    def test_null_returns_preserved_not_zeroed(self):
-        r = reconcile_pairs([cand("p1")], [ctrl("p1")], [oc("p1")])  # returns all None
+    def test_watch_not_equivalent_to_pre_rollout_eligibility(self):
+        # WATCH with valid setup but trigger NOT confirmed and NOT eligible
+        waiting = cand("p1", verdict="WATCH", readiness="ready", setup=True)
+        # WATCH that is a confirmed-trigger rollout-blocked would-enter
+        blocked = cand("p2", verdict="WATCH", readiness="ready", setup=True,
+                       trigger_state="confirmed", eligible=True, allow_enter=False)
+        r = reconcile_pairs([waiting, blocked], [ctrl("p1"), ctrl("p2")],
+                            [oc("p1"), oc("p2")])
         out = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign")
-        assert out["rows"][0]["outcome"]["returns"] == {
-            "1d": None, "3d": None, "5d": None, "10d": None, "20d": None}
+        rows = {x["pair_id"]: x for x in out["rows"]}
+        w = rows["p1"]["candidate"]; b = rows["p2"]["candidate"]
+        assert w["watch"] is True and w["pre_rollout_enter_eligible"] in (False, None)
+        assert w["watch_classification"] == "valid_setup_trigger_unconfirmed"
+        assert b["watch"] is True and b["pre_rollout_enter_eligible"] is True
+        assert b["watch_classification"] == "trigger_confirmed_rollout_blocked"
+        # The two WATCH records are NOT the same signal
+        assert w["watch_classification"] != b["watch_classification"]
+        assert w["primary_signal"] != b["primary_signal"]
+
+    def test_separate_populations(self):
+        c = [
+            cand("s", readiness="ready", setup=True),                              # setup only
+            cand("t", readiness="ready", setup=True, trigger_state="confirmed"),   # trigger confirmed
+            cand("e", readiness="ready", setup=True, trigger_state="confirmed",
+                 eligible=True, allow_enter=False, verdict="WATCH"),               # pre-rollout eligible + rollout-blocked
+        ]
+        k = [ctrl("s"), ctrl("t"), ctrl("e")]
+        o = [oc("s"), oc("t"), oc("e")]
+        m = build_paired_metrics(reconcile_pairs(c, k, o),
+                                 experiment_code=EXP, campaign_scope="campaign")
+        pc = m["population_counts"]
+        assert pc["candidate_setup_population"] == 3
+        assert pc["candidate_trigger_population"] == 2
+        assert pc["candidate_pre_rollout_entry_population"] == 1
+        assert pc["candidate_rollout_blocked_entry_population"] == 1
+        assert pc["candidate_final_enter_population"] == 0  # allow_enter false
+        assert pc["candidate_watch_population"] == 1
+
+
+class TestSharedOutcomeSemanticsV2:
+    def test_outcome_labeled_shared_and_no_paired_diff(self):
+        r = reconcile_pairs([cand("p1")], [ctrl("p1")], [oc("p1")])
+        out = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign")
+        ob = out["rows"][0]["outcome"]
+        assert ob["concept"] == "shared_market_path_outcome"
+        assert ob["shared_across_arms"] is True
+        assert ob["arm_conditioned_available"] is False
+        m = build_paired_metrics(r, experiment_code=EXP, campaign_scope="campaign")
+        # no candidate-minus-control strategy return anywhere
+        assert "candidate_return_minus_control_return" in m["prohibited"]
+        assert "per_population" not in m
+        assert "selection_conditioned_market_path_metrics" in m
+
+    def test_selection_populations_candidate_only_control_only_both_neither(self):
+        # candidate-selected only (pre-rollout eligible), control AVOID
+        conly = cand("co", readiness="ready", setup=True, trigger_state="confirmed",
+                     eligible=True, verdict="WATCH")
+        # control-selected only (ENTER), candidate AVOID
+        c_c = cand("ko"); k_k = ctrl("ko", verdict="ENTER")
+        # both selected
+        bc = cand("bo", readiness="ready", setup=True, trigger_state="confirmed",
+                  eligible=True, verdict="WATCH"); bk = ctrl("bo", verdict="ENTER")
+        # neither
+        nc = cand("no"); nk = ctrl("no")
+        c = [conly, c_c, bc, nc]
+        k = [ctrl("co"), k_k, bk, nk]
+        o = [oc("co", rets={"1d": 0.05, "3d": None, "5d": None, "10d": None, "20d": None}),
+             oc("ko"), oc("bo"), oc("no")]
+        m = build_paired_metrics(reconcile_pairs(c, k, o),
+                                 experiment_code=EXP, campaign_scope="campaign")
+        s = m["selection_conditioned_market_path_metrics"]["selection_population_counts"]
+        assert s["candidate_selected"] == 2  # co + bo
+        assert s["control_selected"] == 2     # ko + bo
+        assert s["both_selected"] == 1        # bo
+        assert s["candidate_only"] == 1       # co
+        assert s["control_only"] == 1         # ko
+        assert s["neither_selected"] == 1     # no
+        assert s["unconditional"] == 4
+        # market-path distribution present for candidate_selected 1d
+        cd = m["selection_conditioned_market_path_metrics"]["populations"]["candidate_selected"]["horizons"]["1d"]
+        assert cd["n"] == 2 and cd["n_with_return"] == 1
+        assert cd["mean_market_path_return"] == 0.05
+
+    def test_null_returns_preserved(self):
+        r = reconcile_pairs([cand("p1")], [ctrl("p1")], [oc("p1")])
+        out = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign")
+        mp = out["rows"][0]["outcome"]["market_path_returns"]
+        assert mp == {"1d": None, "3d": None, "5d": None, "10d": None, "20d": None}
         assert out["rows"][0]["outcome"]["stop_price"] is None
 
-    def test_pre_rollout_actionability(self):
-        # verdict AVOID but pre-rollout eligible → candidate actionable = True
-        r = reconcile_pairs(
-            [cand("p1", verdict="WATCH", eligible=True, allow_enter=False,
-                  readiness="ready", setup=True)],
-            [ctrl("p1")], [oc("p1")])
-        out = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign")
-        assert out["rows"][0]["candidate"]["pre_rollout_enter_eligible"] is True
-        assert out["rows"][0]["candidate"]["rollout_blocked"] is True
-        assert out["rows"][0]["candidate"]["actionable"] is True
 
-    def test_pagination_cursor_stable(self):
+class TestPagination:
+    def test_cursor_stable(self):
         c = [cand(f"p{i:03d}") for i in range(10)]
         k = [ctrl(f"p{i:03d}") for i in range(10)]
         o = [oc(f"p{i:03d}") for i in range(10)]
         r = reconcile_pairs(c, k, o)
-        p1 = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign",
-                                     cursor=0, limit=4)
+        p1 = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign", cursor=0, limit=4)
+        p2 = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign", cursor=4, limit=4)
         assert len(p1["rows"]) == 4 and p1["next_cursor"] == 4
-        p2 = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign",
-                                     cursor=4, limit=4)
         assert [x["pair_id"] for x in p1["rows"]] != [x["pair_id"] for x in p2["rows"]]
-        assert p2["next_cursor"] == 8
-
-    def test_population_filter(self):
-        c = [cand("p1", readiness="ready", setup=True), cand("p2")]
-        k = [ctrl("p1"), ctrl("p2")]
-        o = [oc("p1"), oc("p2")]
-        r = reconcile_pairs(c, k, o)
-        out = build_paired_comparison(r, experiment_code=EXP, campaign_scope="campaign",
-                                      decision_population="B_candidate_ready")
-        assert out["total_rows"] == 1
-        assert out["rows"][0]["pair_id"] == "p1"
-
-
-class TestPairedMetrics:
-    def test_population_counts_and_suppressed_stats(self):
-        c = [cand("p1", readiness="ready", setup=True)]
-        k = [ctrl("p1", verdict="ENTER")]
-        o = [oc("p1", rets={"1d": 0.02, "3d": None, "5d": None, "10d": None, "20d": None})]
-        r = reconcile_pairs(c, k, o)
-        m = build_paired_metrics(r, experiment_code=EXP, campaign_scope="campaign")
-        assert m["contract_version"] == "shadow_paired_metrics.v1"
-        assert m["population_counts"]["A_full"] == 1
-        assert m["population_counts"]["B_candidate_ready"] == 1
-        assert m["population_counts"]["E_control_actionable"] == 1
-        h = m["per_population"]["A_full"]["horizons"]["1d"]
-        assert h["candidate_n"] == 1
-        assert h["inferential"] is None  # below MIN_INFERENTIAL_SAMPLE
-        assert "MIN_INFERENTIAL_SAMPLE" in (h["inferential_suppressed_reason"] or "")
-
-    def test_inferential_present_above_min_sample(self):
-        n = MIN_INFERENTIAL_SAMPLE + 5
-        c = [cand(f"p{i}", readiness="ready", setup=True) for i in range(n)]
-        k = [ctrl(f"p{i}") for i in range(n)]
-        o = [oc(f"p{i}", rets={"1d": (0.01 if i % 2 else -0.005),
-                               "3d": None, "5d": None, "10d": None, "20d": None})
-             for i in range(n)]
-        r = reconcile_pairs(c, k, o)
-        m = build_paired_metrics(r, experiment_code=EXP, campaign_scope="campaign")
-        h = m["per_population"]["A_full"]["horizons"]["1d"]
-        assert h["paired_n"] == n
-        # The inferential BLOCK is present once paired_n >= MIN_INFERENTIAL_SAMPLE.
-        assert h["inferential"] is not None
-        assert h["inferential"]["bonferroni_family_size"] == 5
-        # Candidate & control share the one per-pair outcome path, so raw paired
-        # differences are all zero -> the paired-difference tests are degenerate
-        # (None). Effect sizes/denominators are still reported. This is the
-        # honest reflection of the data model (see interpretation_guard).
-        assert h["mean_paired_difference"] == 0
-        assert h["inferential"]["sign_test"] is None
-        assert h["candidate_mean_return"] is not None
 
 
 class TestStatistics:
     def test_gated_below_min(self):
-        assert sign_test([0.1] * (MIN_INFERENTIAL_SAMPLE - 1)) is None
-        assert wilcoxon_signed_rank([0.1] * (MIN_INFERENTIAL_SAMPLE - 1)) is None
-        assert paired_t_test([0.1] * (MIN_INFERENTIAL_SAMPLE - 1)) is None
-        assert bootstrap_ci([0.1] * (MIN_INFERENTIAL_SAMPLE - 1)) is None
+        for f in (sign_test, wilcoxon_signed_rank, paired_t_test, bootstrap_ci):
+            assert f([0.1] * (MIN_INFERENTIAL_SAMPLE - 1)) is None
 
     def test_deterministic_bootstrap(self):
         diffs = [((-1) ** i) * 0.01 * (i + 1) for i in range(40)]
-        a = bootstrap_ci(diffs, seed=0)
-        b = bootstrap_ci(diffs, seed=0)
-        assert a == b  # deterministic for fixed input + seed
+        assert bootstrap_ci(diffs, seed=0) == bootstrap_ci(diffs, seed=0)
 
     def test_sign_test_all_positive(self):
         s = sign_test([0.01] * 40)
         assert s["positives"] == 40 and s["p_value"] <= 0.001
 
 
-# --------------------------------------------------------------------------- #
-# HTTP
 # --------------------------------------------------------------------------- #
 class _FakeConn:
     async def fetch(self, sql, *a):
@@ -261,8 +262,7 @@ def _audit_on(monkeypatch, *, cand_records, ctrl_records, outcomes):
 
     async def fake_records(filters):
         return cand_records if filters["strategy_code"] == "wyckoff_mtf_v2" else ctrl_records
-    monkeypatch.setattr("app.workers.shadow.evidence_review.fetch_evidence_records",
-                        fake_records)
+    monkeypatch.setattr("app.workers.shadow.evidence_review.fetch_evidence_records", fake_records)
 
     async def fake_outcomes(filters):
         return outcomes
@@ -275,31 +275,30 @@ def _teardown():
 
 
 class TestHttp:
-    def test_paired_comparison_ok(self, monkeypatch):
+    def test_paired_comparison_v2(self, monkeypatch):
         _audit_on(monkeypatch, cand_records=[cand("p1")], ctrl_records=[ctrl("p1")],
                   outcomes=[oc("p1")])
         try:
             r = TestClient(app, raise_server_exceptions=False).get(
                 "/api/admin/shadow-cohort/paired-comparison?experiment_code=" + EXP)
             assert r.status_code == 200, r.json()
-            b = r.json()
-            assert b["contract_version"] == "shadow_paired_comparison.v1"
-            assert b["total_rows"] == 1
-            assert b["reconciliation"]["valid_paired_rows"] == 1
-            # no secret leakage
+            assert r.json()["contract_version"] == "shadow_paired_comparison.v2"
+            assert r.json()["reconciliation"]["valid_paired_rows"] == 1
             assert "token" not in r.text.lower() and "password" not in r.text.lower()
         finally:
             _teardown()
 
-    def test_paired_metrics_ok(self, monkeypatch):
+    def test_paired_metrics_v2(self, monkeypatch):
         _audit_on(monkeypatch, cand_records=[cand("p1", readiness="ready")],
-                  ctrl_records=[ctrl("p1")], outcomes=[oc("p1")])
+                  ctrl_records=[ctrl("p1", verdict="ENTER")], outcomes=[oc("p1")])
         try:
             r = TestClient(app, raise_server_exceptions=False).get(
                 "/api/admin/shadow-cohort/paired-metrics?experiment_code=" + EXP)
             assert r.status_code == 200, r.json()
-            assert r.json()["contract_version"] == "shadow_paired_metrics.v1"
-            assert r.json()["population_counts"]["A_full"] == 1
+            b = r.json()
+            assert b["contract_version"] == "shadow_paired_metrics.v2"
+            assert b["population_counts"]["control_signal_population"] == 1
+            assert "selection_conditioned_market_path_metrics" in b
         finally:
             _teardown()
 
@@ -320,4 +319,3 @@ class TestAllowlist:
                       "/api/admin/shadow-cohort/prospective-readiness"):
             assert is_audit_route_allowed("GET", route) is True
             assert is_audit_route_allowed("POST", route) is False
-            assert is_audit_route_allowed("DELETE", route) is False

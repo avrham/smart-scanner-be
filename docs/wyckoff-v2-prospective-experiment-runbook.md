@@ -83,6 +83,16 @@ The contract **distinguishes** setup-detected → trigger-confirmed →
 enter-eligible-before-rollout → final verdict. Candidate actionability is **NOT**
 defined as final `ENTER` while `allow_enter=false`.
 
+> **v2 update (measurement semantics):** the paired contracts are now
+> `shadow_paired_comparison.v2` / `shadow_paired_metrics.v2`. The broad
+> `actionable` field is removed; the versioned primary signal is
+> `candidate_signal_definition = pre_rollout_enter_eligible.v1`, and WATCH is
+> decomposed (`watch_classification`). Outcomes are labelled as a SHARED market
+> path (Concept A); no candidate−control strategy-return difference is emitted.
+> See `wyckoff-v2-measurement-and-4h-readiness-runbook.md` for the full signal
+> state machine, arm-conditioned-outcome (Concept B) design, local `market_bars_4h`
+> store, history-warmer role, provider budget, and `prospective_readiness.v2`.
+
 ## 4–6. Analytical surface (read-only, audit-app allowlist)
 
 New GET endpoints (all read-only, GET-only so the audit-only method gate holds;

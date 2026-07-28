@@ -1,21 +1,32 @@
 """PURE read-only builders for the paired candidate-vs-control analytical surface.
 
-This module never touches the database, a provider or a token. The audit
-endpoint fetches rows through the EXISTING frozen readers
-(`fetch_pair_outcomes` → paired verdicts + ret_1d..20d/MFE/MAE/benchmark, and
-`fetch_strategy_shadow_evaluations` → per-arm decision detail) and hands them to
-the pure functions here, which:
+v2 (`shadow_paired_comparison.v2` / `shadow_paired_metrics.v2`) corrects two
+semantic hazards found in v1:
 
-  * join candidate + control + outcome per pair (symmetric, no silent drops);
-  * reconcile arm/outcome structure (duplicate / missing arm, missing outcome);
-  * expose a bounded, secret-free pair-level dataset (`shadow_paired_comparison.v1`);
-  * compute symmetric per-population, per-horizon aggregates and — only above a
-    documented minimum sample — paired inferential statistics
-    (`shadow_paired_metrics.v1`).
+  1. SIGNAL SEMANTICS. v1 collapsed WATCH/ENTER/pre-rollout into a single broad
+     `actionable`. WATCH is ambiguous (valid-setup-waiting vs
+     trigger-confirmed-but-rollout-blocked). v2 exposes SEPARATE candidate
+     populations — setup / trigger-confirmed / pre-rollout-entry-eligible /
+     rollout-blocked-entry / final-ENTER / WATCH — plus a per-row
+     `watch_classification`, and names a versioned primary signal
+     (`candidate_signal_definition = pre_rollout_enter_eligible.v1`). It does NOT
+     emit a bare `actionable = WATCH or ENTER` field.
 
-Decision detail is derived using the SAME production classifiers from
-`app.workers.shadow.strategy_metrics` (read-only import) so semantics never drift
-from the aggregation the closeout uses.
+  2. OUTCOME SEMANTICS. One matured outcome per pair is a SHARED MARKET PATH
+     (Concept A) — identical for both arms. v1 could be read as implying a
+     candidate-minus-control strategy return; that difference is definitionally
+     ~0 and is NOT a strategy P&L. v2 removes the paired-difference framing and
+     instead reports SELECTION-CONDITIONED MARKET-PATH distributions
+     (candidate-selected / control-selected / both / candidate-only /
+     control-only / neither / unconditional) — labelled selection-quality
+     analyses, not arm returns. A true arm-conditioned outcome (Concept B)
+     requires arm-specific entry semantics that are NOT currently persisted (see
+     the runbook + the proposed `strategy_shadow_arm_outcomes` design).
+
+Pure: no DB, provider or token. The endpoint fetches rows via the frozen readers
+(`fetch_evidence_records` per arm, `fetch_pair_outcomes` for the shared path) and
+hands them here. Decision detail uses the production classifiers in
+`app.workers.shadow.strategy_metrics` (read-only import) so semantics never drift.
 """
 
 from __future__ import annotations
@@ -24,7 +35,6 @@ import math
 import random
 from typing import Any, Dict, List, Optional, Tuple
 
-# Read-only reuse of the production decision classifiers (never re-derived here).
 from app.workers.shadow.strategy_metrics import (
     TRIGGER_CLASS_CONFIRMED,
     classify_trigger_state,
@@ -32,63 +42,67 @@ from app.workers.shadow.strategy_metrics import (
     is_rollout_blocked,
 )
 
-PAIRED_COMPARISON_CONTRACT_VERSION = "shadow_paired_comparison.v1"
-PAIRED_METRICS_CONTRACT_VERSION = "shadow_paired_metrics.v1"
+PAIRED_COMPARISON_CONTRACT_VERSION = "shadow_paired_comparison.v2"
+PAIRED_METRICS_CONTRACT_VERSION = "shadow_paired_metrics.v2"
 
-# Horizons (calendar-day labels matching the stored outcome return keys).
+# The recommended primary candidate signal for the next shadow experiment: the
+# strategy's "would-enter" decision measured WHILE allow_enter stays false.
+CANDIDATE_SIGNAL_DEFINITION = "pre_rollout_enter_eligible.v1"
+
 HORIZONS: Tuple[str, ...] = ("1d", "3d", "5d", "10d", "20d")
-
-# Inferential statistics are SUPPRESSED below this paired sample size — a small
-# sample cannot support a defensible significance claim. Documented + tested.
 MIN_INFERENTIAL_SAMPLE = 30
-# Number of horizons an inferential claim spans → Bonferroni family size.
 HORIZON_FAMILY_SIZE = len(HORIZONS)
 
 CANDIDATE_STRATEGY = "wyckoff_mtf_v2"
 CONTROL_STRATEGY = "sma150_bounce"
+# sma150_bounce emits only ENTER/AVOID; wyckoff can emit ENTER/WATCH/AVOID.
 ACTIONABLE_VERDICTS = frozenset({"ENTER", "WATCH"})
 
 
 # --------------------------------------------------------------------------- #
-# Candidate/control decision-detail extraction (via production classifiers).
+# Candidate decision-detail extraction (via production classifiers).
 # --------------------------------------------------------------------------- #
-def _setup_present(evaluation: Optional[Dict[str, Any]]) -> Optional[bool]:
-    if not evaluation:
+def _setup_present(ev: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if not ev:
         return None
-    policy = evaluation.get("policy") or {}
+    policy = ev.get("policy") or {}
     if not isinstance(policy, dict) or "setup_state" not in policy:
         return None
     return policy.get("setup_state") == "valid"
 
 
-def _trigger_confirmed(evaluation: Optional[Dict[str, Any]]) -> Optional[bool]:
-    if not evaluation:
+def _trigger_confirmed(ev: Optional[Dict[str, Any]]) -> Optional[bool]:
+    if not ev:
         return None
-    if evaluation.get("four_hour_trigger") is None and not evaluation.get("policy"):
+    if ev.get("four_hour_trigger") is None and not ev.get("policy"):
         return None
-    return classify_trigger_state(evaluation) == TRIGGER_CLASS_CONFIRMED
+    return classify_trigger_state(ev) == TRIGGER_CLASS_CONFIRMED
 
 
-def _four_hour_state(evaluation: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not evaluation:
+def _four_hour_state(ev: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not ev:
         return None
-    meta = evaluation.get("four_hour_frame_meta")
-    if isinstance(meta, dict):
-        return meta.get("state")
-    return None
+    meta = ev.get("four_hour_frame_meta")
+    return meta.get("state") if isinstance(meta, dict) else None
 
 
-def _candidate_actionable(evaluation: Optional[Dict[str, Any]], verdict: Optional[str]) -> bool:
-    """Candidate is actionable if its FINAL verdict is ENTER/WATCH OR it was
-    enter-eligible before the rollout gate (the pre-rollout signal). This is the
-    key correction: actionability is NOT `verdict==ENTER` while allow_enter=false."""
-    if verdict in ACTIONABLE_VERDICTS:
-        return True
-    return is_pre_rollout_enter_candidate(evaluation or {}) is True
+def _watch_classification(ev: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Decompose a WATCH final verdict into its material sub-state (never treat
+    all WATCH as equivalent). Determinable purely from persisted fields."""
+    if not ev or ev.get("verdict") != "WATCH":
+        return None
+    if is_rollout_blocked(ev) is True:
+        # confirmed/eligible ENTER setup blocked only by allow_enter=false
+        return "trigger_confirmed_rollout_blocked"
+    if _trigger_confirmed(ev) is True:
+        return "trigger_confirmed_other"
+    if _setup_present(ev) is True:
+        return "valid_setup_trigger_unconfirmed"
+    return "watch_other"
 
 
 # --------------------------------------------------------------------------- #
-# Reconciliation + paired join (Part 6 — symmetric, no silent drops).
+# Reconciliation + paired join (symmetric; no silent drops).
 # --------------------------------------------------------------------------- #
 def reconcile_pairs(
     candidate_records: List[Dict[str, Any]],
@@ -97,9 +111,6 @@ def reconcile_pairs(
     *,
     excluded_manual_pair_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Group candidate + control evaluation rows and outcome rows by pair_id and
-    report the full structural reconciliation. Every anomaly is COUNTED and
-    sampled — never silently dropped."""
     excluded = set(excluded_manual_pair_ids or [])
 
     def _by_pair(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -119,9 +130,7 @@ def reconcile_pairs(
     missing_control = sorted(p for p in all_pairs if p not in ctrl)
     with_both = sorted(p for p in all_pairs if p in cand and p in ctrl)
     missing_outcome = sorted(
-        p for p in with_both
-        if (cand[p][0].get("outcome_status") != "complete")
-    )
+        p for p in with_both if (cand[p][0].get("outcome_status") != "complete"))
 
     return {
         "raw_pair_rows": len(all_pairs),
@@ -160,35 +169,34 @@ def _num(v: Any) -> Optional[float]:
 
 
 def build_pair_row(pair_id: str, recon_index: Dict[str, Any]) -> Dict[str, Any]:
-    """Assemble one safe, secret-free paired row (`shadow_paired_comparison.v1`)."""
     cand_recs = recon_index["cand"].get(pair_id, [])
     ctrl_recs = recon_index["ctrl"].get(pair_id, [])
     cand = cand_recs[0] if cand_recs else None
     ctrl = ctrl_recs[0] if ctrl_recs else None
     oc = recon_index["outcomes"].get(pair_id)
-
     base = cand or ctrl or {}
     cand_verdict = cand.get("verdict") if cand else None
+    ctrl_verdict = ctrl.get("verdict") if ctrl else None
 
-    # outcome returns (null-preserving — missing is null, never zero). The
-    # frozen reader nests returns under oc["outcome"] and relative_returns at the
-    # top level of the outcome item.
     oc_outcome = (oc or {}).get("outcome") or {}
     returns = oc_outcome.get("returns")
     outcome_block: Dict[str, Any] = {
+        "concept": "shared_market_path_outcome",
+        "shared_across_arms": True,
         "status": oc_outcome.get("outcome_status") if oc else (cand or {}).get("outcome_status"),
-        "returns": {h: (returns or {}).get(h) for h in HORIZONS} if returns is not None
-        else {h: None for h in HORIZONS},
+        "market_path_returns": {h: (returns or {}).get(h) for h in HORIZONS}
+        if returns is not None else {h: None for h in HORIZONS},
         "benchmark_returns": oc_outcome.get("benchmark_returns") if oc else None,
         "relative_returns": (oc or {}).get("relative_returns") if oc else None,
         "max_favorable_excursion": oc_outcome.get("max_favorable_excursion") if oc else None,
         "max_adverse_excursion": oc_outcome.get("max_adverse_excursion") if oc else None,
-        # stop/target only surfaced when GENUINELY present (the stored outcome
-        # does not currently persist them → null, never coerced to zero).
-        "stop_price": oc_outcome.get("stop_price") if oc else None,
-        "target_price": oc_outcome.get("target_price") if oc else None,
+        # Arm-specific entry/stop/target are NOT persisted → null, never fabricated.
+        "arm_conditioned_available": False,
+        "stop_price": None,
+        "target_price": None,
     }
 
+    pre_rollout = is_pre_rollout_enter_candidate(cand or {})
     return {
         "pair_id": pair_id,
         "pair_fingerprint": base.get("pair_fingerprint"),
@@ -203,19 +211,24 @@ def build_pair_row(pair_id: str, recon_index: Dict[str, Any]) -> Dict[str, Any]:
             "readiness_status": (cand or {}).get("readiness_status"),
             "setup_present": _setup_present(cand),
             "trigger_confirmed": _trigger_confirmed(cand),
-            "pre_rollout_enter_eligible": is_pre_rollout_enter_candidate(cand or {}),
+            "pre_rollout_enter_eligible": pre_rollout,
             "rollout_blocked": is_rollout_blocked(cand or {}),
+            "final_enter": cand_verdict == "ENTER",
+            "watch": cand_verdict == "WATCH",
+            "watch_classification": _watch_classification(cand),
             "score": (cand or {}).get("score"),
             "four_hour_frame_state": _four_hour_state(cand),
-            "actionable": _candidate_actionable(cand, cand_verdict),
+            # primary signal for the prospective experiment (NOT a broad actionable)
+            "primary_signal": pre_rollout is True,
+            "primary_signal_definition": CANDIDATE_SIGNAL_DEFINITION,
         },
         "control": {
             "strategy_code": (ctrl or {}).get("strategy_code"),
             "strategy_version": (ctrl or {}).get("strategy_version"),
             "arm_code": (ctrl or {}).get("arm_code"),
-            "verdict": (ctrl or {}).get("verdict"),
+            "verdict": ctrl_verdict,
             "score": (ctrl or {}).get("score"),
-            "actionable": ((ctrl or {}).get("verdict") in ACTIONABLE_VERDICTS),
+            "signal": ctrl_verdict in ACTIONABLE_VERDICTS,  # sma150 => ENTER
         },
         "outcome": outcome_block,
         "structure": {
@@ -229,87 +242,120 @@ def build_pair_row(pair_id: str, recon_index: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _valid(row: Dict[str, Any]) -> bool:
+    st = row["structure"]
+    return (st["has_candidate"] and st["has_control"] and not st["duplicate_candidate"]
+            and not st["duplicate_control"] and not st["excluded_manual"])
+
+
+# Explicit, separated candidate populations (Part 3) — never a broad "actionable".
+def _in_population(row: Dict[str, Any], population: str) -> bool:
+    if not _valid(row):
+        return False
+    c, k = row["candidate"], row["control"]
+    if population == "all_valid_pairs":
+        return True
+    if population == "candidate_ready_population":
+        return c["readiness_status"] == "ready"
+    if population == "candidate_setup_population":
+        return c["setup_present"] is True
+    if population == "candidate_trigger_population":
+        return c["trigger_confirmed"] is True
+    if population == "candidate_pre_rollout_entry_population":
+        return c["pre_rollout_enter_eligible"] is True
+    if population == "candidate_rollout_blocked_entry_population":
+        return (c["pre_rollout_enter_eligible"] is True and c["verdict"] != "ENTER"
+                and c["rollout_blocked"] is True)
+    if population == "candidate_final_enter_population":
+        return c["verdict"] == "ENTER"
+    if population == "candidate_watch_population":
+        return c["verdict"] == "WATCH"
+    if population == "control_signal_population":
+        return c is not None and k["signal"] is True
+    return False
+
+
+POPULATIONS = (
+    "all_valid_pairs", "candidate_ready_population", "candidate_setup_population",
+    "candidate_trigger_population", "candidate_pre_rollout_entry_population",
+    "candidate_rollout_blocked_entry_population", "candidate_final_enter_population",
+    "candidate_watch_population", "control_signal_population",
+)
+
+# Selection populations for market-path (selection-quality) analysis. Candidate
+# selection uses the versioned PRIMARY signal (pre-rollout entry eligibility).
+def _candidate_selected(row: Dict[str, Any]) -> bool:
+    return _valid(row) and row["candidate"]["primary_signal"] is True
+
+
+def _control_selected(row: Dict[str, Any]) -> bool:
+    return _valid(row) and row["control"]["signal"] is True
+
+
+SELECTION_POPULATIONS = (
+    "candidate_selected", "control_selected", "both_selected",
+    "candidate_only", "control_only", "neither_selected", "unconditional",
+)
+
+
+def _in_selection(row: Dict[str, Any], sel: str) -> bool:
+    if not _valid(row):
+        return False
+    cs, ks = _candidate_selected(row), _control_selected(row)
+    return {
+        "candidate_selected": cs, "control_selected": ks,
+        "both_selected": cs and ks, "candidate_only": cs and not ks,
+        "control_only": ks and not cs, "neither_selected": not cs and not ks,
+        "unconditional": True,
+    }[sel]
+
+
 def build_paired_comparison(
-    reconciliation: Dict[str, Any],
-    *,
-    experiment_code: str,
-    campaign_scope: str,
-    horizon: Optional[str] = None,
-    decision_population: Optional[str] = None,
-    cursor: int = 0,
-    limit: int = 100,
+    reconciliation: Dict[str, Any], *, experiment_code: str, campaign_scope: str,
+    horizon: Optional[str] = None, decision_population: Optional[str] = None,
+    cursor: int = 0, limit: int = 100,
 ) -> Dict[str, Any]:
-    """`shadow_paired_comparison.v1` — bounded, cursor-paginated pair-level rows."""
     idx = reconciliation["_index"]
     all_pairs = sorted(set(idx["cand"]) | set(idx["ctrl"]))
     rows = [build_pair_row(p, idx) for p in all_pairs]
-
     if decision_population:
         rows = [r for r in rows if _in_population(r, decision_population)]
-
     total = len(rows)
     limit = max(1, min(int(limit), 500))
     cursor = max(0, int(cursor))
     page = rows[cursor:cursor + limit]
-    next_cursor = cursor + limit if cursor + limit < total else None
-
     return {
         "contract_version": PAIRED_COMPARISON_CONTRACT_VERSION,
         "experiment_code": experiment_code,
         "cohort_scope": campaign_scope,
         "candidate_strategy": CANDIDATE_STRATEGY,
         "control_strategy": CONTROL_STRATEGY,
+        "candidate_signal_definition": CANDIDATE_SIGNAL_DEFINITION,
         "horizon_filter": horizon,
         "decision_population_filter": decision_population,
+        "available_decision_populations": list(POPULATIONS),
         "reconciliation": {k: v for k, v in reconciliation.items() if k != "_index"},
         "total_rows": total,
         "cursor": cursor,
         "limit": limit,
-        "next_cursor": next_cursor,
+        "next_cursor": cursor + limit if cursor + limit < total else None,
         "rows": page,
-        "null_semantics": (
-            "A null return / benchmark / stop / target means the value is not "
-            "present in the stored outcome; it is NEVER coerced to zero. A null "
-            "candidate detail (readiness/setup/trigger/score) means that arm did "
-            "not record it. Absent arm → structure flags expose it explicitly."),
+        "semantics": {
+            "outcome": ("outcome is a SHARED_MARKET_PATH (Concept A): one matured "
+                        "outcome per pair, identical for both arms. Arm-conditioned "
+                        "(entry-specific) outcomes are NOT available (no persisted "
+                        "arm entry price/timestamp)."),
+            "candidate_signal": ("WATCH is decomposed via watch_classification; the "
+                                 "primary signal is pre_rollout_enter_eligible, NOT a "
+                                 "broad actionable=WATCH-or-ENTER."),
+            "null": ("null return / benchmark / stop / target = not present in the "
+                     "stored outcome; never coerced to zero."),
+        },
     }
 
 
 # --------------------------------------------------------------------------- #
-# Populations (Part 9) — counted before any performance is reported.
-# --------------------------------------------------------------------------- #
-def _in_population(row: Dict[str, Any], population: str) -> bool:
-    c = row["candidate"]
-    k = row["control"]
-    st = row["structure"]
-    valid = st["has_candidate"] and st["has_control"] and not st["duplicate_candidate"] \
-        and not st["duplicate_control"] and not st["excluded_manual"]
-    if population == "A_full":
-        return valid and st["has_outcome"]
-    if population == "B_candidate_ready":
-        return valid and c["readiness_status"] == "ready"
-    if population == "C_candidate_trigger_confirmed":
-        return valid and c["trigger_confirmed"] is True
-    if population == "D_candidate_actionable":
-        return valid and c["actionable"] is True
-    if population == "E_control_actionable":
-        return valid and k["actionable"] is True
-    if population == "F_both_actionable":
-        return valid and c["actionable"] is True and k["actionable"] is True
-    if population == "candidate_setup_present":
-        return valid and c["setup_present"] is True
-    return valid
-
-
-POPULATIONS = (
-    "A_full", "B_candidate_ready", "candidate_setup_present",
-    "C_candidate_trigger_confirmed", "D_candidate_actionable",
-    "E_control_actionable", "F_both_actionable",
-)
-
-
-# --------------------------------------------------------------------------- #
-# Pure statistics (paired) — gated by MIN_INFERENTIAL_SAMPLE, effect-size first.
+# Statistics (used only where a real non-degenerate sample exists).
 # --------------------------------------------------------------------------- #
 def _mean(xs: List[float]) -> Optional[float]:
     return sum(xs) / len(xs) if xs else None
@@ -318,38 +364,32 @@ def _mean(xs: List[float]) -> Optional[float]:
 def _median(xs: List[float]) -> Optional[float]:
     if not xs:
         return None
-    s = sorted(xs)
-    n = len(s)
+    s = sorted(xs); n = len(s)
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def _norm_two_sided_p(z: float) -> float:
-    # two-sided p from standard normal via erf
     return max(0.0, min(1.0, 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0))))))
 
 
 def sign_test(diffs: List[float]) -> Optional[Dict[str, Any]]:
-    nz = [d for d in diffs if d != 0]
-    n = len(nz)
+    nz = [d for d in diffs if d != 0]; n = len(nz)
     if n < MIN_INFERENTIAL_SAMPLE:
         return None
     k = sum(1 for d in nz if d > 0)
-    # exact two-sided binomial p at prob 0.5
     def _cdf(x: int) -> float:
         return sum(math.comb(n, i) for i in range(0, x + 1)) / (2.0 ** n)
-    p = min(1.0, 2.0 * min(_cdf(k), 1.0 - _cdf(k - 1))) if n else 1.0
+    p = min(1.0, 2.0 * min(_cdf(k), 1.0 - _cdf(k - 1)))
     return {"n_nonzero": n, "positives": k, "negatives": n - k, "p_value": p,
             "test": "sign_test_exact_binomial"}
 
 
 def wilcoxon_signed_rank(diffs: List[float]) -> Optional[Dict[str, Any]]:
-    nz = [d for d in diffs if d != 0]
-    n = len(nz)
+    nz = [d for d in diffs if d != 0]; n = len(nz)
     if n < MIN_INFERENTIAL_SAMPLE:
         return None
     order = sorted(range(n), key=lambda i: abs(nz[i]))
-    ranks = [0.0] * n
-    i = 0
+    ranks = [0.0] * n; i = 0
     while i < n:
         j = i
         while j + 1 < n and abs(nz[order[j + 1]]) == abs(nz[order[i]]):
@@ -374,10 +414,8 @@ def paired_t_test(diffs: List[float]) -> Optional[Dict[str, Any]]:
     var = sum((d - m) ** 2 for d in diffs) / (n - 1) if n > 1 else 0.0
     se = math.sqrt(var / n) if n else 0.0
     t = m / se if se else 0.0
-    # normal-approx two-sided p (n>=30 → acceptable; labelled approximate)
     return {"n": n, "mean_diff": m, "std_error": se, "t_stat": t, "df": n - 1,
-            "p_value_normal_approx": _norm_two_sided_p(t),
-            "test": "paired_t_normal_approx"}
+            "p_value_normal_approx": _norm_two_sided_p(t), "test": "paired_t_normal_approx"}
 
 
 def bootstrap_ci(diffs: List[float], *, iters: int = 2000, alpha: float = 0.05,
@@ -385,69 +423,31 @@ def bootstrap_ci(diffs: List[float], *, iters: int = 2000, alpha: float = 0.05,
     n = len(diffs)
     if n < MIN_INFERENTIAL_SAMPLE:
         return None
-    rng = random.Random(seed)  # deterministic for fixed input+seed
-    means = []
-    for _ in range(iters):
-        means.append(sum(diffs[rng.randrange(n)] for _ in range(n)) / n)
+    rng = random.Random(seed)
+    means = [sum(diffs[rng.randrange(n)] for _ in range(n)) / n for _ in range(iters)]
     means.sort()
-    lo = means[int((alpha / 2) * iters)]
-    hi = means[min(iters - 1, int((1 - alpha / 2) * iters))]
-    return {"mean": _mean(diffs), "ci_lower": lo, "ci_upper": hi,
+    return {"mean": _mean(diffs), "ci_lower": means[int((alpha / 2) * iters)],
+            "ci_upper": means[min(iters - 1, int((1 - alpha / 2) * iters))],
             "alpha": alpha, "iters": iters, "seed": seed, "method": "percentile"}
 
 
-def _horizon_stats(pair_returns: List[Tuple[Optional[float], Optional[float]]]) -> Dict[str, Any]:
-    """pair_returns: list of (candidate_ret, control_ret) for one horizon.
-    Effect sizes and denominators always; inferential stats only when both
-    values present for >= MIN_INFERENTIAL_SAMPLE pairs."""
-    cand = [c for c, _ in pair_returns if c is not None]
-    ctrl = [k for _, k in pair_returns if k is not None]
-    paired = [(c, k) for c, k in pair_returns if c is not None and k is not None]
-    diffs = [c - k for c, k in paired]
-    n_paired = len(diffs)
-    result: Dict[str, Any] = {
-        "candidate_n": len(cand),
-        "control_n": len(ctrl),
-        "paired_n": n_paired,
-        "candidate_missing": sum(1 for c, _ in pair_returns if c is None),
-        "control_missing": sum(1 for _, k in pair_returns if k is None),
-        "candidate_mean_return": _mean(cand),
-        "candidate_median_return": _median(cand),
-        "control_mean_return": _mean(ctrl),
-        "control_median_return": _median(ctrl),
-        "candidate_positive_return_rate": (sum(1 for c in cand if c > 0) / len(cand)) if cand else None,
-        "control_positive_return_rate": (sum(1 for k in ctrl if k > 0) / len(ctrl)) if ctrl else None,
-        "mean_paired_difference": _mean(diffs),
-        "median_paired_difference": _median(diffs),
-        "positive_paired_difference_rate": (sum(1 for d in diffs if d > 0) / n_paired) if n_paired else None,
-        "inferential": None,
-        "inferential_suppressed_reason": None,
+def _market_path_dist(rows: List[Dict[str, Any]], horizon: str) -> Dict[str, Any]:
+    vals = [_num(r["outcome"]["market_path_returns"].get(horizon)) for r in rows]
+    present = [v for v in vals if v is not None]
+    return {
+        "n": len(rows),
+        "n_with_return": len(present),
+        "missing": len(vals) - len(present),
+        "mean_market_path_return": _mean(present),
+        "median_market_path_return": _median(present),
+        "positive_return_rate": (sum(1 for v in present if v > 0) / len(present))
+        if present else None,
     }
-    if n_paired < MIN_INFERENTIAL_SAMPLE:
-        result["inferential_suppressed_reason"] = (
-            f"paired_n={n_paired} < MIN_INFERENTIAL_SAMPLE={MIN_INFERENTIAL_SAMPLE}")
-    else:
-        result["inferential"] = {
-            "sign_test": sign_test(diffs),
-            "wilcoxon_signed_rank": wilcoxon_signed_rank(diffs),
-            "paired_t_test": paired_t_test(diffs),
-            "bootstrap_ci_mean_diff": bootstrap_ci(diffs),
-            "bonferroni_family_size": HORIZON_FAMILY_SIZE,
-            "note": ("p-values are two-sided; apply the Bonferroni family size "
-                     "for multi-horizon inference. Significance is NOT strategy "
-                     "validation — report effect size and denominators."),
-        }
-    return result
 
 
 def build_paired_metrics(
-    reconciliation: Dict[str, Any],
-    *,
-    experiment_code: str,
-    campaign_scope: str,
+    reconciliation: Dict[str, Any], *, experiment_code: str, campaign_scope: str,
 ) -> Dict[str, Any]:
-    """`shadow_paired_metrics.v1` — symmetric candidate/control population counts
-    and per-horizon effect sizes + gated inferential statistics."""
     idx = reconciliation["_index"]
     all_pairs = sorted(set(idx["cand"]) | set(idx["ctrl"]))
     rows = [build_pair_row(p, idx) for p in all_pairs]
@@ -462,27 +462,22 @@ def build_paired_metrics(
     population_counts["pairs_missing_outcome"] = sum(
         1 for r in rows if not r["structure"]["has_outcome"])
 
-    per_population: Dict[str, Any] = {}
-    for pop in POPULATIONS:
-        pop_rows = [r for r in rows if _in_population(r, pop)]
-        horizons: Dict[str, Any] = {}
-        for h in HORIZONS:
-            # One matured outcome per pair is shared by both arms, so the
-            # candidate and control forward returns are the SAME pair path here
-            # (raw paired difference is definitionally ~0 without an
-            # entry-conditioned model — see interpretation_guard). We still
-            # report per-arm distributions over each population.
-            pr = [(_num(r["outcome"]["returns"].get(h)),
-                   _num(r["outcome"]["returns"].get(h)))
-                  for r in pop_rows]
-            # candidate & control share the SAME per-pair outcome path (one
-            # matured outcome per pair); a paired difference is only meaningful
-            # under an entry-conditioned model — see runbook. Here candidate and
-            # control "returns" are the shared pair forward return, so the
-            # paired difference is definitionally 0 unless entry-conditioning is
-            # applied. We still expose per-arm actionable-conditioned returns.
-            horizons[h] = _horizon_stats(pr)
-        per_population[pop] = {"pair_count": len(pop_rows), "horizons": horizons}
+    # WATCH decomposition (never a single signal)
+    watch_rows = [r for r in rows if r["candidate"]["verdict"] == "WATCH"]
+    watch_breakdown: Dict[str, int] = {}
+    for r in watch_rows:
+        wc = r["candidate"]["watch_classification"] or "watch_other"
+        watch_breakdown[wc] = watch_breakdown.get(wc, 0) + 1
+
+    selection_counts = {sel: sum(1 for r in rows if _in_selection(r, sel))
+                        for sel in SELECTION_POPULATIONS}
+    selection_metrics: Dict[str, Any] = {}
+    for sel in SELECTION_POPULATIONS:
+        sel_rows = [r for r in rows if _in_selection(r, sel)]
+        selection_metrics[sel] = {
+            "pair_count": len(sel_rows),
+            "horizons": {h: _market_path_dist(sel_rows, h) for h in HORIZONS},
+        }
 
     return {
         "contract_version": PAIRED_METRICS_CONTRACT_VERSION,
@@ -490,34 +485,37 @@ def build_paired_metrics(
         "cohort_scope": campaign_scope,
         "candidate_strategy": CANDIDATE_STRATEGY,
         "control_strategy": CONTROL_STRATEGY,
+        "candidate_signal_definition": CANDIDATE_SIGNAL_DEFINITION,
         "min_inferential_sample": MIN_INFERENTIAL_SAMPLE,
         "horizons": list(HORIZONS),
         "population_counts": population_counts,
+        "candidate_watch_breakdown": watch_breakdown,
         "reconciliation": {k: v for k, v in reconciliation.items() if k != "_index"},
-        "per_population": per_population,
-        "interpretation_guard": (
-            "Outcomes are a single per-pair forward market path shared by both "
-            "arms; a raw candidate-minus-control return difference is only "
-            "economically meaningful under an entry-conditioned model that the "
-            "current experiment does NOT define. Treat these as descriptive "
-            "signal-level statistics, not a backtest or portfolio result."),
+        "selection_conditioned_market_path_metrics": {
+            "note": ("SELECTION-QUALITY analysis over the SHARED market-path "
+                     "outcome (Concept A). NOT strategy P&L or arm return. For "
+                     "both_selected the forward returns are IDENTICAL for both "
+                     "arms by construction — a zero cross-arm difference is NOT "
+                     "evidence of equivalence. A true arm-conditioned comparison "
+                     "requires arm-specific entry semantics (Concept B), which are "
+                     "not persisted (see strategy_shadow_arm_outcomes design)."),
+            "selection_population_counts": selection_counts,
+            "populations": selection_metrics,
+        },
+        "prohibited": {
+            "candidate_return_minus_control_return": (
+                "not emitted: both draw from the same shared pair outcome row"),
+            "portfolio_or_pnl_metrics": (
+                "not emitted: no entry price/timestamp/sizing/costs defined"),
+        },
     }
 
 
 __all__ = [
-    "PAIRED_COMPARISON_CONTRACT_VERSION",
-    "PAIRED_METRICS_CONTRACT_VERSION",
-    "HORIZONS",
-    "MIN_INFERENTIAL_SAMPLE",
-    "POPULATIONS",
-    "CANDIDATE_STRATEGY",
-    "CONTROL_STRATEGY",
-    "reconcile_pairs",
-    "build_pair_row",
-    "build_paired_comparison",
-    "build_paired_metrics",
-    "sign_test",
-    "wilcoxon_signed_rank",
-    "paired_t_test",
+    "PAIRED_COMPARISON_CONTRACT_VERSION", "PAIRED_METRICS_CONTRACT_VERSION",
+    "CANDIDATE_SIGNAL_DEFINITION", "HORIZONS", "MIN_INFERENTIAL_SAMPLE",
+    "POPULATIONS", "SELECTION_POPULATIONS", "CANDIDATE_STRATEGY", "CONTROL_STRATEGY",
+    "reconcile_pairs", "build_pair_row", "build_paired_comparison",
+    "build_paired_metrics", "sign_test", "wilcoxon_signed_rank", "paired_t_test",
     "bootstrap_ci",
 ]
