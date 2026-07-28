@@ -136,6 +136,7 @@ def evaluate_maintenance_access(
     locked_cohort_hash: Optional[str] = None,
     current_cohort_lock_hash: Optional[str] = None,
     cohort_pair_count: Optional[int] = None,
+    min_batch_interval_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """PURE verdict from the gathered probes + process configuration."""
     reasons: List[str] = []
@@ -262,6 +263,16 @@ def evaluate_maintenance_access(
         "locked_cohort_hash_matches": locked_matches,
         "current_cohort_lock_hash": current_cohort_lock_hash,
         "cohort_pair_count": cohort_pair_count,
+        # Provider pacing: readiness is an ENVIRONMENT capability verdict and is
+        # deliberately NOT a function of the current clock. A temporary cooldown
+        # (temporary unavailability) is reported only by the preflight endpoint;
+        # here we surface the configured interval and where the pacing state is
+        # persisted so operators can reason about it. Environment readiness may
+        # remain true during a cooldown.
+        "min_batch_interval_seconds": min_batch_interval_seconds,
+        "cooldown_persistence_source": (
+            "strategy_shadow_outcome_runs"
+            if min_batch_interval_seconds is not None else None),
         "ready_for_maintenance_execution": ready,
         "reasons": reasons,
     }
@@ -281,6 +292,7 @@ async def run_maintenance_access_check(
     locked_cohort_hash: Optional[str] = None,
     current_cohort_lock_hash: Optional[str] = None,
     cohort_pair_count: Optional[int] = None,
+    min_batch_interval_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Gather read-only capability probes and return the maintenance verdict.
 
@@ -320,6 +332,7 @@ async def run_maintenance_access_check(
         locked_cohort_hash=locked_cohort_hash,
         current_cohort_lock_hash=current_cohort_lock_hash,
         cohort_pair_count=cohort_pair_count,
+        min_batch_interval_seconds=min_batch_interval_seconds,
     )
 
 

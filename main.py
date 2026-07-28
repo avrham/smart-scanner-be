@@ -61,6 +61,28 @@ async def lifespan(app: FastAPI):
         logger.info("Scheduler started")
     elif settings.MAINTENANCE_ONLY_MODE:
         logger.info("Maintenance-only mode: scheduler and background work disabled")
+        # The maintainer role intentionally has NO daily_bars write grant (least
+        # privilege). The outcome service's best-effort cache write therefore
+        # always fails with InsufficientPrivilegeError and logs a WARNING that
+        # can be mis-read as an outcome failure. Outcome correctness uses the
+        # provider response directly; cache persistence is non-essential in this
+        # mode. Downgrade ONLY that specific, expected line to DEBUG — no key,
+        # no outcome behaviour, no cache behaviour and no normal deployment are
+        # affected (this filter is installed only in maintenance-only mode).
+        class _MaintenanceCacheWriteNoise(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                try:
+                    msg = record.getMessage()
+                except Exception:
+                    return True
+                if (record.levelno == logging.WARNING
+                        and msg.startswith("daily_bars cache write failed")):
+                    record.levelno = logging.DEBUG
+                    record.levelname = "DEBUG"
+                    return logger.isEnabledFor(logging.DEBUG)
+                return True
+        logging.getLogger("app.workers.shadow.outcomes.service").addFilter(
+            _MaintenanceCacheWriteNoise())
     elif settings.AUDIT_ONLY_MODE:
         logger.info("Audit-only mode: scheduler and background work disabled")
 

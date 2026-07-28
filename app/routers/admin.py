@@ -2140,6 +2140,39 @@ async def _recompute_maintenance_plan(db, *, experiment_code, cohort_scope,
     )
 
 
+async def _latest_maintenance_run(db):
+    """The most recent MAINTENANCE-tagged outcome run, or None. Read-only.
+
+    Maintenance executions tag their run row with a `maintenance` block inside
+    `requested_selector` (set at creation, so it survives a crash or restart and
+    is queryable even if the run never finalizes). Generic runs from the calc
+    endpoint / scheduler carry no such marker and are therefore never selected —
+    the cooldown is scoped strictly to provider-backed maintenance execution.
+    The row is ordered by the documented reference-timestamp precedence so the
+    latest attempt (successful OR failed) wins.
+    """
+    row = await db.fetchrow(
+        """
+        SELECT id, status, created_at, started_at, finished_at, updated_at
+        FROM strategy_shadow_outcome_runs
+        WHERE requested_selector -> 'maintenance' IS NOT NULL
+        ORDER BY COALESCE(finished_at, updated_at, started_at, created_at) DESC
+        LIMIT 1
+        """)
+    # Return a plain dict so the pure cooldown helper's `.get(...)` is portable
+    # across asyncpg versions (Record.get availability varies).
+    return dict(row) if row is not None else None
+
+
+def _resolved_min_batch_interval() -> int:
+    """Effective server-enforced batch interval for the current process."""
+    from app.maintenance_cooldown import resolve_min_interval_seconds
+    return resolve_min_interval_seconds(
+        settings.MAINTENANCE_MIN_BATCH_INTERVAL_SECONDS,
+        maintenance_only_mode=settings.MAINTENANCE_ONLY_MODE,
+        provider=(settings.MARKET_DATA_PROVIDER or ""))
+
+
 @router.get("/shadow-maintenance/access-check")
 async def shadow_maintenance_access_check(
     _: str = Depends(get_worker_token),
@@ -2181,6 +2214,7 @@ async def shadow_maintenance_access_check(
         locked_cohort_hash=(settings.MAINTENANCE_LOCKED_COHORT_HASH or None),
         current_cohort_lock_hash=current_lock,
         cohort_pair_count=cohort_pair_count,
+        min_batch_interval_seconds=_resolved_min_batch_interval(),
     )
 
 
@@ -2202,6 +2236,23 @@ async def shadow_maintenance_preflight(
     planning = plan["planning"]
     locked = (settings.MAINTENANCE_LOCKED_COHORT_HASH or "").strip()
     locked_matches = bool(locked) and locked == plan["cohort_lock_hash"]
+
+    # Provider pacing (read-only; never constructs or calls the provider). The
+    # cooldown is derived from the latest persisted maintenance run, so it holds
+    # across restart / auto-stop / token rotation. cohort+manifest may be safe
+    # and the environment ready, yet execution is temporarily unavailable.
+    from datetime import datetime, timezone
+    from app.maintenance_cooldown import (
+        COOLDOWN_BLOCKING_REASON, compute_cooldown)
+    min_interval = _resolved_min_batch_interval()
+    latest_run = await _latest_maintenance_run(db)
+    cooldown = compute_cooldown(
+        latest_run, min_interval_seconds=min_interval,
+        now=datetime.now(timezone.utc))
+    cooldown_active = not cooldown["execution_allowed_by_cooldown"]
+    blocking_reasons = list(planning["blocking_reasons"]) + (
+        [COOLDOWN_BLOCKING_REASON] if cooldown_active else [])
+
     return {
         "contract_version": "shadow_maintenance_preflight.v2",
         "experiment_code": exp,
@@ -2224,14 +2275,22 @@ async def shadow_maintenance_preflight(
         "terminal_failure_count": plan["terminal_failure_count"],
         # context
         "safe_to_execute": planning["safe_to_execute"],
-        "blocking_reasons": planning["blocking_reasons"],
+        "blocking_reasons": blocking_reasons,
         "experiment_eligible_unmatured_count": plan["experiment_eligible_unmatured_count"],
         "excluded_non_campaign_count": plan["excluded_non_campaign_eligible_count"],
         "campaign_membership_unverifiable_count": (
             plan["membership"]["campaign_membership_unverifiable_count"]),
-        # execution available only when safe AND the stable lock matches
+        # provider pacing (temporary unavailability distinct from readiness)
+        "min_batch_interval_seconds": cooldown["min_interval_seconds"],
+        "last_execution_finished_at": cooldown["last_execution_finished_at"],
+        "next_execution_not_before": cooldown["next_execution_not_before"],
+        "cooldown_remaining_seconds": cooldown["cooldown_remaining_seconds"],
+        "execution_allowed_by_cooldown": cooldown["execution_allowed_by_cooldown"],
+        # execution available only when safe AND the stable lock matches AND a
+        # next batch exists AND the provider cooldown has cleared.
         "execution_available": bool(planning["safe_to_execute"] and locked_matches
-                                    and plan["next_batch"]["available"]),
+                                    and plan["next_batch"]["available"]
+                                    and cooldown["execution_allowed_by_cooldown"]),
     }
 
 
@@ -2247,20 +2306,52 @@ async def shadow_maintenance_execute(
     idempotency, then reuses the existing outcome-calculation service. NOT
     invoked during the environment-readiness task."""
     _require_maintenance_mode()
+    import json as _json
+    import uuid as _uuid
+    from datetime import datetime, timezone
     from app.maintenance_execute import (
+        EXECUTE_CONTRACT_VERSION,
         MAINTENANCE_ADVISORY_LOCK_KEY,
         MODE_RETRY,
         validate_normal,
         validate_retry,
     )
+    from app.maintenance_cooldown import (
+        COOLDOWN_BLOCKING_REASON,
+        COOLDOWN_UNDER_LOCK_REASON,
+        compute_cooldown,
+        retry_after_seconds,
+    )
 
     exp = settings.MAINTENANCE_ALLOWED_EXPERIMENT_CODE
     scope = settings.MAINTENANCE_ALLOWED_COHORT_SCOPE
     locked = (settings.MAINTENANCE_LOCKED_COHORT_HASH or None)
+    min_interval = _resolved_min_batch_interval()
     logger = logging.getLogger(__name__)
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="request body must be a JSON object")
     mode = body.get("mode")
+
+    def _cooldown_409(cooldown, *, reason):
+        """Safe 409 for an active provider cooldown (+ whole-second Retry-After).
+        Never exposes a pair id, provider payload, DSN or token."""
+        return HTTPException(
+            status_code=409,
+            detail={
+                "error": reason,
+                "detail": "provider request window not yet cleared — obtain a "
+                          "fresh preflight after the cooldown elapses",
+                "min_batch_interval_seconds": cooldown["min_interval_seconds"],
+                "next_execution_not_before": cooldown["next_execution_not_before"],
+                "cooldown_remaining_seconds": cooldown["cooldown_remaining_seconds"],
+            },
+            headers={"Retry-After": str(retry_after_seconds(cooldown))})
+
+    async def _cooldown_now():
+        return compute_cooldown(
+            await _latest_maintenance_run(db),
+            min_interval_seconds=min_interval,
+            now=datetime.now(timezone.utc))
 
     async def _statuses(pair_ids):
         if not pair_ids:
@@ -2314,6 +2405,14 @@ async def shadow_maintenance_execute(
     include_recalc = verdict["include_recalc"]
     batch_identity = verdict["batch_identity"]
 
+    # ---- provider cooldown (Step 4): BEFORE the advisory lock, before any ---- #
+    # provider construction / call / outcome-run creation / outcome write. A
+    # genuine idempotent replay (stale hashes, pairs already complete) returned
+    # `already_applied` above and never reaches this gate.
+    cooldown = await _cooldown_now()
+    if not cooldown["execution_allowed_by_cooldown"]:
+        raise _cooldown_409(cooldown, reason=COOLDOWN_BLOCKING_REASON)
+
     got_lock = await db.fetchval(
         "SELECT pg_try_advisory_lock($1)", MAINTENANCE_ADVISORY_LOCK_KEY)
     if not got_lock:
@@ -2332,6 +2431,14 @@ async def shadow_maintenance_execute(
                 "reason": verdict2.get("reason"),
                 "detail": "obtain a fresh preflight and retry"})
 
+        # DOUBLE-CHECK the cooldown under the lock (Step 8): a request may have
+        # passed the initial gate and then waited on the advisory lock while
+        # another batch completed. Recompute from the latest persisted run and
+        # reject WITHOUT constructing the provider if the window reopened.
+        cooldown2 = await _cooldown_now()
+        if not cooldown2["execution_allowed_by_cooldown"]:
+            raise _cooldown_409(cooldown2, reason=COOLDOWN_UNDER_LOCK_REASON)
+
         # Idempotency: inspect current outcome statuses BEFORE any provider call.
         status_by = await _statuses(validated)
         complete = [p for p in validated if status_by.get(p) == "complete"]
@@ -2349,20 +2456,72 @@ async def shadow_maintenance_execute(
         # Execute via the EXISTING service (not invoked in the readiness task).
         from app.workers.shadow.outcomes.service import run_shadow_outcome_calculation
         provider = get_market_data_provider()
-        logger.info("[MAINT] executing %s (%d pairs, include_recalc=%s)",
-                    batch_identity, len(validated), include_recalc)
-        # The service is synchronous by construction (no run_in_background arg);
-        # we deliberately never use background mode for maintenance execution.
+        provider_name = getattr(provider, "name", None) or "unknown"
+
+        # PRE-CREATE the outcome-run row with a bounded maintenance marker in
+        # requested_selector so this attempt is distinctly identifiable for the
+        # cooldown query — set at creation, so it survives a crash/restart even
+        # if the run never finalizes. The service is passed this id and its own
+        # create_outcome_run is a no-op (ON CONFLICT (id) DO NOTHING). No secret
+        # (token / key / DSN / header / payload) is ever stored.
+        outcome_run_id = str(_uuid.uuid4())
+        maintenance_marker = {
+            "contract_version": EXECUTE_CONTRACT_VERSION,
+            "mode": mode,
+            "batch_identity": batch_identity,
+            "cohort_lock_hash": plan2.get("cohort_lock_hash"),
+            "pair_count": len(validated),
+        }
+        if mode == MODE_RETRY:
+            maintenance_marker["retry_plan_hash"] = (
+                (plan2.get("retry_plan") or {}).get("retry_plan_hash"))
+        else:
+            maintenance_marker["remaining_manifest_hash"] = plan2.get("remaining_manifest_hash")
+            maintenance_marker["next_batch_hash"] = (
+                (plan2.get("next_batch") or {}).get("next_batch_hash"))
+        pre_selector = {
+            "pair_ids": list(validated), "symbols": [], "run_id": None,
+            "pending": False, "include_recalc": include_recalc,
+            "maintenance": maintenance_marker,
+        }
+        await db.execute(
+            """
+            INSERT INTO strategy_shadow_outcome_runs (
+                id, status, requested_selector, requested_limit, provider,
+                started_at, created_at, updated_at
+            )
+            VALUES ($1, 'running', $2, $3, $4, NOW(), NOW(), NOW())
+            ON CONFLICT (id) DO NOTHING
+            """,
+            outcome_run_id, _json.dumps(pre_selector), len(validated), provider_name)
+
+        # Observability (Step 12): safe structured maintenance batch telemetry.
+        # Accurate per-provider 429/attempt/retry counters would require invasive
+        # changes to the (boundary-frozen) provider client, so they are omitted
+        # here — the provider client already emits 429 WARNING lines. We record
+        # the batch envelope only; no key / credentialed URL / response body.
+        started_at = datetime.now(timezone.utc)
+        logger.info("[MAINT] batch started run=%s identity=%s mode=%s pairs=%d "
+                    "include_recalc=%s min_interval_s=%d",
+                    outcome_run_id, batch_identity, mode, len(validated),
+                    include_recalc, min_interval)
         summary = await run_shadow_outcome_calculation(
             provider, pair_ids=validated, symbols=None, run_id=None, pending=False,
-            limit=len(validated), include_recalc=include_recalc)
+            limit=len(validated), include_recalc=include_recalc,
+            outcome_run_id=outcome_run_id)
+        elapsed_s = (datetime.now(timezone.utc) - started_at).total_seconds()
         after = await db.fetch(
             "SELECT pair_id, outcome_status, error_code FROM "
             "strategy_shadow_pair_outcomes WHERE pair_id = ANY($1::uuid[])", validated)
         st = {str(r["pair_id"]): r for r in after}
+        error_count = sum(1 for p in validated
+                          if (st.get(p) or {}).get("outcome_status") == "error")
+        logger.info("[MAINT] batch finished run=%s status=%s pairs=%d errors=%d "
+                    "duration_s=%.3f", outcome_run_id, summary.get("status"),
+                    len(validated), error_count, elapsed_s)
         return {
             "status": "executed", "batch_identity": batch_identity,
-            "mode": mode, "outcome_run_id": summary.get("outcome_run_id"),
+            "mode": mode, "outcome_run_id": summary.get("outcome_run_id") or outcome_run_id,
             "pairs": [{"pair_id": p,
                        "status": "processed",
                        "outcome_status": (st.get(p) or {}).get("outcome_status"),

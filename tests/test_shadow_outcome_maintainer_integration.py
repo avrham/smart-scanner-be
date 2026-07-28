@@ -12,13 +12,23 @@ that the audit reader remains unchanged. Skips without Docker.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 asyncpg = pytest.importorskip("asyncpg")
+
+# Production maintenance-run selection query (mirrors admin._latest_maintenance_run).
+_LATEST_MAINT_SQL = (
+    "SELECT id, status, created_at, started_at, finished_at, updated_at "
+    "FROM strategy_shadow_outcome_runs "
+    "WHERE requested_selector -> 'maintenance' IS NOT NULL "
+    "ORDER BY COALESCE(finished_at, updated_at, started_at, created_at) DESC LIMIT 1")
 
 PG_IMAGE = "postgres:16-alpine"
 DBNAME = "auditdb"
@@ -298,3 +308,142 @@ class TestAccessCheckAndAuditUnchanged:
                 await c.close()
         r = asyncio.run(drive())
         assert r["ready_for_closeout_audit"] is True, r["reasons"]
+
+
+def _reset_runs(pg):
+    """Clear outcome-run rows between cooldown tests (as postgres — the
+    maintainer intentionally has no DELETE privilege)."""
+    r = _psql(pg["cid"], "DELETE FROM public.strategy_shadow_outcome_runs;")
+    assert r.returncode == 0, r.stderr[-300:]
+
+
+async def _insert_run(c, *, maintenance, status="completed", finished_at=None,
+                      run_id=None):
+    """Insert an outcome-run row as the connected role. `maintenance=True` tags
+    it with a bounded maintenance marker in requested_selector (as the execute
+    route does); `maintenance=False` writes a generic run (no marker)."""
+    rid = run_id or uuid.uuid4()
+    selector = {"pair_ids": [], "include_recalc": False}
+    if maintenance:
+        selector["maintenance"] = {
+            "contract_version": "shadow_maintenance_execute.v2",
+            "mode": "normal", "batch_identity": "batch:test", "pair_count": 0}
+    await c.execute(
+        "INSERT INTO public.strategy_shadow_outcome_runs "
+        "(id,status,requested_selector,provider,started_at,created_at,updated_at,finished_at) "
+        "VALUES ($1,$2,$3::jsonb,'massive',NOW(),NOW(),NOW(),$4)",
+        rid, status, json.dumps(selector), finished_at)
+    return rid
+
+
+class TestMaintenanceCooldownPersistence:
+    """Real-Postgres proof the cooldown reads persisted maintenance runs, is
+    scoped to maintenance runs only, and survives a fresh connection."""
+
+    def test_maintenance_run_selected_generic_ignored(self, pg):
+        from app.maintenance_cooldown import compute_cooldown
+        _reset_runs(pg)
+
+        async def drive():
+            c = await _connect(pg["maint_dsn"])
+            try:
+                # a generic (non-maintenance) run must NOT be selected
+                await _insert_run(c, maintenance=False, status="completed",
+                                  finished_at=datetime.now(timezone.utc))
+                # with only a generic run present, no cooldown applies
+                none_row = await c.fetchrow(_LATEST_MAINT_SQL)
+                assert none_row is None
+                # add a maintenance run finished 4s ago -> selected + blocks
+                fin = datetime.now(timezone.utc) - timedelta(seconds=4)
+                mid = await _insert_run(c, maintenance=True, status="completed",
+                                        finished_at=fin)
+                row = await c.fetchrow(_LATEST_MAINT_SQL)
+                assert row is not None and row["id"] == mid
+                cd = compute_cooldown(dict(row), min_interval_seconds=75,
+                                      now=datetime.now(timezone.utc))
+                assert cd["execution_allowed_by_cooldown"] is False
+                assert cd["cooldown_remaining_seconds"] > 0
+            finally:
+                await c.close()
+        asyncio.run(drive())
+
+    def test_generic_run_alone_allows_execution(self, pg):
+        from app.maintenance_cooldown import compute_cooldown
+        _reset_runs(pg)
+
+        async def drive():
+            c = await _connect(pg["maint_dsn"])
+            try:
+                await _insert_run(c, maintenance=False, status="completed",
+                                  finished_at=datetime.now(timezone.utc))
+                row = await c.fetchrow(_LATEST_MAINT_SQL)
+                cd = compute_cooldown(dict(row) if row else None,
+                                      min_interval_seconds=75,
+                                      now=datetime.now(timezone.utc))
+                assert cd["execution_allowed_by_cooldown"] is True
+            finally:
+                await c.close()
+        asyncio.run(drive())
+
+    def test_failed_run_establishes_cooldown(self, pg):
+        from app.maintenance_cooldown import compute_cooldown
+        _reset_runs(pg)
+
+        async def drive():
+            c = await _connect(pg["maint_dsn"])
+            try:
+                fin = datetime.now(timezone.utc) - timedelta(seconds=5)
+                await _insert_run(c, maintenance=True, status="failed",
+                                  finished_at=fin)
+                row = await c.fetchrow(_LATEST_MAINT_SQL)
+                assert row["status"] == "failed"
+                cd = compute_cooldown(dict(row), min_interval_seconds=75,
+                                      now=datetime.now(timezone.utc))
+                assert cd["execution_allowed_by_cooldown"] is False
+            finally:
+                await c.close()
+        asyncio.run(drive())
+
+    def test_latest_maintenance_run_wins(self, pg):
+        _reset_runs(pg)
+
+        async def drive():
+            c = await _connect(pg["maint_dsn"])
+            try:
+                old = await _insert_run(
+                    c, maintenance=True, status="completed",
+                    finished_at=datetime.now(timezone.utc) - timedelta(seconds=600))
+                new = await _insert_run(
+                    c, maintenance=True, status="completed",
+                    finished_at=datetime.now(timezone.utc) - timedelta(seconds=3))
+                row = await c.fetchrow(_LATEST_MAINT_SQL)
+                assert row["id"] == new and row["id"] != old
+            finally:
+                await c.close()
+        asyncio.run(drive())
+
+    def test_cooldown_survives_new_connection(self, pg):
+        """Insert on one connection/instance; a brand-new connection sees the
+        persisted run and still enforces the cooldown (never process memory)."""
+        from app.maintenance_cooldown import compute_cooldown
+        _reset_runs(pg)
+
+        async def drive():
+            c1 = await _connect(pg["maint_dsn"])
+            try:
+                fin = datetime.now(timezone.utc) - timedelta(seconds=6)
+                await _insert_run(c1, maintenance=True, status="completed",
+                                  finished_at=fin)
+            finally:
+                await c1.close()
+            c2 = await _connect(pg["maint_dsn"])  # fresh connection == new instance
+            try:
+                row = await c2.fetchrow(_LATEST_MAINT_SQL)
+                assert row is not None
+                cd = compute_cooldown(dict(row), min_interval_seconds=75,
+                                      now=datetime.now(timezone.utc))
+                assert cd["execution_allowed_by_cooldown"] is False
+                assert cd["cooldown_remaining_seconds"] > 0
+            finally:
+                await c2.close()
+        asyncio.run(drive())

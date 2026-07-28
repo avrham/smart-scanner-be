@@ -111,6 +111,15 @@ class Settings(BaseSettings):
     MAINTENANCE_ALLOWED_COHORT_SCOPE: str = "campaign"
     # Hard cap on a single bounded execution batch (never exceeded server-side).
     MAINTENANCE_MAX_BATCH_SIZE: int = 10
+    # Server-enforced minimum wall-clock interval between provider-backed
+    # maintenance batches. The Massive Basic plan allows ~5 requests/minute, so
+    # a second batch started before this window clears is throttled (429) and
+    # every pair fails retryably. Default 75s; floored to 60s whenever
+    # maintenance mode is active on the Massive provider (the rolling request
+    # window), clamped to a 600s maximum. Not sensitive: may be overridden via
+    # Fly runtime configuration, needs no secret treatment. Ignored outside
+    # maintenance mode.
+    MAINTENANCE_MIN_BATCH_INTERVAL_SECONDS: int = 75
     # STABLE campaign-cohort membership lock (a sha256:... value). Required for
     # ready_for_maintenance_execution; compared against the recomputed cohort
     # lock hash (NEVER the dynamic remaining hash). Empty by default; installed

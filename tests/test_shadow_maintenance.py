@@ -306,14 +306,27 @@ class _Boom:
 
 
 class _FakeConn:
-    def __init__(self, *, lock=True, statuses=None):
+    def __init__(self, *, lock=True, statuses=None, latest_run=None):
         self._lock = lock
         self._statuses = statuses or {}
+        self._latest_run = latest_run  # maintenance cooldown source row (or None)
+        self.inserted_runs = []
 
     async def fetchval(self, sql, *args):
         if "pg_try_advisory_lock" in sql:
             return self._lock
         return None
+
+    async def fetchrow(self, sql, *args):
+        # Cooldown source: latest maintenance-tagged outcome run (or None).
+        if "strategy_shadow_outcome_runs" in sql and "requested_selector" in sql:
+            return self._latest_run
+        return None
+
+    async def execute(self, sql, *args):
+        if "INSERT INTO strategy_shadow_outcome_runs" in sql:
+            self.inserted_runs.append(args)
+        return "INSERT 0 1"
 
     async def fetch(self, sql, *args):
         if "outcome_status" in sql:
