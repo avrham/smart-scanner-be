@@ -1,0 +1,49 @@
+# fly.prospective.toml — smart-scanner-be-prospective-staging
+#
+# ISOLATED PROSPECTIVE CAMPAIGN ENVIRONMENT. A disposable non-production app that
+# connects ONLY to the isolated Fly Postgres cluster via the dedicated
+# least-privilege smart_scanner_prospective_runner role (PROSPECTIVE_DATABASE_URL,
+# a SECRET). Exposes ONLY liveness/version + the prospective access-check /
+# preflight / register / execute / audit routes; runs NO scheduler, NO background
+# work; constructs NO provider (local daily_bars + market_bars_4h only). NO
+# provider credential and NO shared Supabase credential are installed. Git SHA is
+# supplied at deploy time via --build-arg APP_GIT_SHA.
+
+app = 'smart-scanner-be-prospective-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_ENVIRONMENT = 'prospective-staging'
+  PROSPECTIVE_CAMPAIGN_ONLY_MODE = 'true'
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  HISTORY_WARMUP_ONLY_MODE = 'false'
+  ENABLE_SCHEDULER = 'false'
+  REQUIRE_WORKER_TOKEN = 'true'
+  MARKET_DATA_PROVIDER = 'massive'          # name only; NO key installed
+  LOG_FORMAT = 'json'
+  PROSPECTIVE_EXPECTED_DB_ROLE = 'smart_scanner_prospective_runner'
+  PROSPECTIVE_ALLOWED_EXPERIMENT_CODE = 'wyckoff_v2_vs_baseline'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+  # NO http health check: the single bounded prospective `execute` runs 25 local
+  # candidate/control evaluations synchronously (CPU-bound pandas), which starves
+  # the event loop long enough that a /version check would fail and Fly would
+  # restart the Machine mid-run. This app does no background work and auto-stops
+  # when idle, so a liveness check is unnecessary and would only interrupt a
+  # legitimate multi-minute local computation.
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512
