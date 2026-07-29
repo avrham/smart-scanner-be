@@ -207,6 +207,14 @@ class TestModeAndAllowlist:
     def test_config_default_false(self):
         assert Settings.model_fields["HISTORY_WARMUP_ONLY_MODE"].default is False
 
+    def test_supabase_creds_optional_for_credential_free_boot(self):
+        # An isolated warmup app installs ZERO Supabase credentials; Settings must
+        # instantiate without them (warmup mode connects only via
+        # HISTORY_WARMUP_DATABASE_URL). Legacy fields default to empty.
+        for f in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY", "SUPABASE_ANON_KEY",
+                  "SUPABASE_DB_PASSWORD"):
+            assert Settings.model_fields[f].default == ""
+
     def test_allowlist_get_only(self):
         for route in ("/api/admin/history-warmup/access-check",
                       "/api/admin/history-warmup/preflight",

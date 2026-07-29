@@ -24,11 +24,16 @@ class Settings(BaseSettings):
     APP_ENVIRONMENT: str = "local"    # local | development | staging | production
     APP_RELEASE: str = "unknown"      # optional human/image release identifier
 
-     # Database
-    SUPABASE_URL: str
-    SUPABASE_SERVICE_KEY: str
-    SUPABASE_ANON_KEY: str
-    SUPABASE_DB_PASSWORD: str
+     # Database (legacy Supabase-derived identity). OPTIONAL with empty defaults so
+    # an ISOLATED deployment that uses none of it can boot with ZERO Supabase
+    # credentials (e.g. HISTORY_WARMUP_ONLY_MODE connects exclusively via
+    # HISTORY_WARMUP_DATABASE_URL). Normal deployments still supply these via
+    # secrets; the legacy connection path validates them at CONNECT time and
+    # fails closed if they are missing when actually used.
+    SUPABASE_URL: str = ""
+    SUPABASE_SERVICE_KEY: str = ""
+    SUPABASE_ANON_KEY: str = ""
+    SUPABASE_DB_PASSWORD: str = ""
     SUPABASE_REGION: str = "eu-central-1"
     
     # Market data provider selection ("massive" | "fmp")
