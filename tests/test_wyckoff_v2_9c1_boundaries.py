@@ -53,7 +53,7 @@ def test_migration_012_exists_for_v2_only():
         "013_wyckoff_v2_shadow_arms.sql"
     ]
     assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
-    assert not list(MIGRATIONS.glob("018_*"))
+    assert not list(MIGRATIONS.glob("019_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
 
 

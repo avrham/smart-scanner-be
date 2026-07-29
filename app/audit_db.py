@@ -40,6 +40,8 @@ MODE_HISTORY_WARMUP_EXPLICIT = "history_warmup_explicit"
 MODE_HISTORY_WARMUP_UNCONFIGURED = "history_warmup_unconfigured"
 MODE_PROSPECTIVE_EXPLICIT = "prospective_explicit"
 MODE_PROSPECTIVE_UNCONFIGURED = "prospective_unconfigured"
+MODE_JOB_WORKER_EXPLICIT = "job_worker_explicit"
+MODE_JOB_WORKER_UNCONFIGURED = "job_worker_unconfigured"
 
 # asyncpg pool kwargs for the AUDIT pool. statement_cache_size=0 disables
 # prepared statements so the pool is safe behind a Supavisor pooler (and
@@ -77,6 +79,17 @@ PROSPECTIVE_POOL_KWARGS = {
     "command_timeout": 120,
     "statement_cache_size": 0,
 }
+# Job-worker pool: WRITE-capable as the least-privilege
+# smart_scanner_prospective_worker role. Used by the dedicated non-HTTP worker
+# process (parent claim/lease/finalize AND the child evaluation subprocess).
+# statement_cache_size=0 for pooler safety; individual SQL statements are fast
+# (the multi-minute cost is CPU in the child, not any single query).
+JOB_WORKER_POOL_KWARGS = {
+    "min_size": 1,
+    "max_size": 5,
+    "command_timeout": 120,
+    "statement_cache_size": 0,
+}
 DEFAULT_POOL_KWARGS = {"min_size": 1, "max_size": 10, "command_timeout": 60}
 
 
@@ -99,6 +112,10 @@ def _history_warmup_url() -> str:
 
 def _prospective_url() -> str:
     return (getattr(settings, "PROSPECTIVE_DATABASE_URL", "") or "").strip()
+
+
+def _job_worker_url() -> str:
+    return (getattr(settings, "JOB_WORKER_DATABASE_URL", "") or "").strip()
 
 
 def maintenance_database_configured() -> bool:
@@ -189,6 +206,9 @@ def audit_dsn_diagnostic() -> Dict[str, Any]:
 
 def get_connection_mode() -> str:
     """The selected connection mode (safe to log/report; never the DSN)."""
+    if getattr(settings, "JOB_WORKER_ENABLED", False):
+        return (MODE_JOB_WORKER_EXPLICIT if _job_worker_url()
+                else MODE_JOB_WORKER_UNCONFIGURED)
     if getattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", False):
         return (MODE_PROSPECTIVE_EXPLICIT if _prospective_url()
                 else MODE_PROSPECTIVE_UNCONFIGURED)
@@ -214,6 +234,17 @@ def select_connection_plan() -> Tuple[str, List[Tuple[str, str]], Dict[str, Any]
     it uses only the explicit audit DSN, or fails closed when none is set.
     """
     from app.deps import build_connection_dsns
+
+    if getattr(settings, "JOB_WORKER_ENABLED", False):
+        raw = _job_worker_url()
+        if not raw:
+            raise AuditDatabaseError(
+                "job worker database not configured: JOB_WORKER_ENABLED=true "
+                "requires JOB_WORKER_DATABASE_URL (no fallback to the prospective, "
+                "audit, maintenance, warmup or default database)")
+        validate_audit_database_url(raw)
+        return (MODE_JOB_WORKER_EXPLICIT, [("job_worker_explicit", raw)],
+                dict(JOB_WORKER_POOL_KWARGS))
 
     if getattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", False):
         raw = _prospective_url()
@@ -279,6 +310,8 @@ __all__ = [
     "MODE_HISTORY_WARMUP_UNCONFIGURED",
     "MODE_PROSPECTIVE_EXPLICIT",
     "MODE_PROSPECTIVE_UNCONFIGURED",
+    "MODE_JOB_WORKER_EXPLICIT",
+    "MODE_JOB_WORKER_UNCONFIGURED",
     "AuditDatabaseError",
     "validate_audit_database_url",
     "audit_dsn_diagnostic",

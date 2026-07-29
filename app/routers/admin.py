@@ -3,7 +3,7 @@ Admin API endpoints for Smart Scanner
 Write endpoints protected by worker token
 """
 
-from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException
+from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException, Response
 from typing import Any, List, Optional
 import re
 import uuid
@@ -3318,9 +3318,59 @@ async def prospective_audit(
         if r["verdict"] == "ENTER":
             ctrl_signal_syms.add(r["symbol"])
     outcomes = await db.fetchval("SELECT count(*)::int FROM strategy_shadow_pair_outcomes")
+    # ---- audit v2: durable-queue job / task / worker state -----------------
+    from datetime import datetime as _dt, timezone as _tz
+    _now = _dt.now(_tz.utc)
+    job_block = None
+    # The durable queue is optional infrastructure (migration 018). If the queue
+    # tables are absent or unreadable, the audit degrades gracefully (job=None)
+    # rather than failing — the shadow reconciliation above is authoritative.
+    try:
+        job = await db.fetchrow(
+            "SELECT * FROM job_runs WHERE registration_id=$1 AND job_type='prospective_campaign' "
+            "ORDER BY created_at DESC LIMIT 1", reg["id"])
+    except (asyncpg.UndefinedTableError, asyncpg.InsufficientPrivilegeError):
+        job = None
+    if job is not None:
+        tc = await db.fetchrow(
+            "SELECT count(*)::int AS total,"
+            " count(*) FILTER (WHERE status='queued')::int AS queued,"
+            " count(*) FILTER (WHERE status IN ('leased','running'))::int AS running,"
+            " count(*) FILTER (WHERE status='retryable')::int AS retryable,"
+            " count(*) FILTER (WHERE status='succeeded')::int AS succeeded,"
+            " count(*) FILTER (WHERE status='failed')::int AS failed,"
+            " count(*) FILTER (WHERE status='cancelled')::int AS cancelled,"
+            " count(*) FILTER (WHERE status IN ('leased','running') AND lease_expires_at > $2)::int AS active_leases,"
+            " count(*) FILTER (WHERE status IN ('leased','running') AND lease_expires_at <= $2)::int AS expired_leases "
+            "FROM job_tasks WHERE job_id=$1", job["id"], _now)
+        last_event = await db.fetchrow(
+            "SELECT event_type, safe_message, created_at FROM job_events WHERE job_id=$1 "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", job["id"])
+        workers = await db.fetch(
+            "SELECT worker_id, status, draining, last_heartbeat_at, current_task_id,"
+            " (NOW() - last_heartbeat_at) > (($2)::text || ' seconds')::interval AS stale "
+            "FROM job_workers WHERE $1 = ANY(queue_names) ORDER BY last_heartbeat_at DESC LIMIT 10",
+            "prospective", int(getattr(settings, "JOB_WORKER_STALE_SECONDS", 90)))
+        job_block = {
+            "job_id": str(job["id"]), "job_status": job["status"],
+            "total_tasks": tc["total"], "queued_tasks": tc["queued"],
+            "running_tasks": tc["running"], "retryable_tasks": tc["retryable"],
+            "succeeded_tasks": tc["succeeded"], "failed_tasks": tc["failed"],
+            "cancelled_tasks": tc["cancelled"], "active_leases": tc["active_leases"],
+            "expired_leases": tc["expired_leases"],
+            "last_job_event": ({"event_type": last_event["event_type"],
+                                "safe_message": last_event["safe_message"],
+                                "created_at": last_event["created_at"].isoformat()}
+                               if last_event else None),
+            "workers": [{"worker_id": w["worker_id"], "status": w["status"],
+                         "draining": w["draining"], "stale": bool(w["stale"]),
+                         "current_task_id": str(w["current_task_id"]) if w["current_task_id"] else None,
+                         "last_heartbeat_at": w["last_heartbeat_at"].isoformat()} for w in workers],
+        }
     return {
         "contract_version": pc.AUDIT_CONTRACT_VERSION,
         "provider_called": False,
+        "job": job_block,
         "registration_id": str(reg["id"]), "registration_identity": reg["registration_identity"],
         "registration_status": reg["status"],
         "campaign_id": str(reg["campaign_id"]) if reg["campaign_id"] else None,
@@ -3350,6 +3400,40 @@ async def prospective_audit(
         "outcome_count": int(outcomes or 0),
         "campaign_completion_state": reg["status"],
     }
+
+
+@router.post("/prospective/jobs")
+async def prospective_enqueue_jobs(
+    response: Response, _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db), body: Any = Body(...)):
+    """prospective_campaign_enqueue.v1 — create ONE durable job + 25 symbol tasks
+    atomically (the PRIMARY execution path; the worker processes them). NO
+    strategy evaluation and NO provider construction happen in this request.
+    Idempotent: exact replay → already_queued (same job); completed → already_applied."""
+    _require_prospective_mode()
+    from app.jobs import contracts as jc
+    from app.jobs.contracts import JobError
+    from app.jobs.prospective_enqueue import enqueue_prospective_campaign
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    if not isinstance(body, dict) or body.get("contract_version") != jc.PROSPECTIVE_CAMPAIGN_ENQUEUE_CONTRACT:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    reg_id = body.get("registration_id")
+    reg_identity = body.get("registration_identity")
+    if not reg_id or not reg_identity:
+        raise HTTPException(status_code=422, detail={"error": "registration_id_and_identity_required"})
+    try:
+        uuid.UUID(str(reg_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail={"error": "invalid_registration_id"})
+    try:
+        result = await enqueue_prospective_campaign(
+            db, registration_id=str(reg_id), registration_identity=str(reg_identity),
+            requested_by="prospective_api")
+    except JobError as e:
+        raise HTTPException(status_code=409, detail={"error": e.safe_error_code})
+    response.status_code = 200 if result.get("status") == "already_applied" else 202
+    return result
 
 
 # --------------------------------------------------------------------------- #

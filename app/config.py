@@ -199,6 +199,57 @@ class Settings(BaseSettings):
     # as a Fly secret / runtime value after independent audit verification.
     MAINTENANCE_LOCKED_COHORT_HASH: str = ""
 
+    # ---------------------------------------------------------------------
+    # Durable PostgreSQL-backed job queue + dedicated worker (migration 018).
+    # PostgreSQL is the ONLY queue source of truth (no Redis/Celery/broker).
+    # The queue framework is generic; only the prospective symbol-evaluation
+    # task type is live-enabled in this task. These are non-secret runtime
+    # knobs (safe to set via Fly env); the worker's database identity is a
+    # SECRET DSN supplied separately (JOB_WORKER_DATABASE_URL).
+    # ---------------------------------------------------------------------
+    # The dedicated worker process (`python -m app.jobs.worker`) is enabled only
+    # on the isolated worker Machine; the web app never runs it. Default false so
+    # every existing deployment and test is unchanged.
+    JOB_WORKER_ENABLED: bool = False
+    JOB_WORKER_TYPE: str = "prospective"
+    # Comma-separated queue names the worker claims from. The prospective queue
+    # is the only live one now.
+    JOB_WORKER_QUEUES: str = "prospective"
+    # Concurrency 1 initially: one CPU-bound strategy evaluation at a time.
+    JOB_WORKER_CONCURRENCY: int = 1
+    # The scheduler leader loop runs INSIDE the worker parent process (never the
+    # web app). Guarded by a Postgres advisory lock so exactly one leader acts.
+    # No schedule is enabled in this task, so an enabled scheduler enqueues
+    # nothing until an operator enables a schedule.
+    JOB_SCHEDULER_ENABLED: bool = True
+    # Explicit worker database identity: a COMPLETE PostgreSQL DSN authenticating
+    # as the least-privilege smart_scanner_prospective_worker role. SECRET; the
+    # worker fails closed if absent. Never falls back to the API/default identity.
+    JOB_WORKER_DATABASE_URL: str = ""
+    # The PostgreSQL role the worker connection MUST authenticate as.
+    JOB_WORKER_EXPECTED_DB_ROLE: str = "smart_scanner_prospective_worker"
+    # Lease / heartbeat / poll / retry defaults (seconds unless noted). The lease
+    # comfortably covers one real Wyckoff-v2 symbol evaluation on shared CPU.
+    JOB_TASK_LEASE_SECONDS: int = 900
+    JOB_WORKER_HEARTBEAT_SECONDS: int = 15
+    JOB_TASK_HEARTBEAT_SECONDS: int = 30
+    JOB_QUEUE_POLL_SECONDS: int = 2
+    JOB_MAX_ATTEMPTS_DEFAULT: int = 3
+    # Bounded exponential backoff between attempts (seconds): attempt 1 -> 60,
+    # attempt 2 -> 300, then terminal. Deterministic (jitter only under a test
+    # hook) so crash-recovery tests are reproducible.
+    JOB_RETRY_BACKOFF_SECONDS: List[int] = [60, 300]
+    # A worker whose last heartbeat is older than this is considered stale/dead
+    # (its leased/running tasks become eligible for lease-expiry reconciliation).
+    JOB_WORKER_STALE_SECONDS: int = 90
+    # The scheduler-leader advisory lock key (distinct from the prospective
+    # execute lock 0x50524F53). "JBSC" = 0x4A425343.
+    JOB_SCHEDULER_ADVISORY_LOCK_KEY: int = 0x4A425343
+    # Test-only synthetic task handlers (controlled retry/crash tests) are
+    # selectable ONLY when this is true. Default false → never in production /
+    # never on the live worker. The live worker app never sets this.
+    JOB_ALLOW_TEST_HANDLERS: bool = False
+
     SCAN_BATCH_SIZE: int = 150
     SCAN_TIMES: List[str] = ["10:00", "14:00", "18:00"]  # UTC times
     

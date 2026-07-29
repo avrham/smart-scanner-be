@@ -17,6 +17,7 @@ from app.prospective_mode import is_prospective_route_allowed
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
 from app.routers import public, admin, outcomes, shadow
+from app.routers import jobs as jobs_router
 from app.utils.logging import setup_logging
 from app.workers.scheduler import start_scheduler
 
@@ -87,6 +88,16 @@ async def lifespan(app: FastAPI):
             "ENABLE_SCHEDULER=false (prospective mode never runs background work)"
         )
 
+    # The durable job WORKER is a dedicated non-HTTP process (`python -m
+    # app.jobs.worker`). The FastAPI HTTP app must NEVER set JOB_WORKER_ENABLED —
+    # doing so would make the web app adopt the worker's DB identity and run the
+    # scheduler leader. Fail fast on that misconfiguration.
+    if settings.JOB_WORKER_ENABLED:
+        raise RuntimeError(
+            "invalid configuration: JOB_WORKER_ENABLED=true is only valid for the "
+            "dedicated worker process (python -m app.jobs.worker), never the HTTP app"
+        )
+
     # Start scheduler if enabled — never in audit / maintenance / warmup mode.
     if (settings.ENABLE_SCHEDULER and not settings.AUDIT_ONLY_MODE
             and not settings.MAINTENANCE_ONLY_MODE
@@ -151,6 +162,7 @@ app.include_router(public.router, prefix="/api", tags=["public"])
 app.include_router(outcomes.router, prefix="/api", tags=["outcomes"])
 app.include_router(shadow.router, prefix="/api", tags=["shadow"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
+app.include_router(jobs_router.router, prefix="/api/admin", tags=["jobs"])
 
 
 @app.middleware("http")

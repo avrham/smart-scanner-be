@@ -206,7 +206,7 @@ class TestMigration010:
             "013_wyckoff_v2_shadow_arms.sql"
         ]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("014_*"))] == ["014_market_bars_4h.sql"]
-        assert not list(MIGRATIONS_DIR.glob("018_*"))
+        assert not list(MIGRATIONS_DIR.glob("019_*"))
         sql = (MIGRATIONS_DIR / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
         assert "strategy_shadow" not in sql.lower()
         assert "wyckoff_mtf_v2" in sql

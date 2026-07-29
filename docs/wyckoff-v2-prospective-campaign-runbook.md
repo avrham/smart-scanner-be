@@ -99,11 +99,35 @@ SEPARATE future task (forward daily bars after the snapshot → returns/excursio
 never run here. The candidate signal for analysis is
 `enter_eligible_without_rollout_gate` (pre_rollout_enter_eligible.v1).
 
+## Execution: durable queue + dedicated worker (PRIMARY) — replaces sync execute
+The synchronous `POST /prospective/execute` evaluated all 25 symbols inside one
+HTTP request; on shared CPU that is minutes/symbol and the web Machine can
+auto-stop mid-run. Execution is now a **durable PostgreSQL-backed job queue**
+processed by a dedicated non-HTTP worker Machine (see
+[durable-job-queue-runbook.md](durable-job-queue-runbook.md)):
+- `POST /api/admin/prospective/jobs` (`prospective_campaign_enqueue.v1`) creates
+  ONE parent job + 25 tasks (one per frozen symbol, deterministic ordinals)
+  ATOMICALLY and returns 202. NO evaluation / NO provider in the request.
+- The worker (`python -m app.jobs.worker`, app `smart-scanner-be-prospective-worker-staging`,
+  role `smart_scanner_prospective_worker`) claims tasks (FOR UPDATE SKIP LOCKED),
+  runs each candidate/control evaluation in a bounded child process, and persists
+  one pair + both arms per symbol via the SAME pure `run_shadow_comparison`
+  (unchanged strategy math). All 25 tasks share ONE `campaign_run_id` → one
+  campaign; registration → executing on first task, → completed when all 25
+  succeed. Crash-safe (leases + reconcile). The synchronous `execute` route
+  remains only for backward compatibility.
+- Monitor: `GET /api/admin/jobs/{job_id}` / `/tasks` / `/events`,
+  `GET /api/admin/jobs/workers`, `GET /api/admin/prospective/audit` (now includes
+  the job/task/worker state). Idempotent: exact enqueue replay → `already_queued`;
+  completed → `already_applied`.
+
 ## Operator workflow (isolated cloud)
 1. `GET /api/admin/prospective/access-check` (expect ready, provider_constructed=false).
 2. `GET /api/admin/prospective/preflight?universe_id=<frozen>&experiment_code=wyckoff_v2_vs_baseline`
    → note snapshot session + hashes.
 3. `POST /api/admin/prospective/register` with the pinned hashes/snapshot.
-4. `POST /api/admin/prospective/execute` with the registration id + pinned hashes.
-5. `GET /api/admin/prospective/audit` → verify 25 pairs, 25+25 evaluations, 0 outcomes.
-6. Replay register + execute → already_registered / already_applied. Stop.
+4. `POST /api/admin/prospective/jobs` with the registration id + identity → 202
+   (queued). The worker processes all 25 symbols asynchronously.
+5. `GET /api/admin/prospective/audit` → verify 25 pairs, 25+25 evaluations, 0
+   outcomes, job succeeded, campaign completed.
+6. Replay enqueue → `already_queued` / `already_applied`. Stop.

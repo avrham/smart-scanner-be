@@ -83,9 +83,13 @@ class TestProductionSurfacesUnmodified:
         migrations = sorted(
             p.name for p in (ROOT / "app" / "db" / "migrations").glob("*.sql")
         )
-        assert migrations[-1] == "017_prospective_campaign_registration.sql"
+        # Durable Job Queue task: migration 018 is the newest additive migration.
+        assert migrations[-1] == "018_durable_job_queue.sql"
         assert [m for m in migrations if m.startswith("014_")] == ["014_market_bars_4h.sql"]
-        assert not [m for m in migrations if m.startswith("018_")]
+        assert [m for m in migrations if m.startswith("017_")] == [
+            "017_prospective_campaign_registration.sql"]
+        assert [m for m in migrations if m.startswith("018_")] == ["018_durable_job_queue.sql"]
+        assert not [m for m in migrations if m.startswith("019_")]
 
 
 class TestSchedulerBoundaries:
