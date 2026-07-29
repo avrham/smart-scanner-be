@@ -16,12 +16,18 @@ DO $$
 DECLARE
   audit_role  constant text := 'smart_scanner_audit_reader';
   warmer_role constant text := 'smart_scanner_history_warmer';
-  rels        constant text[] := ARRAY['public.market_bars_4h', 'public.history_warmup_runs'];
+  rels        text[] := ARRAY['public.market_bars_4h', 'public.history_warmup_runs'];
   t           text;
   rel_oid     regclass;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = warmer_role) THEN
     RAISE EXCEPTION 'role % does not exist (run create_shadow_history_warmer.sql first)', warmer_role;
+  END IF;
+
+  -- history_warmup_run_items (migration 015) gets the SAME policy set as the 4H
+  -- tables when present (older databases predate it).
+  IF to_regclass('public.history_warmup_run_items') IS NOT NULL THEN
+    rels := array_append(rels, 'public.history_warmup_run_items');
   END IF;
 
   FOREACH t IN ARRAY rels LOOP

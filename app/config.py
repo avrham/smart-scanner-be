@@ -141,6 +141,23 @@ class Settings(BaseSettings):
     # (current_user must equal this). Required once HISTORY_WARMUP_DATABASE_URL
     # is set in warmup mode; the access-check refuses readiness otherwise.
     HISTORY_WARMUP_EXPECTED_DB_ROLE: str = "smart_scanner_history_warmer"
+    # Hard cap on symbols per bounded warmup-execute batch. The first pilot is
+    # strictly ONE symbol; the server selects it (the client can never widen a
+    # batch). Never exceeded server-side.
+    HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH: int = 1
+    # Server-enforced minimum wall-clock interval between provider-backed warmup
+    # execute batches, persisted via history_warmup_runs (survives restart /
+    # auto-stop / token rotation). One symbol costs ~1 daily + 1 4H (+ up to 2
+    # benchmark) provider requests plus the client's bounded retries; on the
+    # Massive Basic ~5 req/min plan a second batch inside the rolling minute
+    # window would be throttled (429), so the default holds a full window (75s,
+    # floored to 60s in warmup mode on Massive). Not sensitive.
+    HISTORY_WARMUP_MIN_BATCH_INTERVAL_SECONDS: int = 75
+    # Server-controlled spacing between the individual provider requests WITHIN a
+    # single symbol's warmup (daily then 4H). Belt-and-braces on top of the
+    # provider client's own rolling limiter; keeps a symbol's 2-3 calls under the
+    # 5/min window. Applied OUTSIDE any DB lock/transaction. 0 disables (tests).
+    HISTORY_WARMUP_PROVIDER_REQUEST_SPACING_SECONDS: int = 15
     # STABLE campaign-cohort membership lock (a sha256:... value). Required for
     # ready_for_maintenance_execution; compared against the recomputed cohort
     # lock hash (NEVER the dynamic remaining hash). Empty by default; installed

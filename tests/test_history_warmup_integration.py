@@ -29,7 +29,8 @@ MAINT = "smart_scanner_outcome_maintainer"
 AUDIT = "smart_scanner_audit_reader"
 MIGRATIONS = ["001_initial_schema", "005_massive_provider",
               "010_sma150_shadow_evaluations", "011_shadow_pair_outcomes",
-              "013_wyckoff_v2_shadow_arms", "014_market_bars_4h"]
+              "013_wyckoff_v2_shadow_arms", "014_market_bars_4h",
+              "015_history_warmup_run_items"]
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 

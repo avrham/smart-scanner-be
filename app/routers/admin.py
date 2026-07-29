@@ -2282,6 +2282,61 @@ async def history_warmup_access_check(
         provider_credential_configured=credential)
 
 
+def _resolve_history_warmup_provider():
+    """Obtain the configured provider through the existing abstraction. Tests
+    monkeypatch THIS function to inject a deterministic fake provider — the
+    fake is never selectable via production environment variables."""
+    from app.providers import get_market_data_provider
+    return get_market_data_provider()
+
+
+def _resolved_warmup_min_interval() -> int:
+    from app.maintenance_cooldown import resolve_min_interval_seconds
+    return resolve_min_interval_seconds(
+        settings.HISTORY_WARMUP_MIN_BATCH_INTERVAL_SECONDS,
+        maintenance_only_mode=settings.HISTORY_WARMUP_ONLY_MODE,
+        provider=settings.MARKET_DATA_PROVIDER)
+
+
+async def _latest_history_warmup_run(db):
+    """Most recent history_warmup_runs row (drives the persisted cooldown)."""
+    return await db.fetchrow(
+        "SELECT id, status, finished_at, updated_at, started_at, created_at "
+        "FROM history_warmup_runs "
+        "ORDER BY COALESCE(finished_at, updated_at, started_at, created_at) DESC "
+        "LIMIT 1")
+
+
+async def _latest_run_items(db, symbols):
+    """Latest history_warmup_run_items row per symbol (for the retry plan).
+    Returns {} when the table is absent (pre-migration-015 deploy)."""
+    try:
+        rows = await db.fetch(
+            "SELECT DISTINCT ON (symbol) symbol, status, error_code, error_class, "
+            "retryable, attempt FROM history_warmup_run_items "
+            "WHERE symbol = ANY($1::text[]) ORDER BY symbol, created_at DESC", symbols)
+    except (asyncpg.UndefinedTableError, asyncpg.InsufficientPrivilegeError):
+        return {}
+    return {r["symbol"]: dict(r) for r in rows}
+
+
+async def _warmup_preflight_state(db, syms, *, now):
+    """Recompute the live readiness v2 + preflight v2 (server-authoritative)."""
+    from app.prospective_readiness import build_prospective_readiness_v2
+    from app.history_warmup_execute import build_preflight_v2
+    from app.maintenance_cooldown import compute_cooldown
+    daily_rows, fourh_rows = await _fetch_local_readiness(db, syms)
+    readiness = build_prospective_readiness_v2(syms, daily_rows, fourh_rows, now=now)
+    latest_items = await _latest_run_items(db, syms)
+    cooldown = compute_cooldown(await _latest_history_warmup_run(db),
+                                min_interval_seconds=_resolved_warmup_min_interval(),
+                                now=now)
+    preflight = build_preflight_v2(
+        readiness, latest_items, cooldown,
+        max_batch=settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH)
+    return preflight, readiness, cooldown
+
+
 @router.get("/history-warmup/preflight")
 async def history_warmup_preflight(
     _: str = Depends(get_worker_token),
@@ -2289,40 +2344,275 @@ async def history_warmup_preflight(
     symbols: Optional[str] = None,
 ):
     """Read-only, local-data-only history-warmup preflight
-    (`history_warmup_preflight.v1`): per-symbol readiness (v2 four-state) + a
-    provider-request ESTIMATE (never a call). No write/execute capability."""
+    (`history_warmup_preflight.v2`): readiness v2 four-state + server-selected
+    next batch + retry plan + persisted cooldown. Constructs no provider, calls
+    no market-data API, issues no mutation."""
     _require_history_warmup_mode()
     from datetime import datetime, timezone
-    from app.prospective_readiness import build_prospective_readiness_v2
     syms = _parse_symbols(symbols)
-    daily_rows, fourh_rows = await _fetch_local_readiness(db, syms)
-    readiness = build_prospective_readiness_v2(syms, daily_rows, fourh_rows,
-                                               now=datetime.now(timezone.utc))
-    # provider-request ESTIMATE only (no provider constructed). One daily request
-    # per symbol needing daily warmup + one 4H request per symbol needing 4H
-    # warmup + 2 shared benchmark daily; retry allowance ×2 worst case; 5/min.
-    daily_needed = sum(1 for r in readiness["symbols"]
-                       if r["daily"]["state"] != "ready" or r["control"]["state"] != "ready")
-    fourh_needed = sum(1 for r in readiness["symbols"]
-                       if r["four_hour"]["state"] != "ready")
-    base = daily_needed + fourh_needed + 2
-    return {
-        "contract_version": "history_warmup_preflight.v1",
-        "provider_called": False,
-        "provider_constructed": False,
-        "readiness": readiness,
-        "provider_budget_estimate": {
-            "daily_symbols_requiring_warmup": daily_needed,
-            "four_hour_symbols_requiring_warmup": fourh_needed,
-            "shared_benchmark_requests": 2,
-            "estimated_base_requests": base,
-            "estimated_worst_case_requests": base * 2,
-            "rate_limit_per_minute": settings.MASSIVE_REQUESTS_PER_MINUTE,
-            "estimated_min_duration_seconds": round(base / max(1, settings.MASSIVE_REQUESTS_PER_MINUTE) * 60),
-            "estimated_safe_duration_seconds": base * 15,
-            "note": "estimate only; no provider constructed or called",
-        },
-    }
+    preflight, _readiness, _cooldown = await _warmup_preflight_state(
+        db, syms, now=datetime.now(timezone.utc))
+    return preflight
+
+
+@router.post("/history-warmup/execute")
+async def history_warmup_execute(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...),
+):
+    """The ONE bounded history-warmup mutation route (`history_warmup_execute.v1`).
+    Server-selected single-symbol batch; advisory-locked; cooldown-gated;
+    idempotent by deterministic execution identity. The provider is obtained via
+    the existing abstraction AFTER all gates pass and called OUTSIDE any DB lock
+    wait; no client-supplied provider options, pacing, ranges or table names."""
+    _require_history_warmup_mode()
+    import asyncio
+    import json as _json
+    import uuid as _uuid
+    from datetime import datetime, timezone, timedelta
+    from app.history_warmup_execute import (
+        EXECUTE_CONTRACT_VERSION, EXECUTE_RESULT_CONTRACT_VERSION,
+        HISTORY_WARMUP_ADVISORY_LOCK_KEY, MODE_NORMAL, MODE_RETRY,
+        FORBIDDEN_REQUEST_FIELDS, FOUR_HOUR_FETCH_CALENDAR_DAYS,
+        DAILY_WARMUP_TARGET_SESSIONS, execution_identity, validate_execute_request,
+        normalize_daily_bars, normalize_4h_bars, upsert_daily_bars, upsert_4h_bars,
+        map_provider_error, error_class,
+    )
+    from app.maintenance_cooldown import (
+        COOLDOWN_BLOCKING_REASON, COOLDOWN_UNDER_LOCK_REASON, retry_after_seconds)
+    logger = logging.getLogger(__name__)
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    max_batch = settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH
+    now = datetime.now(timezone.utc)
+
+    # ---- (Step 4a) BASIC request shape validation (before any recompute) ---- #
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    present = [f for f in FORBIDDEN_REQUEST_FIELDS if body.get(f) is not None]
+    if present:
+        raise HTTPException(status_code=422, detail={
+            "error": "forbidden_request_fields", "fields": sorted(present)})
+    if body.get("contract_version") != EXECUTE_CONTRACT_VERSION:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    mode = body.get("mode")
+    if mode not in (MODE_NORMAL, MODE_RETRY):
+        raise HTTPException(status_code=422, detail={"error": "bad_mode"})
+    raw_symbols = body.get("symbols")
+    if not isinstance(raw_symbols, list) or not raw_symbols:
+        raise HTTPException(status_code=422, detail={"error": "symbols_required"})
+    symbols = [str(s).strip().upper() for s in raw_symbols]
+    if len(symbols) != len(set(symbols)):
+        raise HTTPException(status_code=422, detail={"error": "duplicate_symbols"})
+    if len(symbols) > max_batch:
+        raise HTTPException(status_code=422, detail={
+            "error": "batch_size_out_of_range", "max": max_batch})
+    if body.get("limit") != len(symbols):
+        raise HTTPException(status_code=422, detail={"error": "limit_must_equal_symbol_count"})
+
+    plan_hash = (body.get("readiness_manifest_hash") if mode == MODE_NORMAL
+                 else body.get("retry_plan_hash"))
+    identity = execution_identity(
+        mode=mode, universe_hash=body.get("universe_hash"),
+        config_hash=body.get("config_hash"), plan_hash=plan_hash,
+        next_batch_hash=body.get("next_batch_hash"), symbols=symbols)
+
+    # ---- (Step 8/idempotency) completed / in-progress replay short-circuit --- #
+    prior = await db.fetchrow(
+        "SELECT id, status, processed_symbol_count, provider_request_count "
+        "FROM history_warmup_runs WHERE idempotency_key = $1", identity)
+    if prior is not None and prior["status"] == "completed":
+        return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+                "status": "already_applied", "mode": mode,
+                "run_id": str(prior["id"]), "batch_identity": body.get("next_batch_hash"),
+                "symbols": symbols, "provider_request_count": 0,
+                "detail": "identical batch already applied; obtain a fresh preflight"}
+    # A non-completed prior run with this identity is a CRASHED attempt (the
+    # advisory lock guarantees no concurrent live attempt shares it). It is
+    # safely re-drivable: the durable marker is reused (ON CONFLICT DO NOTHING),
+    # the daily/4H upserts are idempotent, and the run item uses ON CONFLICT DO
+    # NOTHING — so re-entry never duplicates bars, items or the run row.
+
+    # ---- (Steps 5-8) recompute live preflight + strict validation ----------- #
+    preflight, readiness_before, cooldown = await _warmup_preflight_state(db, symbols, now=now)
+    verdict = validate_execute_request(body, preflight, max_batch=max_batch)
+    if not verdict["ok"]:
+        reason = verdict["reason"]
+        code = 409 if reason in ("no_next_batch", "mode_not_current_batch",
+                                 "symbols_not_server_selected_batch") else 422
+        raise HTTPException(status_code=code, detail={
+            "error": "history_warmup_validation_failed", "reason": reason})
+
+    # ---- (Step 9) cooldown BEFORE the advisory lock, before any provider ----- #
+    def _cooldown_409(cd, *, reason):
+        return HTTPException(status_code=409, detail={
+            "error": reason,
+            "detail": "provider request window not yet cleared — obtain a fresh "
+                      "preflight after the cooldown elapses",
+            "min_batch_interval_seconds": cd["min_interval_seconds"],
+            "next_execution_not_before": cd["next_execution_not_before"],
+            "cooldown_remaining_seconds": cd["cooldown_remaining_seconds"]},
+            headers={"Retry-After": str(retry_after_seconds(cd))})
+    if not cooldown["execution_allowed_by_cooldown"]:
+        raise _cooldown_409(cooldown, reason=COOLDOWN_BLOCKING_REASON)
+
+    # ---- (Steps 6-7) advisory lock (no provider/write after a lock reject) --- #
+    got_lock = await db.fetchval(
+        "SELECT pg_try_advisory_lock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
+    if not got_lock:
+        raise HTTPException(status_code=409, detail={
+            "error": "history_warmup_execution_locked",
+            "batch_identity": verdict["batch_identity"]})
+    try:
+        # DOUBLE-CHECK under the lock: recompute + re-validate + re-check cooldown
+        # + re-check idempotency so a preflight/execute race cannot slip through.
+        preflight2, readiness_before, cooldown2 = await _warmup_preflight_state(
+            db, symbols, now=datetime.now(timezone.utc))
+        verdict2 = validate_execute_request(body, preflight2, max_batch=max_batch)
+        if not verdict2["ok"] or verdict2["execution_identity"] != identity:
+            raise HTTPException(status_code=409, detail={
+                "error": "history_warmup_plan_changed_under_lock",
+                "reason": verdict2.get("reason")})
+        if not cooldown2["execution_allowed_by_cooldown"]:
+            raise _cooldown_409(cooldown2, reason=COOLDOWN_UNDER_LOCK_REASON)
+        again = await db.fetchval(
+            "SELECT status FROM history_warmup_runs WHERE idempotency_key = $1", identity)
+        if again == "completed":
+            return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+                    "status": "already_applied", "mode": mode, "symbols": symbols,
+                    "provider_request_count": 0}
+
+        symbol = symbols[0]
+        attempt = (await db.fetchval(
+            "SELECT COALESCE(MAX(attempt),0)+1 FROM history_warmup_run_items "
+            "WHERE symbol = $1", symbol)) or 1
+
+        # ---- (Step 10/11) DURABLE pre-provider run marker (idempotency_key) --- #
+        run_id = str(_uuid.uuid4())
+        await db.execute(
+            """
+            INSERT INTO history_warmup_runs(
+              id, mode, status, universe_hash, readiness_manifest_hash,
+              requested_symbols, requested_symbol_count, idempotency_key,
+              started_at, created_at, updated_at)
+            VALUES($1,$2,'running',$3,$4,$5::jsonb,$6,$7,NOW(),NOW(),NOW())
+            ON CONFLICT (idempotency_key) DO NOTHING
+            """,
+            run_id, mode, preflight2["universe_hash"], verdict2["plan_hash"],
+            _json.dumps(symbols), len(symbols), identity)
+        run_row = await db.fetchrow(
+            "SELECT id FROM history_warmup_runs WHERE idempotency_key = $1", identity)
+        run_id = str(run_row["id"])
+
+        # ---- (Step 12) provider obtained + called OUTSIDE the DB tx ---------- #
+        provider = _resolve_history_warmup_provider()
+        provider_name = getattr(provider, "name", None) or "unknown"
+        spacing = max(0, int(settings.HISTORY_WARMUP_PROVIDER_REQUEST_SPACING_SECONDS))
+        req_count = 0
+        daily_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
+        fourh_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
+        daily_status = four_hour_status = "pending"
+        err_code = err_class = None
+        started = datetime.now(timezone.utc)
+        logger.info("[HWX] start run=%s identity=%s mode=%s symbol=%s attempt=%d",
+                    run_id, identity[:16], mode, symbol, attempt)
+        try:
+            # daily
+            frm = (now.date() - timedelta(days=int(DAILY_WARMUP_TARGET_SESSIONS * 1.75)))
+            to = now.date()
+            raw_daily = await provider.get_daily_bars(symbol, str(frm), str(to))
+            req_count += 1
+            daily_bars = normalize_daily_bars(raw_daily, now=now)
+            daily_tel = await upsert_daily_bars(db, daily_bars, source=provider_name)
+            daily_status = "completed"
+            # (Step 9) explicit server-controlled spacing BEFORE the 4H request
+            if spacing:
+                await asyncio.sleep(spacing)
+            # 4H
+            fh_start = now.date() - timedelta(days=FOUR_HOUR_FETCH_CALENDAR_DAYS)
+            payload = await provider.get_intraday_history(
+                symbol, multiplier=4, timespan="hour", start=fh_start, end=to)
+            req_count += 1
+            fourh_rows = normalize_4h_bars(payload, symbol=symbol, now=now)
+            fourh_tel = await upsert_4h_bars(db, fourh_rows)
+            four_hour_status = "completed"
+            item_status = "completed"
+        except Exception as exc:  # noqa: BLE001 - mapped to a bounded safe code
+            err_code, err_class = map_provider_error(exc)
+            item_status = "failed"
+            if daily_status != "completed":
+                daily_status = "failed"
+            if four_hour_status != "completed":
+                four_hour_status = "failed" if daily_status == "completed" else "skipped"
+            logger.warning("[HWX] symbol failed run=%s symbol=%s code=%s class=%s exc=%s",
+                           run_id, symbol, err_code, err_class, type(exc).__name__)
+
+        retryable = err_class == "retryable"
+        # ---- (Step 15) run item + run finalization -------------------------- #
+        await db.execute(
+            """
+            INSERT INTO history_warmup_run_items(
+              run_id, symbol, attempt, mode, status, daily_status, four_hour_status,
+              daily_rows_inserted, daily_rows_updated, daily_rows_unchanged,
+              four_hour_rows_inserted, four_hour_rows_updated, four_hour_rows_unchanged,
+              provider_request_count, error_code, error_class, retryable,
+              execution_identity, started_at, finished_at, created_at, updated_at)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW(),NOW())
+            ON CONFLICT (run_id, symbol, attempt) DO NOTHING
+            """,
+            run_id, symbol, attempt, mode, item_status, daily_status, four_hour_status,
+            daily_tel["inserted"], daily_tel["updated"], daily_tel["unchanged"],
+            fourh_tel["inserted"], fourh_tel["updated"], fourh_tel["unchanged"],
+            req_count, err_code, err_class, retryable, identity, started)
+        run_status = "completed" if item_status == "completed" else "failed"
+        await db.execute(
+            "UPDATE history_warmup_runs SET status=$2, processed_symbol_count=1, "
+            "provider_request_count=$3, error_code=$4, error_message=$5, "
+            "finished_at=NOW(), updated_at=NOW(), cooldown_last_finished_at=NOW(), "
+            "cooldown_next_not_before=NOW() + ($6 || ' seconds')::interval "
+            "WHERE id=$1",
+            run_id, run_status, req_count, err_code,
+            (err_class if err_code else None), str(_resolved_warmup_min_interval()))
+
+        # ---- (Step 16) recompute readiness after ---------------------------- #
+        preflight_after, readiness_after, _ = await _warmup_preflight_state(
+            db, symbols, now=datetime.now(timezone.utc))
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        logger.info("[HWX] done run=%s status=%s symbol=%s daily=%s 4h=%s reqs=%d dur=%.3f",
+                    run_id, run_status, symbol, daily_status, four_hour_status, req_count, elapsed)
+
+        def _tf_state(rd, sym, tf):
+            for s in rd["symbols"]:
+                if s["symbol"] == sym:
+                    return s[tf]["state"]
+            return None
+        return {
+            "contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+            "status": "executed" if run_status == "completed" else "failed",
+            "mode": mode, "run_id": run_id, "batch_identity": verdict2["batch_identity"],
+            "symbols": symbols, "provider_request_count": req_count,
+            "daily": {k: daily_tel[k] for k in ("inserted", "updated", "unchanged", "completed_count")},
+            "four_hour": {k: fourh_tel[k] for k in ("inserted", "updated", "unchanged", "completed_count")},
+            "error": ({"code": err_code, "class": err_class, "retryable": retryable}
+                      if err_code else None),
+            "readiness_before": {
+                "candidate": _tf_state(readiness_before, symbol, "four_hour"),
+                "both_ready": next((s["both_ready"] for s in readiness_before["symbols"]
+                                    if s["symbol"] == symbol), None)},
+            "readiness_after": {
+                "four_hour": _tf_state(readiness_after, symbol, "four_hour"),
+                "both_ready": next((s["both_ready"] for s in readiness_after["symbols"]
+                                    if s["symbol"] == symbol), None),
+                "combined_readiness_manifest_hash": readiness_after["combined_readiness_manifest_hash"]},
+            "cooldown": {
+                "min_batch_interval_seconds": _resolved_warmup_min_interval(),
+                "next_execution_not_before": (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=_resolved_warmup_min_interval())).isoformat()},
+        }
+    finally:
+        await db.fetchval("SELECT pg_advisory_unlock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
 
 
 # --------------------------------------------------------------------------- #

@@ -422,4 +422,4 @@ class TestUnchangedBehavior:
             "013_wyckoff_v2_shadow_arms.sql"
         ]
         assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
-        assert not list(MIGRATIONS.glob("015_*"))
+        assert not list(MIGRATIONS.glob("016_*"))

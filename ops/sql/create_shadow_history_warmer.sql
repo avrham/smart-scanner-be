@@ -65,13 +65,23 @@ GRANT USAGE ON SCHEMA public TO smart_scanner_history_warmer;
 -- 4) SELECT on the EXACT readiness read relations. No ALL TABLES, no default
 --    privileges — future tables are never auto-exposed. Deliberately NO SELECT
 --    on any strategy_shadow_* relation.
-GRANT SELECT ON public.daily_bars           TO smart_scanner_history_warmer;
-GRANT SELECT ON public.market_bars_4h       TO smart_scanner_history_warmer;
-GRANT SELECT ON public.history_warmup_runs  TO smart_scanner_history_warmer;
-GRANT SELECT ON public.patterns             TO smart_scanner_history_warmer;
-GRANT SELECT ON public.pattern_configs      TO smart_scanner_history_warmer;
+GRANT SELECT ON public.daily_bars               TO smart_scanner_history_warmer;
+GRANT SELECT ON public.market_bars_4h           TO smart_scanner_history_warmer;
+GRANT SELECT ON public.history_warmup_runs      TO smart_scanner_history_warmer;
+GRANT SELECT ON public.patterns                 TO smart_scanner_history_warmer;
+GRANT SELECT ON public.pattern_configs          TO smart_scanner_history_warmer;
+-- history_warmup_run_items (migration 015): SELECT only granted when the table
+-- exists (older databases predate it). Owner-safe: skipped when absent.
+DO $$
+BEGIN
+  IF to_regclass('public.history_warmup_run_items') IS NOT NULL THEN
+    GRANT SELECT ON public.history_warmup_run_items TO smart_scanner_history_warmer;
+    GRANT INSERT, UPDATE ON public.history_warmup_run_items TO smart_scanner_history_warmer;
+  END IF;
+END
+$$;
 
--- 5) INSERT + UPDATE on ONLY the three write relations. No DELETE / TRUNCATE /
+-- 5) INSERT + UPDATE on ONLY the write relations. No DELETE / TRUNCATE /
 --    TRIGGER / REFERENCES; no other table.
 GRANT INSERT, UPDATE ON public.daily_bars          TO smart_scanner_history_warmer;
 GRANT INSERT, UPDATE ON public.market_bars_4h      TO smart_scanner_history_warmer;

@@ -190,13 +190,142 @@ full required window); +2 shared benchmark daily. `base = daily_needed +
 fourh_needed + 2`; `worst = base×2`; rate limit 5/min; safe pacing 15 s/request.
 Estimate only — the endpoint never constructs or calls the provider.
 
-## 13. Why there is no execute endpoint yet
+## 13. Bounded warmup EXECUTE (`POST /api/admin/history-warmup/execute`)
 
-This foundation deliberately ships NO `POST /history-warmup/execute`, no provider
-client, no background job, and no new Fly app/credentials. The NEXT task will
-implement bounded provider-backed execution (server-enforced pacing, advisory
-lock, idempotent replay, run telemetry) and live-test it after this foundation
-passes and the migration + role are applied to an isolated non-production DB.
+Implemented (`history_warmup_execute.v1`) and validated ENTIRELY against isolated
+Docker Postgres + a deterministic FAKE provider — no live provider construction
+or network call in this task. `app/history_warmup_execute.py` holds the pure
+logic; the endpoint (`app/routers/admin.py`) mirrors the maintenance execute
+pattern.
+
+**Preflight v2** (`history_warmup_preflight.v2`) is now server-authoritative: it
+returns `universe_hash`, `config_hash`, `combined_readiness_manifest_hash`,
+`normal_pending_symbols`, `retryable_symbols`, `terminal_symbols`,
+`normal_complete`, `retry_plan_hash`, cooldown (`execution_allowed_by_cooldown`,
+`next_execution_not_before`, `cooldown_remaining_seconds`), and a server-selected
+`next_batch` (`available`, `mode`, `symbol_count`, `symbols`, `next_batch_hash`,
+`daily_required`, `four_hour_required`, `estimated_provider_requests`).
+
+**Server-selected batch algorithm (retry-first).** `HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH=1`.
+If any retryable item exists → next batch is the first retryable symbol in RETRY
+mode (normal progression hard-stops until retry drains). Else the first
+normal-pending symbol (not-ready, not-retryable, not-terminal) in NORMAL mode.
+Else unavailable (`all_symbols_launch_ready` / `only_terminal_symbols_remain`).
+Terminal symbols are never auto-selected — they block launch readiness and
+require operator investigation. The client can NEVER widen or choose a symbol
+outside the server-selected batch.
+
+**Execute contract (`history_warmup_execute.v1`).** Body: `contract_version`,
+`mode` (normal|retry), `universe_hash`, `config_hash`, `readiness_manifest_hash`
+(normal) / `retry_plan_hash` (retry), `next_batch_hash`, `symbols` (exactly the
+server-selected batch), `limit==len(symbols)`, `limit<=1`. Forbidden fields
+(422): provider/provider_options, pacing/spacing, retry_count, table/table_name,
+adjustment, from/to/start/end/date_range/timeseries, run_id, batch_index,
+pending, background.
+
+**Server-enforced sequence:** worker token → warmup mode → scheduler off →
+basic shape validation → compute execution identity → completed-idempotency
+short-circuit → recompute live preflight + strict hash/batch validation →
+cooldown gate (before any provider) → advisory lock → double-check
+(recompute/validate/cooldown/idempotency under lock) → durable pre-provider run
+marker (`idempotency_key`) → provider obtained via the existing abstraction and
+called OUTSIDE any open transaction → normalize + canonical daily/4H upserts →
+finalize run + run item → recompute readiness → safe response. Lock released in
+`finally`.
+
+**Advisory lock:** `HISTORY_WARMUP_ADVISORY_LOCK_KEY = 0x57524D55`
+(`pg_try_advisory_lock`, session-scoped, released in `finally`). A second holder
+→ 409 `history_warmup_execution_locked`; no provider call or write occurs after a
+lock rejection.
+
+**Idempotency identity:** `hwx:` + sha256 of
+`contract_version|mode|universe_hash|config_hash|(readiness|retry_plan hash)|next_batch_hash|sorted(symbols)`,
+stored as `history_warmup_runs.idempotency_key`. Identical completed replay → 200
+`already_applied`, same `run_id`, no provider call, no new bars/run/item. A
+different payload yields a different identity (new request, strictly re-validated).
+
+**Cooldown:** `compute_cooldown` (reused, pure) over the latest
+`history_warmup_runs` row (precedence finished_at→updated_at→started_at→created_at)
+survives restart / auto-stop / token rotation. Defaults:
+`HISTORY_WARMUP_MIN_BATCH_INTERVAL_SECONDS=75` (floored to 60 in warmup mode on
+Massive — the rolling 1-minute request window),
+`HISTORY_WARMUP_PROVIDER_REQUEST_SPACING_SECONDS=15` (between a symbol's daily and
+4H request, applied outside locks). Justification: one symbol = 1 daily + 1 4H
+(+ bounded client retries) ≈ the Massive Basic 5/min budget, so a second batch
+inside the window would be 429-throttled. An execute during cooldown → 409
+`provider_cooldown_active` (+ `Retry-After`), BEFORE provider construction.
+
+**Daily persistence:** reuses the canonical `UPSERT_DAILY_BAR_SQL`
+(ON CONFLICT (symbol,trading_date)) on the warmer connection; completed sessions
+only (trading_date < today UTC); inserted/updated/unchanged telemetry via a
+pre-read compare; no DELETE, no raw payload, no second implementation.
+
+**4H persistence (Option A):** provider-native adjusted bars → validate
+OHLC/volume/timestamps, compute `bar_end`, `session_date` (ET of bar_end),
+`is_regular_session`, `is_completed` (only completed bars stored; the forming
+bucket is excluded), `content_fingerprint`; fingerprint-guarded upsert
+(ON CONFLICT (symbol,bar_start,provider,provider_adjustment)) → identical replay
+is a no-op, a correction updates in place (fingerprint + updated_at change, no
+duplicate row). An invalid provider row → bounded `provider_invalid_payload`
+(never coerced).
+
+**Failure taxonomy** (`FAILURE_TAXONOMY`): retryable = provider_rate_limited,
+provider_unavailable, provider_timeout; terminal = provider_invalid_payload,
+daily_persistence_error, four_hour_persistence_error; operator_error =
+provider_auth_error, stale_manifest, stale_retry_plan, stale_next_batch,
+history_warmup_execution_locked, provider_cooldown_active. Auth/config are NEVER
+retryable.
+
+**Retry plan:** `history_warmup_run_items` (migration 015) records one scalar row
+per (run, symbol, attempt). The retry plan = symbols whose LATEST item failed
+retryably; `retry_plan_hash` changes when an item is added / completes / becomes
+terminal. Retry execution is one server-selected symbol, RETRY mode, fresh
+retry-plan + retry-batch hashes, same cooldown + advisory lock.
+
+**Normal vs retry progression:** retry-first hard-stop — normal progression stops
+while any retryable item exists; the operator must run retry mode. Terminal
+failures block launch readiness and require investigation.
+
+**Crash recovery** (bounded points a–d): the durable pre-provider run marker +
+idempotent daily/4H upserts + `ON CONFLICT DO NOTHING` run item guarantee no
+duplicate bars, items or runs on re-entry. A crashed `running` run with the same
+identity is safely re-driven (the advisory lock precludes a concurrent live
+attempt); a crash that persisted some bars changes readiness → the operator
+obtains a fresh preflight (new identity) and re-executes, still without
+duplication. Reconciliation rule: a `running` run older than the cooldown
+interval with no completed twin is stale and may be marked failed by an operator;
+it never blocks a fresh-identity execute.
+
+**Success response** (`history_warmup_execute_result.v1`): contract_version,
+status, mode, run_id, batch_identity, symbols, provider_request_count,
+daily{inserted,updated,unchanged,completed_count},
+four_hour{inserted,updated,unchanged,completed_count}, readiness_before,
+readiness_after, cooldown. Never exposes provider payloads, credentialed URLs,
+tokens, DSNs, passwords or raw traces.
+
+**Provider injection:** production obtains the provider via
+`get_market_data_provider()` (`app/routers/admin._resolve_history_warmup_provider`).
+Tests monkeypatch that resolver with a deterministic fake (`tests/support/fake_provider.py`)
+that performs no network access; a socket guard fails any non-loopback connection.
+The fake is never selectable via `MARKET_DATA_PROVIDER`.
+
+## 13a. One-symbol live cloud pilot (future — do NOT run now)
+
+1. provision an isolated non-production cloud Postgres (Fly Postgres cluster);
+2. apply migrations 001→015 and the role + RLS scripts to it;
+3. deploy the dedicated `smart-scanner-be-history-warmup-staging` Fly app
+   (`HISTORY_WARMUP_ONLY_MODE=true`, `ENABLE_SCHEDULER=false`,
+   `HISTORY_WARMUP_DATABASE_URL` → isolated DB as `smart_scanner_history_warmer`,
+   dedicated `WORKER_TOKEN`);
+4. install the provider credential (`MASSIVE_API_KEY`) on that app ONLY;
+5. `GET access-check` (expect `foundation_ready=true`);
+6. `GET preflight?symbols=<one candidate>` → note the server-selected `next_batch`
+   + hashes;
+7. `POST execute` with exactly the server-selected single symbol + fresh hashes;
+8. verify persisted daily/4H bars + `readiness_after`;
+9. replay the identical body → `already_applied` (no provider call);
+10. attempt an immediate second execute → 409 `provider_cooldown_active`;
+11. stop.
 
 ## 14. Migration application (deferred — see report)
 
