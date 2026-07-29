@@ -194,11 +194,13 @@ class TestAccessCheckPure:
         assert without_cred["foundation_ready"] is True
         assert without_cred["ready"] is True
         assert without_cred["provider_credential_configured"] is False
-        # provider execution never claimed by the foundation
+        # the execute route EXISTS -> execution is SUPPORTED, but only READY once a
+        # credential is also configured; foundation readiness never depends on it.
         for out in (with_cred, without_cred):
-            assert out["provider_execution_supported"] is False
-            assert out["provider_execution_ready"] is False
+            assert out["provider_execution_supported"] is True
             assert out["provider_constructed"] is False
+        assert without_cred["provider_execution_ready"] is False   # no credential
+        assert with_cred["provider_execution_ready"] is True       # ready + credential
 
 
 class TestModeAndAllowlist:

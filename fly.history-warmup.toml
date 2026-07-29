@@ -1,0 +1,52 @@
+# fly.history-warmup.toml — smart-scanner-be-history-warmup-staging
+#
+# ISOLATED HISTORY-WARMUP ENVIRONMENT. A disposable non-production app that
+# connects ONLY to its own isolated Fly Postgres cluster via the dedicated
+# least-privilege smart_scanner_history_warmer role (HISTORY_WARMUP_DATABASE_URL,
+# a SECRET). It exposes ONLY liveness/version + the read-only history-warmup
+# foundation routes + the two bounded POST mutation routes (universes, execute);
+# runs NO scheduler and NO background work. NO provider credential and NO shared
+# Supabase credential are installed. The Git SHA is supplied at deploy time via
+# --build-arg APP_GIT_SHA. Secrets (HISTORY_WARMUP_DATABASE_URL, WORKER_TOKEN)
+# are set via `fly secrets import` — never here.
+
+app = 'smart-scanner-be-history-warmup-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_ENVIRONMENT = 'history-warmup-staging'
+  HISTORY_WARMUP_ONLY_MODE = 'true'        # expose ONLY liveness + warmup routes
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  ENABLE_SCHEDULER = 'false'               # never any background work
+  REQUIRE_WORKER_TOKEN = 'true'
+  MARKET_DATA_PROVIDER = 'massive'         # provider NAME only; NO key installed
+  LOG_FORMAT = 'json'
+  HISTORY_WARMUP_EXPECTED_DB_ROLE = 'smart_scanner_history_warmer'
+  HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH = '1'
+  HISTORY_WARMUP_MIN_BATCH_INTERVAL_SECONDS = '75'
+  HISTORY_WARMUP_PROVIDER_REQUEST_SPACING_SECONDS = '15'
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/version'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512

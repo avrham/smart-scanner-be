@@ -82,13 +82,14 @@ def evaluate_history_warmup_access(
         # Explicitly SEPARATE foundation readiness from provider execution. The
         # foundation (isolated DB + least-privilege role + mode) is usable with
         # NO provider credential: `foundation_ready` NEVER depends on
-        # provider_credential_configured. Provider execution does not exist in
-        # this foundation, so `provider_execution_supported` is always false and
-        # `provider_execution_ready` is always false — a missing provider key can
-        # never make the database foundation appear unusable.
+        # provider_credential_configured. The bounded execute route EXISTS in this
+        # build, so `provider_execution_supported` is true; but execution is only
+        # `provider_execution_ready` once a provider credential is ALSO configured
+        # (and the foundation is ready). A missing provider key therefore leaves
+        # execution not-ready WITHOUT ever making the database foundation unusable.
         "foundation_ready": ready,
-        "provider_execution_supported": False,
-        "provider_execution_ready": False,
+        "provider_execution_supported": True,
+        "provider_execution_ready": bool(ready and provider_credential_configured),
         "reasons": reasons,
         "database_identity": database_identity,
         "expected_database_role": expected_role or None,
