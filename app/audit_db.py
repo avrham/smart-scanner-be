@@ -36,6 +36,8 @@ MODE_AUDIT_EXPLICIT = "audit_explicit"
 MODE_AUDIT_UNCONFIGURED = "audit_unconfigured"
 MODE_MAINTENANCE_EXPLICIT = "maintenance_explicit"
 MODE_MAINTENANCE_UNCONFIGURED = "maintenance_unconfigured"
+MODE_HISTORY_WARMUP_EXPLICIT = "history_warmup_explicit"
+MODE_HISTORY_WARMUP_UNCONFIGURED = "history_warmup_unconfigured"
 
 # asyncpg pool kwargs for the AUDIT pool. statement_cache_size=0 disables
 # prepared statements so the pool is safe behind a Supavisor pooler (and
@@ -50,6 +52,15 @@ AUDIT_POOL_KWARGS = {
 # Supavisor safety; a bounded command_timeout matches the role's server-side
 # statement_timeout so a stuck write can never hang a batch indefinitely.
 MAINTENANCE_POOL_KWARGS = {
+    "min_size": 1,
+    "max_size": 5,
+    "command_timeout": 60,
+    "statement_cache_size": 0,
+}
+# History-warmup pool: WRITE-capable (the dedicated warmer role performs the
+# narrowly-authorized 4H/daily writes). statement_cache_size=0 for Supavisor
+# safety; bounded command_timeout matches the role's server-side statement_timeout.
+HISTORY_WARMUP_POOL_KWARGS = {
     "min_size": 1,
     "max_size": 5,
     "command_timeout": 60,
@@ -71,8 +82,16 @@ def _maintenance_url() -> str:
     return (getattr(settings, "MAINTENANCE_DATABASE_URL", "") or "").strip()
 
 
+def _history_warmup_url() -> str:
+    return (getattr(settings, "HISTORY_WARMUP_DATABASE_URL", "") or "").strip()
+
+
 def maintenance_database_configured() -> bool:
     return bool(_maintenance_url())
+
+
+def history_warmup_database_configured() -> bool:
+    return bool(_history_warmup_url())
 
 
 def validate_audit_database_url(url: str) -> Dict[str, Any]:
@@ -155,6 +174,9 @@ def audit_dsn_diagnostic() -> Dict[str, Any]:
 
 def get_connection_mode() -> str:
     """The selected connection mode (safe to log/report; never the DSN)."""
+    if getattr(settings, "HISTORY_WARMUP_ONLY_MODE", False):
+        return (MODE_HISTORY_WARMUP_EXPLICIT if _history_warmup_url()
+                else MODE_HISTORY_WARMUP_UNCONFIGURED)
     if getattr(settings, "MAINTENANCE_ONLY_MODE", False):
         return (MODE_MAINTENANCE_EXPLICIT if _maintenance_url()
                 else MODE_MAINTENANCE_UNCONFIGURED)
@@ -174,6 +196,18 @@ def select_connection_plan() -> Tuple[str, List[Tuple[str, str]], Dict[str, Any]
     it uses only the explicit audit DSN, or fails closed when none is set.
     """
     from app.deps import build_connection_dsns
+
+    if getattr(settings, "HISTORY_WARMUP_ONLY_MODE", False):
+        raw = _history_warmup_url()
+        if not raw:
+            raise AuditDatabaseError(
+                "history-warmup database not configured: HISTORY_WARMUP_ONLY_MODE"
+                "=true requires HISTORY_WARMUP_DATABASE_URL (no fallback to the "
+                "audit, maintenance or default database)"
+            )
+        validate_audit_database_url(raw)  # same DSN validation; raises on invalid
+        return (MODE_HISTORY_WARMUP_EXPLICIT, [("history_warmup_explicit", raw)],
+                dict(HISTORY_WARMUP_POOL_KWARGS))
 
     if getattr(settings, "MAINTENANCE_ONLY_MODE", False):
         raw = _maintenance_url()
@@ -212,11 +246,14 @@ __all__ = [
     "MODE_AUDIT_UNCONFIGURED",
     "MODE_MAINTENANCE_EXPLICIT",
     "MODE_MAINTENANCE_UNCONFIGURED",
+    "MODE_HISTORY_WARMUP_EXPLICIT",
+    "MODE_HISTORY_WARMUP_UNCONFIGURED",
     "AuditDatabaseError",
     "validate_audit_database_url",
     "audit_dsn_diagnostic",
     "get_connection_mode",
     "audit_database_configured",
     "maintenance_database_configured",
+    "history_warmup_database_configured",
     "select_connection_plan",
 ]

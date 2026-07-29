@@ -91,10 +91,11 @@ def pg():
         r = _psql(cid, None, path=os.path.join(REPO, "ops", "sql",
                                                "create_shadow_history_warmer_rls_policies.sql"))
         assert r.returncode == 0, f"warmer rls: {r.stderr[-500:]}"
-        yield {"cid": cid,
+        yield {"cid": cid, "hp": hp,
                "warmer": f"postgresql://{WARMER}:{WARMER_PW}@127.0.0.1:{hp}/{DBNAME}",
                "maint": f"postgresql://{MAINT}:{MAINT_PW}@127.0.0.1:{hp}/{DBNAME}",
-               "audit": f"postgresql://{AUDIT}:{AUDIT_PW}@127.0.0.1:{hp}/{DBNAME}"}
+               "audit": f"postgresql://{AUDIT}:{AUDIT_PW}@127.0.0.1:{hp}/{DBNAME}",
+               "owner": f"postgresql://postgres:postgres@127.0.0.1:{hp}/{DBNAME}"}
     finally:
         _sh(["docker", "stop", cid])
 
@@ -144,6 +145,39 @@ class TestWarmerGrantsAndRls:
                 ):
                     with pytest.raises(asyncpg.PostgresError):
                         await c.execute(stmt)
+            finally:
+                await c.close()
+        asyncio.run(drive())
+
+    def test_warmer_daily_bars_functional_under_rls(self, pg):
+        """Under the production posture (RLS ENABLED on daily_bars) the warmer's
+        daily_bars grant is inert without a policy. The warmer RLS script adds
+        SELECT/INSERT/UPDATE policies (no DELETE) so the already-granted daily
+        operations work; DELETE stays denied."""
+        # Owner enables RLS on daily_bars, then re-runs the (rerunnable) warmer
+        # RLS policy script — which now provisions the warmer daily_bars policies.
+        r = _psql(pg["cid"], "ALTER TABLE public.daily_bars ENABLE ROW LEVEL SECURITY;")
+        assert r.returncode == 0, r.stderr[-300:]
+        r = _psql(pg["cid"], None, path=os.path.join(
+            REPO, "ops", "sql", "create_shadow_history_warmer_rls_policies.sql"))
+        assert r.returncode == 0, r.stderr[-400:]
+
+        async def drive():
+            c = await _c(pg["warmer"])
+            try:
+                tr = c.transaction(); await tr.start()
+                try:
+                    await c.execute(
+                        "INSERT INTO public.daily_bars(symbol,trading_date,open,high,low,"
+                        "close,volume) VALUES('ZZDLYRLS','2026-06-11',1,2,0.5,1.5,100)")
+                    assert await c.fetchval(
+                        "SELECT count(*) FROM public.daily_bars WHERE symbol='ZZDLYRLS'") == 1
+                    await c.execute(
+                        "UPDATE public.daily_bars SET volume=200 WHERE symbol='ZZDLYRLS'")
+                finally:
+                    await tr.rollback()
+                with pytest.raises(asyncpg.PostgresError):
+                    await c.execute("DELETE FROM public.daily_bars")
             finally:
                 await c.close()
         asyncio.run(drive())

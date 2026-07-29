@@ -129,7 +129,17 @@ class Settings(BaseSettings):
     # ENABLE_SCHEDULER=true. Default false leaves all deployments unchanged.
     # NOTE: this task adds NO provider-backed execute route under this mode.
     HISTORY_WARMUP_ONLY_MODE: bool = False
-    # The PostgreSQL role the history-warmup connection must authenticate as.
+    # Explicit history-warmup database identity. A COMPLETE PostgreSQL DSN used
+    # ONLY when HISTORY_WARMUP_ONLY_MODE=true (fail closed if absent — never
+    # falls back to AUDIT_DATABASE_URL, MAINTENANCE_DATABASE_URL or the
+    # Supabase-derived default identity). It supplies the dedicated
+    # least-privilege smart_scanner_history_warmer role directly. SECRET: never
+    # logged, never returned by any endpoint, never committed. Supplied via
+    # `fly secrets set` on the dedicated (isolated) warmup app only.
+    HISTORY_WARMUP_DATABASE_URL: str = ""
+    # The PostgreSQL role the history-warmup connection must authenticate as
+    # (current_user must equal this). Required once HISTORY_WARMUP_DATABASE_URL
+    # is set in warmup mode; the access-check refuses readiness otherwise.
     HISTORY_WARMUP_EXPECTED_DB_ROLE: str = "smart_scanner_history_warmer"
     # STABLE campaign-cohort membership lock (a sha256:... value). Required for
     # ready_for_maintenance_execution; compared against the recomputed cohort

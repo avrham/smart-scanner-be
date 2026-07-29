@@ -177,6 +177,29 @@ class TestAccessCheckPure:
         assert "database_identity_mismatch" in out["reasons"]
         assert "scheduler_enabled" in out["reasons"]
 
+    def test_foundation_ready_independent_of_provider_credential(self):
+        """A missing provider key must NEVER make the DB foundation unusable:
+        foundation_ready mirrors `ready` and ignores provider_credential_configured;
+        provider execution is not part of this foundation (always false)."""
+        kw = dict(
+            database_identity="smart_scanner_history_warmer",
+            expected_role="smart_scanner_history_warmer",
+            history_warmup_only_mode=True, scheduler_enabled=False,
+            provider_name="massive",
+            relation_privileges=self._privs(), relation_exists=self._exists())
+        with_cred = evaluate_history_warmup_access(provider_credential_configured=True, **kw)
+        without_cred = evaluate_history_warmup_access(provider_credential_configured=False, **kw)
+        # foundation readiness is identical with and without a provider credential
+        assert with_cred["foundation_ready"] is True
+        assert without_cred["foundation_ready"] is True
+        assert without_cred["ready"] is True
+        assert without_cred["provider_credential_configured"] is False
+        # provider execution never claimed by the foundation
+        for out in (with_cred, without_cred):
+            assert out["provider_execution_supported"] is False
+            assert out["provider_execution_ready"] is False
+            assert out["provider_constructed"] is False
+
 
 class TestModeAndAllowlist:
     def test_config_default_false(self):

@@ -17,24 +17,35 @@ from app.audit_db import (
     MODE_AUDIT_EXPLICIT,
     MODE_AUDIT_UNCONFIGURED,
     MODE_DEFAULT_SUPABASE,
+    MODE_HISTORY_WARMUP_EXPLICIT,
+    MODE_HISTORY_WARMUP_UNCONFIGURED,
     AuditDatabaseError,
     audit_dsn_diagnostic,
     get_connection_mode,
+    history_warmup_database_configured,
     select_connection_plan,
     validate_audit_database_url,
 )
 
 VALID = ("postgresql://smart_scanner_audit_reader:p%40ss@"
          "aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require")
+WARMER_DSN = ("postgresql://smart_scanner_history_warmer:w%40rm@"
+              "127.0.0.1:5432/warmupdb?sslmode=disable")
 
 
 @pytest.fixture(autouse=True)
 def _restore_settings():
     saved = (settings.AUDIT_ONLY_MODE, settings.AUDIT_DATABASE_URL,
-             settings.AUDIT_EXPECTED_DB_ROLE)
+             settings.AUDIT_EXPECTED_DB_ROLE,
+             settings.MAINTENANCE_ONLY_MODE,
+             settings.HISTORY_WARMUP_ONLY_MODE,
+             settings.HISTORY_WARMUP_DATABASE_URL)
     yield
     (settings.AUDIT_ONLY_MODE, settings.AUDIT_DATABASE_URL,
-     settings.AUDIT_EXPECTED_DB_ROLE) = saved
+     settings.AUDIT_EXPECTED_DB_ROLE,
+     settings.MAINTENANCE_ONLY_MODE,
+     settings.HISTORY_WARMUP_ONLY_MODE,
+     settings.HISTORY_WARMUP_DATABASE_URL) = saved
 
 
 class TestUrlValidation:
@@ -109,6 +120,47 @@ class TestConnectionSelection:
         # no-op safe when pool is None
         asyncio.run(close_db_pool())
         assert deps._db_pool is None
+
+
+class TestHistoryWarmupConnectionSelection:
+    """HISTORY_WARMUP_ONLY_MODE gets its OWN explicit DSN + role — it must never
+    fall back to the Supabase-derived default (which would target the shared
+    store as the default identity). Fail closed when no warmup DSN is set."""
+
+    def test_warmup_mode_without_url_fails_closed(self):
+        settings.AUDIT_ONLY_MODE = False
+        settings.MAINTENANCE_ONLY_MODE = False
+        settings.HISTORY_WARMUP_ONLY_MODE = True
+        settings.HISTORY_WARMUP_DATABASE_URL = ""
+        assert history_warmup_database_configured() is False
+        assert get_connection_mode() == MODE_HISTORY_WARMUP_UNCONFIGURED
+        with pytest.raises(AuditDatabaseError,
+                           match="history-warmup database not configured"):
+            select_connection_plan()
+
+    def test_warmup_mode_with_url_uses_only_explicit_dsn(self):
+        settings.AUDIT_ONLY_MODE = False
+        settings.MAINTENANCE_ONLY_MODE = False
+        settings.HISTORY_WARMUP_ONLY_MODE = True
+        settings.HISTORY_WARMUP_DATABASE_URL = WARMER_DSN
+        assert history_warmup_database_configured() is True
+        assert get_connection_mode() == MODE_HISTORY_WARMUP_EXPLICIT
+        mode, candidates, kwargs = select_connection_plan()
+        assert mode == MODE_HISTORY_WARMUP_EXPLICIT
+        assert candidates == [("history_warmup_explicit", WARMER_DSN)]  # no fallback
+        assert len(candidates) == 1
+        assert kwargs["statement_cache_size"] == 0   # write-capable, pooler-safe
+
+    def test_warmup_mode_precedes_default_supabase_path(self):
+        # Even with valid Supabase settings present, warmup mode never returns
+        # the 3 legacy Supabase-derived candidates.
+        settings.AUDIT_ONLY_MODE = False
+        settings.MAINTENANCE_ONLY_MODE = False
+        settings.HISTORY_WARMUP_ONLY_MODE = True
+        settings.HISTORY_WARMUP_DATABASE_URL = WARMER_DSN
+        mode, candidates, _ = select_connection_plan()
+        assert mode == MODE_HISTORY_WARMUP_EXPLICIT
+        assert all(lbl == "history_warmup_explicit" for lbl, _ in candidates)
 
 
 class TestGetDbFailClosed:

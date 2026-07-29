@@ -79,6 +79,16 @@ def evaluate_history_warmup_access(
     return {
         "access_check_contract_version": HISTORY_WARMUP_ACCESS_CHECK_CONTRACT_VERSION,
         "ready": ready,
+        # Explicitly SEPARATE foundation readiness from provider execution. The
+        # foundation (isolated DB + least-privilege role + mode) is usable with
+        # NO provider credential: `foundation_ready` NEVER depends on
+        # provider_credential_configured. Provider execution does not exist in
+        # this foundation, so `provider_execution_supported` is always false and
+        # `provider_execution_ready` is always false — a missing provider key can
+        # never make the database foundation appear unusable.
+        "foundation_ready": ready,
+        "provider_execution_supported": False,
+        "provider_execution_ready": False,
         "reasons": reasons,
         "database_identity": database_identity,
         "expected_database_role": expected_role or None,

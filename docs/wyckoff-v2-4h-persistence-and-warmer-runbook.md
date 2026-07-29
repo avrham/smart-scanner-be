@@ -105,6 +105,43 @@ Defaults false; mutually exclusive with `AUDIT_ONLY_MODE` and
 `/api/admin/history-warmup/{access-check, preflight}`. No strategy / campaign /
 outcome / execute route is reachable. Testable locally (no new Fly app created).
 
+**Connection identity (`HISTORY_WARMUP_DATABASE_URL`).** In warmup mode the app
+connects using ONLY the explicit `HISTORY_WARMUP_DATABASE_URL` DSN (the dedicated
+`smart_scanner_history_warmer` role), selected by
+`app.audit_db.select_connection_plan` — mode `history_warmup_explicit`. It FAILS
+CLOSED when the DSN is absent (never falls back to `AUDIT_DATABASE_URL`,
+`MAINTENANCE_DATABASE_URL` or the Supabase-derived default identity — that
+default would target the shared store as `postgres`). The DSN is a Fly secret on
+the dedicated (isolated) warmup app only; never logged, never returned, never
+committed. Same DSN validation/redaction as the audit/maintenance URLs.
+
+## 7a. Isolated-environment foundation validation (this task)
+
+The full foundation was provisioned + validated against a genuinely isolated
+non-production PostgreSQL cluster (local Docker `postgres:16-alpine`, a distinct
+physical cluster — different host `127.0.0.1`, different db `warmupdb`, distinct
+`system_identifier`, empty of any real cohort). Cloud provisioning (a dedicated
+Fly Postgres cluster + the dedicated `smart-scanner-be-history-warmup-staging`
+Fly app) was intentionally DEFERRED — see §14. The shared Supabase store was
+never migrated, written, or connected to.
+
+Two bounded foundation fixes were made during isolated live validation:
+
+1. **Warmup connection wiring** (`HISTORY_WARMUP_DATABASE_URL`, §7). Before the
+   fix, warmup mode had no connection branch and fell through to the
+   Supabase-derived default identity — it could not connect to the isolated DB
+   as the warmer role at all.
+2. **Warmer `daily_bars` RLS policies.** The live DB enables RLS on `daily_bars`
+   (one of the eight audit relations). The warmer HELD the `daily_bars`
+   SELECT/INSERT/UPDATE grant but, with RLS on and no warmer policy, the grant
+   was inert: the warmer read ZERO daily rows (breaking readiness run as the
+   warmer) and was refused writes. `create_shadow_history_warmer_rls_policies.sql`
+   now adds guarded warmer SELECT/INSERT/UPDATE policies on `daily_bars` (NO
+   DELETE), only when RLS is enabled there. No new privilege beyond the existing
+   grant. Access-check also now exposes `foundation_ready` /
+   `provider_execution_supported` / `provider_execution_ready` to make explicit
+   that a missing provider credential NEVER makes the DB foundation unusable.
+
 ## 8. Access-check (`GET /api/admin/history-warmup/access-check`, `history_warmup_access_check.v1`)
 
 Read-only privilege verdict via PostgreSQL privilege functions
