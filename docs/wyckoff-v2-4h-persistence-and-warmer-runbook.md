@@ -309,23 +309,91 @@ Tests monkeypatch that resolver with a deterministic fake (`tests/support/fake_p
 that performs no network access; a socket guard fails any non-loopback connection.
 The fake is never selectable via `MARKET_DATA_PROVIDER`.
 
+## 13b. Crash-safe execution + frozen-universe identity (migration 016)
+
+**Frozen universes.** `history_warmup_universes` + `history_warmup_universe_symbols`
+(migration 016) are the server-authoritative executable symbol sets. Lifecycle:
+`draft` → `frozen` → `superseded`. `POST /api/admin/history-warmup/universes`
+(`history_warmup_universe_create.v1`) creates one bounded universe (uppercased,
+deduped symbols, deterministic `universe_hash = sha256(code|version|ordered
+members)`, capped at `HISTORY_WARMUP_MAX_UNIVERSE_SYMBOLS`) and freezes it
+atomically when `freeze:true`. **Immutability is DB-enforced** by triggers
+(`history_warmup_universe_symbols_guard`, `history_warmup_universes_guard`):
+once a universe is not `draft`, membership INSERT/UPDATE/DELETE is denied and the
+identity/hash/count are frozen; `frozen`→`draft` is denied; `superseded` is
+terminal — regardless of role, above RLS/grants. Only a `frozen` universe is
+executable. The warmer may create+freeze (SELECT/INSERT/UPDATE on the universe,
+SELECT/INSERT its draft membership) but never mutate frozen membership, never
+DELETE. Audit reader: SELECT only. Outcome maintainer: no access.
+
+**Preflight v3** (`history_warmup_preflight.v3`) takes `universe_id` (or
+`universe_code`+`universe_version`), loads all members from the DB, recomputes
+the universe hash and proves it equals the pinned hash, then returns the frozen
+identity + readiness v2 + retry plan + provider cooldown + `execution_state`
+(active/abandoned lease) + the server-selected next batch (≤1 symbol). A
+`?symbols=` list is an EXPLICITLY NON-EXECUTABLE preview (`executable:false`, no
+next batch).
+
+**Execute v2** (`history_warmup_execute.v2`) requires `universe_id`; the server
+independently loads the frozen universe, recomputes membership/hash/readiness/
+retry/next-batch, and rejects unknown / draft / superseded / hash-mismatch /
+membership-mismatch / symbol-not-in-universe / stale-hash — all BEFORE any
+provider construction. The execution identity binds the `universe_id`.
+
+**Provider-activity markers + fail-closed cooldown.** Before the first provider
+call the run's `provider_activity_state` is set to `started` +
+`provider_activity_started_at` and COMMITTED; `last_provider_activity_at` +
+`provider_request_count_attempted` update around each request. The provider
+cooldown source of truth is the latest run with `provider_activity_state <>
+'none'`, using `last_provider_activity_at` (or `provider_activity_started_at`)
++ interval — NOT run start / `finished_at`. So a crash AFTER provider activity
+keeps the cooldown fail-closed even if the run never finalizes, while a crash
+BEFORE provider activity (`state='none'`) never establishes cooldown and is
+immediately re-drivable. A request rejected before provider construction
+(stale/locked/cooldown/auth/batch) creates no activity and never extends cooldown.
+
+**Execution leases.** The pre-provider run marker sets
+`execution_lease_expires_at = now + HISTORY_WARMUP_EXECUTION_LEASE_SECONDS`
+(default 120). Same-identity request while the lease is valid → 409
+`history_warmup_execution_in_progress` (with `lease_expires_at` + `Retry-After`).
+Once the lease expires the run is ABANDONED and never a permanent blocker.
+
+**Completed-replay precedence.** Identity is derived and looked up BEFORE any
+stale/cooldown check: a completed (or reconciled) run with the same identity
+returns `already_applied` / `reconciled_complete` (200) with no provider call —
+even during active cooldown and even if readiness changed after it succeeded.
+A FRESH next-batch request during cooldown returns 409 `provider_cooldown_active`.
+
+**Abandoned-run recovery.** For an expired-lease `running` run with the same
+identity (under the advisory lock): (a) if the stored symbols now satisfy the
+exact requested readiness (`both_ready`), finalize `reconciled_complete` from the
+persisted local bars — NO provider call (Part 15); (b) else if provider activity
+occurred and the cooldown is active → 409 `provider_cooldown_active` (re-drive
+after expiry); (c) else re-drive reusing the same run marker (durable idempotency
++ idempotent daily/4H upserts + `ON CONFLICT DO NOTHING` run item → no duplicate
+bars/items/runs). Reconciliation never infers success from the mere presence of
+bars — it requires the full `both_ready` target.
+
 ## 13a. One-symbol live cloud pilot (future — do NOT run now)
 
 1. provision an isolated non-production cloud Postgres (Fly Postgres cluster);
-2. apply migrations 001→015 and the role + RLS scripts to it;
+2. apply migrations 001→016 and the role + RLS scripts to it;
 3. deploy the dedicated `smart-scanner-be-history-warmup-staging` Fly app
    (`HISTORY_WARMUP_ONLY_MODE=true`, `ENABLE_SCHEDULER=false`,
    `HISTORY_WARMUP_DATABASE_URL` → isolated DB as `smart_scanner_history_warmer`,
    dedicated `WORKER_TOKEN`);
 4. install the provider credential (`MASSIVE_API_KEY`) on that app ONLY;
 5. `GET access-check` (expect `foundation_ready=true`);
-6. `GET preflight?symbols=<one candidate>` → note the server-selected `next_batch`
-   + hashes;
-7. `POST execute` with exactly the server-selected single symbol + fresh hashes;
-8. verify persisted daily/4H bars + `readiness_after`;
-9. replay the identical body → `already_applied` (no provider call);
-10. attempt an immediate second execute → 409 `provider_cooldown_active`;
-11. stop.
+6. `POST /history-warmup/universes` with `{universe_code, symbols:[...one or a few],
+   freeze:true}` → note `universe_id`;
+7. `GET preflight?universe_id=<id>` → note the server-selected `next_batch` + hashes;
+8. `POST execute` (v2) with `universe_id` + exactly the server-selected single
+   symbol + fresh hashes;
+9. verify persisted daily/4H bars + `readiness_after`;
+10. replay the identical body → `already_applied` (no provider call), even though
+    cooldown is now active;
+11. attempt a FRESH next-symbol execute → 409 `provider_cooldown_active`;
+12. stop.
 
 ## 14. Migration application (deferred — see report)
 

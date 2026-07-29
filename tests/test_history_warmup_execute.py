@@ -13,8 +13,11 @@ from app.history_warmup_execute import (
     EXECUTE_CONTRACT_VERSION, MODE_NORMAL, MODE_RETRY, FAILURE_TAXONOMY,
     RETRYABLE, TERMINAL, OPERATOR_ERROR, error_class, is_retryable,
     map_provider_error, HistoryWarmupPayloadError, compute_retry_plan,
-    compute_progress, select_next_batch, build_preflight_v2, execution_identity,
-    validate_execute_request, normalize_daily_bars, normalize_4h_bars,
+    compute_progress, select_next_batch, build_preflight_v2, build_preflight_v3,
+    execution_identity, validate_execute_request, normalize_daily_bars,
+    normalize_4h_bars, normalize_universe_symbols, compute_universe_hash,
+    provider_activity_reference, UniverseError, PROVIDER_ACTIVITY_NONE,
+    PROVIDER_ACTIVITY_STARTED,
 )
 from tests.support.fake_provider import (
     make_ready_4h, make_invalid_4h, rate_limited_error, auth_error)
@@ -161,15 +164,68 @@ class TestValidateExecuteRequest:
 
 class TestExecutionIdentity:
     def test_deterministic(self):
-        kw = dict(mode="normal", universe_hash="u", config_hash="c", plan_hash="p",
-                  next_batch_hash="n", symbols=["AAA"])
+        kw = dict(mode="normal", universe_id="u1", universe_hash="u", config_hash="c",
+                  plan_hash="p", next_batch_hash="n", symbols=["AAA"])
         assert execution_identity(**kw) == execution_identity(**kw)
 
     def test_payload_sensitive(self):
-        base = dict(mode="normal", universe_hash="u", config_hash="c", plan_hash="p",
-                    next_batch_hash="n", symbols=["AAA"])
+        base = dict(mode="normal", universe_id="u1", universe_hash="u", config_hash="c",
+                    plan_hash="p", next_batch_hash="n", symbols=["AAA"])
         assert execution_identity(**base) != execution_identity(**{**base, "symbols": ["BBB"]})
         assert execution_identity(**base) != execution_identity(**{**base, "next_batch_hash": "n2"})
+        # bound to the immutable universe id
+        assert execution_identity(**base) != execution_identity(**{**base, "universe_id": "u2"})
+
+
+class TestUniverseIdentity:
+    def test_normalize_upper_dedupe_order(self):
+        out = normalize_universe_symbols([" aapl ", "MSFT", "aapl", "nke"], max_symbols=100)
+        assert out["symbols"] == ["AAPL", "MSFT", "NKE"]
+        assert out["duplicates_removed"] == 1
+
+    def test_normalize_rejects_empty_and_overcap_and_invalid(self):
+        with pytest.raises(UniverseError):
+            normalize_universe_symbols([], max_symbols=100)
+        with pytest.raises(UniverseError):
+            normalize_universe_symbols(["A", "B", "C"], max_symbols=2)
+        with pytest.raises(UniverseError):
+            normalize_universe_symbols(["A B"], max_symbols=100)   # embedded space
+
+    def test_universe_hash_deterministic_and_order_sensitive(self):
+        a = compute_universe_hash(universe_code="U", universe_version=1,
+                                  symbols_in_ordinal_order=["AAA", "BBB"])
+        b = compute_universe_hash(universe_code="U", universe_version=1,
+                                  symbols_in_ordinal_order=["AAA", "BBB"])
+        c = compute_universe_hash(universe_code="U", universe_version=1,
+                                  symbols_in_ordinal_order=["BBB", "AAA"])
+        assert a == b and a != c and a.startswith("sha256:")
+        # code + version participate
+        assert a != compute_universe_hash(universe_code="U", universe_version=2,
+                                          symbols_in_ordinal_order=["AAA", "BBB"])
+
+    def test_provider_activity_reference(self):
+        assert provider_activity_reference(None) is None
+        assert provider_activity_reference({"provider_activity_state": PROVIDER_ACTIVITY_NONE}) is None
+        assert provider_activity_reference({
+            "provider_activity_state": PROVIDER_ACTIVITY_STARTED,
+            "provider_activity_started_at": "T0", "last_provider_activity_at": None}) == "T0"
+        assert provider_activity_reference({
+            "provider_activity_state": "completed",
+            "provider_activity_started_at": "T0", "last_provider_activity_at": "T1"}) == "T1"
+
+    def test_build_preflight_v3_carries_universe_and_exec_state(self):
+        rd = _readiness(["AAA"], [_daily_row("AAA", 10, 2, 3)], [])
+        universe = {"universe_id": "U-1", "universe_code": "TESTU", "universe_version": 1,
+                    "universe_hash": "sha256:frozen", "status": "frozen", "symbol_count": 1}
+        exec_state = {"active": False, "abandoned": True, "run_id": "R1",
+                      "lease_expires_at": None, "provider_activity_state": "started"}
+        pf = build_preflight_v3(universe=universe, readiness=rd, latest_items={},
+                                cooldown=COOLDOWN_OK, execution_state=exec_state, max_batch=1)
+        assert pf["contract_version"] == "history_warmup_preflight.v3"
+        assert pf["universe_id"] == "U-1" and pf["universe_hash"] == "sha256:frozen"
+        assert pf["universe_status"] == "frozen" and pf["executable"] is True
+        assert pf["execution_state"]["abandoned"] is True
+        assert pf["next_batch"]["symbols"] == ["AAA"]
 
 
 class TestFailureTaxonomy:

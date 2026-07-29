@@ -348,7 +348,7 @@ class TestMigration008:
             "013_wyckoff_v2_shadow_arms.sql"
         ]
         assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
-        assert not list(MIGRATIONS.glob("016_*"))
+        assert not list(MIGRATIONS.glob("017_*"))
     def test_v3_defaults_copy_is_isolated(self):
         """default_config() returns an independent copy (mutation-safe)."""
         strategy = get_strategy("sma150_bounce_v3")

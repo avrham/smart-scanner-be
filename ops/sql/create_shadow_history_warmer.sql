@@ -78,6 +78,14 @@ BEGIN
     GRANT SELECT ON public.history_warmup_run_items TO smart_scanner_history_warmer;
     GRANT INSERT, UPDATE ON public.history_warmup_run_items TO smart_scanner_history_warmer;
   END IF;
+  -- Frozen universes (migration 016): the warmer may create + freeze a draft
+  -- universe (SELECT/INSERT/UPDATE on the universe row; SELECT/INSERT its draft
+  -- membership) but NEVER UPDATE/DELETE membership — post-freeze immutability is
+  -- enforced by the DB trigger regardless of grants. No DELETE anywhere.
+  IF to_regclass('public.history_warmup_universes') IS NOT NULL THEN
+    GRANT SELECT, INSERT, UPDATE ON public.history_warmup_universes        TO smart_scanner_history_warmer;
+    GRANT SELECT, INSERT         ON public.history_warmup_universe_symbols TO smart_scanner_history_warmer;
+  END IF;
 END
 $$;
 

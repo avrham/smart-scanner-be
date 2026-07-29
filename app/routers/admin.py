@@ -2337,21 +2337,200 @@ async def _warmup_preflight_state(db, syms, *, now):
     return preflight, readiness, cooldown
 
 
+async def _provider_cooldown(db, *, now):
+    """Server-authoritative provider cooldown — derived ONLY from runs that had
+    provider activity (provider_activity_state != 'none'), using
+    last_provider_activity_at or provider_activity_started_at. A run that never
+    reached provider activity (pre-provider crash) NEVER establishes cooldown;
+    a request rejected before provider construction never creates activity."""
+    from app.maintenance_cooldown import compute_cooldown
+    from app.history_warmup_execute import provider_activity_reference
+    row = None
+    try:
+        row = await db.fetchrow(
+            "SELECT id, status, provider_activity_state, last_provider_activity_at, "
+            "provider_activity_started_at FROM history_warmup_runs "
+            "WHERE provider_activity_state <> 'none' "
+            "ORDER BY COALESCE(last_provider_activity_at, provider_activity_started_at) "
+            "DESC LIMIT 1")
+    except (asyncpg.UndefinedColumnError, asyncpg.UndefinedTableError,
+            asyncpg.InsufficientPrivilegeError):
+        row = None
+    ref = provider_activity_reference(dict(row)) if row else None
+    synthetic = ({"id": row["id"], "status": row["status"], "finished_at": ref}
+                 if ref else None)
+    return compute_cooldown(synthetic,
+                            min_interval_seconds=_resolved_warmup_min_interval(), now=now)
+
+
+async def _load_universe(db, *, universe_id=None, universe_code=None,
+                         universe_version=None, require_frozen=False):
+    """Load a universe + ordered membership; recompute the hash from membership
+    and (for frozen) prove it equals the pinned hash. Raises HTTPException."""
+    from app.history_warmup_execute import compute_universe_hash, UNIVERSE_FROZEN
+    if universe_id:
+        urow = await db.fetchrow(
+            "SELECT * FROM history_warmup_universes WHERE id = $1", universe_id)
+    elif universe_code:
+        urow = await db.fetchrow(
+            "SELECT * FROM history_warmup_universes WHERE universe_code=$1 "
+            "AND universe_version=$2", str(universe_code).upper(), int(universe_version or 1))
+    else:
+        raise HTTPException(status_code=422, detail={"error": "universe_selector_required"})
+    if urow is None:
+        raise HTTPException(status_code=404, detail={"error": "unknown_universe"})
+    rows = await db.fetch(
+        "SELECT symbol, ordinal FROM history_warmup_universe_symbols "
+        "WHERE universe_id=$1 ORDER BY ordinal", urow["id"])
+    symbols = [r["symbol"] for r in rows]
+    recomputed = compute_universe_hash(
+        universe_code=urow["universe_code"], universe_version=urow["universe_version"],
+        symbols_in_ordinal_order=symbols)
+    if require_frozen and urow["status"] != UNIVERSE_FROZEN:
+        raise HTTPException(status_code=409, detail={
+            "error": "universe_not_frozen", "status": urow["status"]})
+    if urow["status"] == UNIVERSE_FROZEN and recomputed != urow["universe_hash"]:
+        raise HTTPException(status_code=409, detail={"error": "universe_membership_mismatch"})
+    effective_hash = urow["universe_hash"] if urow["status"] == UNIVERSE_FROZEN else recomputed
+    return {"universe_id": str(urow["id"]), "universe_code": urow["universe_code"],
+            "universe_version": urow["universe_version"], "status": urow["status"],
+            "symbol_count": urow["symbol_count"], "symbols": symbols,
+            "universe_hash": effective_hash, "recomputed_hash": recomputed}
+
+
+async def _execution_state(db, universe_id, *, now):
+    """Latest RUNNING run for this universe: active (lease valid) vs abandoned
+    (lease expired). Used to surface in-progress/abandoned state in preflight."""
+    row = await db.fetchrow(
+        "SELECT id, status, provider_activity_state, execution_lease_expires_at "
+        "FROM history_warmup_runs WHERE universe_id=$1 AND status='running' "
+        "ORDER BY created_at DESC LIMIT 1", universe_id)
+    if row is None:
+        return {"active": False, "abandoned": False, "run_id": None,
+                "lease_expires_at": None, "provider_activity_state": None}
+    lease = row["execution_lease_expires_at"]
+    active = lease is not None and lease > now
+    return {"active": active, "abandoned": not active, "run_id": str(row["id"]),
+            "lease_expires_at": lease.isoformat() if lease else None,
+            "provider_activity_state": row["provider_activity_state"]}
+
+
+async def _warmup_preflight_state_v3(db, universe, *, now):
+    """Live readiness v2 over the FROZEN universe's members + preflight v3."""
+    from app.prospective_readiness import build_prospective_readiness_v2
+    from app.history_warmup_execute import build_preflight_v3
+    syms = universe["symbols"]
+    daily_rows, fourh_rows = await _fetch_local_readiness(db, syms)
+    readiness = build_prospective_readiness_v2(syms, daily_rows, fourh_rows, now=now)
+    latest_items = await _latest_run_items(db, syms)
+    cooldown = await _provider_cooldown(db, now=now)
+    exec_state = await _execution_state(db, universe["universe_id"], now=now)
+    preflight = build_preflight_v3(
+        universe=universe, readiness=readiness, latest_items=latest_items,
+        cooldown=cooldown, execution_state=exec_state,
+        max_batch=settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH)
+    return preflight, readiness, cooldown, exec_state
+
+
+@router.post("/history-warmup/universes")
+async def history_warmup_create_universe(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...),
+):
+    """Create (and optionally atomically freeze) one bounded warmup universe
+    (`history_warmup_universe_create.v1`). Normalizes/dedupes symbols, computes
+    the deterministic universe hash, pins it at freeze. No provider, no campaign,
+    no strategy execution. The warmer role may write ONLY the universe tables."""
+    _require_history_warmup_mode()
+    import json as _json
+    from app.history_warmup_execute import (
+        UNIVERSE_CREATE_CONTRACT_VERSION, normalize_universe_symbols,
+        compute_universe_hash, UNIVERSE_FROZEN, UNIVERSE_DRAFT, UniverseError)
+    from app.prospective_readiness import THRESHOLDS_V2
+    from app.history_warmup_execute import _sha
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    if body.get("contract_version") != UNIVERSE_CREATE_CONTRACT_VERSION:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    code = str(body.get("universe_code") or "").strip().upper()
+    if not code or not code.isascii() or len(code) > 64 or any(c.isspace() for c in code):
+        raise HTTPException(status_code=422, detail={"error": "invalid_universe_code"})
+    version = body.get("universe_version", 1)
+    if not isinstance(version, int) or version < 1:
+        raise HTTPException(status_code=422, detail={"error": "invalid_universe_version"})
+    try:
+        norm = normalize_universe_symbols(
+            body.get("symbols"), max_symbols=settings.HISTORY_WARMUP_MAX_UNIVERSE_SYMBOLS)
+    except UniverseError as exc:
+        raise HTTPException(status_code=422, detail={"error": exc.code, "detail": exc.detail})
+    symbols = norm["symbols"]
+    freeze = bool(body.get("freeze", False))
+    config_hash = _sha(THRESHOLDS_V2)
+    uhash = compute_universe_hash(universe_code=code, universe_version=version,
+                                  symbols_in_ordinal_order=symbols)
+    if await db.fetchval("SELECT 1 FROM history_warmup_universes WHERE universe_code=$1 "
+                         "AND universe_version=$2", code, version):
+        raise HTTPException(status_code=409, detail={"error": "universe_already_exists"})
+    # create draft + membership, then (optionally) freeze — all before the guard
+    # trigger locks the membership.
+    row = await db.fetchrow(
+        "INSERT INTO history_warmup_universes(universe_code, universe_version, "
+        "config_hash, status, symbol_count) VALUES($1,$2,$3,'draft',$4) RETURNING id",
+        code, version, config_hash, len(symbols))
+    universe_id = str(row["id"])
+    for ordinal, sym in enumerate(symbols):
+        await db.execute(
+            "INSERT INTO history_warmup_universe_symbols(universe_id, symbol, ordinal) "
+            "VALUES($1,$2,$3)", universe_id, sym, ordinal)
+    status = UNIVERSE_DRAFT
+    if freeze:
+        await db.execute(
+            "UPDATE history_warmup_universes SET status='frozen', universe_hash=$2, "
+            "frozen_at=NOW(), updated_at=NOW() WHERE id=$1", universe_id, uhash)
+        status = UNIVERSE_FROZEN
+    return {
+        "contract_version": UNIVERSE_CREATE_CONTRACT_VERSION,
+        "universe_id": universe_id, "universe_code": code, "universe_version": version,
+        "status": status, "symbol_count": len(symbols),
+        "universe_hash": uhash if freeze else None, "config_hash": config_hash,
+        "duplicates_removed": norm["duplicates_removed"], "symbols": symbols,
+        "provider_called": False,
+    }
+
+
 @router.get("/history-warmup/preflight")
 async def history_warmup_preflight(
     _: str = Depends(get_worker_token),
     db: asyncpg.Connection = Depends(get_db),
+    universe_id: Optional[str] = None,
+    universe_code: Optional[str] = None,
+    universe_version: Optional[int] = None,
     symbols: Optional[str] = None,
 ):
-    """Read-only, local-data-only history-warmup preflight
-    (`history_warmup_preflight.v2`): readiness v2 four-state + server-selected
-    next batch + retry plan + persisted cooldown. Constructs no provider, calls
-    no market-data API, issues no mutation."""
+    """History-warmup preflight. Executable form (`history_warmup_preflight.v3`)
+    requires a FROZEN universe (by `universe_id` or `universe_code`+
+    `universe_version`) and loads its members server-side. A `symbols` list is a
+    read-only, EXPLICITLY NON-EXECUTABLE preview. Provider-free, no mutation."""
     _require_history_warmup_mode()
     from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if universe_id or universe_code:
+        universe = await _load_universe(
+            db, universe_id=universe_id, universe_code=universe_code,
+            universe_version=universe_version, require_frozen=True)
+        preflight, _r, _c, _e = await _warmup_preflight_state_v3(db, universe, now=now)
+        return preflight
+    # non-executable preview over an ad hoc bounded symbol list
     syms = _parse_symbols(symbols)
-    preflight, _readiness, _cooldown = await _warmup_preflight_state(
-        db, syms, now=datetime.now(timezone.utc))
+    preflight, _readiness, _cooldown = await _warmup_preflight_state(db, syms, now=now)
+    preflight["executable"] = False
+    preflight["preview"] = True
+    preflight["detail"] = ("ad hoc preview only — freeze a universe and pass "
+                           "universe_id to obtain an executable preflight")
+    preflight.pop("next_batch", None)
     return preflight
 
 
@@ -2361,11 +2540,13 @@ async def history_warmup_execute(
     db: asyncpg.Connection = Depends(get_db),
     body: Any = Body(...),
 ):
-    """The ONE bounded history-warmup mutation route (`history_warmup_execute.v1`).
-    Server-selected single-symbol batch; advisory-locked; cooldown-gated;
-    idempotent by deterministic execution identity. The provider is obtained via
-    the existing abstraction AFTER all gates pass and called OUTSIDE any DB lock
-    wait; no client-supplied provider options, pacing, ranges or table names."""
+    """The ONE bounded history-warmup mutation route (`history_warmup_execute.v2`).
+    Server independently loads the FROZEN universe by universe_id and recomputes
+    membership/readiness/batch. Single-symbol batch; advisory-locked; cooldown
+    derived from PROVIDER ACTIVITY (fail-closed after any crash post-provider);
+    idempotent by deterministic execution identity; crash-safe leases +
+    reconciliation. Provider obtained via the existing abstraction only after all
+    gates pass and called OUTSIDE any open transaction."""
     _require_history_warmup_mode()
     import asyncio
     import json as _json
@@ -2377,7 +2558,7 @@ async def history_warmup_execute(
         FORBIDDEN_REQUEST_FIELDS, FOUR_HOUR_FETCH_CALENDAR_DAYS,
         DAILY_WARMUP_TARGET_SESSIONS, execution_identity, validate_execute_request,
         normalize_daily_bars, normalize_4h_bars, upsert_daily_bars, upsert_4h_bars,
-        map_provider_error, error_class,
+        map_provider_error, PROVIDER_ACTIVITY_STARTED, PROVIDER_ACTIVITY_COMPLETED,
     )
     from app.maintenance_cooldown import (
         COOLDOWN_BLOCKING_REASON, COOLDOWN_UNDER_LOCK_REASON, retry_after_seconds)
@@ -2385,9 +2566,10 @@ async def history_warmup_execute(
     if settings.ENABLE_SCHEDULER:
         raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
     max_batch = settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH
+    lease_seconds = max(1, int(settings.HISTORY_WARMUP_EXECUTION_LEASE_SECONDS))
     now = datetime.now(timezone.utc)
 
-    # ---- (Step 4a) BASIC request shape validation (before any recompute) ---- #
+    # ---- basic request shape validation (before any recompute) -------------- #
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="request body must be a JSON object")
     present = [f for f in FORBIDDEN_REQUEST_FIELDS if body.get(f) is not None]
@@ -2399,6 +2581,9 @@ async def history_warmup_execute(
     mode = body.get("mode")
     if mode not in (MODE_NORMAL, MODE_RETRY):
         raise HTTPException(status_code=422, detail={"error": "bad_mode"})
+    universe_id_req = body.get("universe_id")
+    if not universe_id_req:
+        raise HTTPException(status_code=422, detail={"error": "universe_id_required"})
     raw_symbols = body.get("symbols")
     if not isinstance(raw_symbols, list) or not raw_symbols:
         raise HTTPException(status_code=422, detail={"error": "symbols_required"})
@@ -2411,40 +2596,22 @@ async def history_warmup_execute(
     if body.get("limit") != len(symbols):
         raise HTTPException(status_code=422, detail={"error": "limit_must_equal_symbol_count"})
 
+    # ---- load + independently validate the FROZEN universe (before provider) - #
+    try:
+        universe = await _load_universe(db, universe_id=universe_id_req, require_frozen=True)
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"error": "invalid_universe_id"})
+    universe_symbols = set(universe["symbols"])
+    if any(s not in universe_symbols for s in symbols):
+        raise HTTPException(status_code=422, detail={"error": "symbol_not_in_universe"})
+
     plan_hash = (body.get("readiness_manifest_hash") if mode == MODE_NORMAL
                  else body.get("retry_plan_hash"))
     identity = execution_identity(
-        mode=mode, universe_hash=body.get("universe_hash"),
+        mode=mode, universe_id=universe["universe_id"], universe_hash=body.get("universe_hash"),
         config_hash=body.get("config_hash"), plan_hash=plan_hash,
         next_batch_hash=body.get("next_batch_hash"), symbols=symbols)
 
-    # ---- (Step 8/idempotency) completed / in-progress replay short-circuit --- #
-    prior = await db.fetchrow(
-        "SELECT id, status, processed_symbol_count, provider_request_count "
-        "FROM history_warmup_runs WHERE idempotency_key = $1", identity)
-    if prior is not None and prior["status"] == "completed":
-        return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
-                "status": "already_applied", "mode": mode,
-                "run_id": str(prior["id"]), "batch_identity": body.get("next_batch_hash"),
-                "symbols": symbols, "provider_request_count": 0,
-                "detail": "identical batch already applied; obtain a fresh preflight"}
-    # A non-completed prior run with this identity is a CRASHED attempt (the
-    # advisory lock guarantees no concurrent live attempt shares it). It is
-    # safely re-drivable: the durable marker is reused (ON CONFLICT DO NOTHING),
-    # the daily/4H upserts are idempotent, and the run item uses ON CONFLICT DO
-    # NOTHING — so re-entry never duplicates bars, items or the run row.
-
-    # ---- (Steps 5-8) recompute live preflight + strict validation ----------- #
-    preflight, readiness_before, cooldown = await _warmup_preflight_state(db, symbols, now=now)
-    verdict = validate_execute_request(body, preflight, max_batch=max_batch)
-    if not verdict["ok"]:
-        reason = verdict["reason"]
-        code = 409 if reason in ("no_next_batch", "mode_not_current_batch",
-                                 "symbols_not_server_selected_batch") else 422
-        raise HTTPException(status_code=code, detail={
-            "error": "history_warmup_validation_failed", "reason": reason})
-
-    # ---- (Step 9) cooldown BEFORE the advisory lock, before any provider ----- #
     def _cooldown_409(cd, *, reason):
         return HTTPException(status_code=409, detail={
             "error": reason,
@@ -2454,102 +2621,89 @@ async def history_warmup_execute(
             "next_execution_not_before": cd["next_execution_not_before"],
             "cooldown_remaining_seconds": cd["cooldown_remaining_seconds"]},
             headers={"Retry-After": str(retry_after_seconds(cd))})
-    if not cooldown["execution_allowed_by_cooldown"]:
-        raise _cooldown_409(cooldown, reason=COOLDOWN_BLOCKING_REASON)
 
-    # ---- (Steps 6-7) advisory lock (no provider/write after a lock reject) --- #
-    got_lock = await db.fetchval(
-        "SELECT pg_try_advisory_lock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
-    if not got_lock:
-        raise HTTPException(status_code=409, detail={
-            "error": "history_warmup_execution_locked",
-            "batch_identity": verdict["batch_identity"]})
-    try:
-        # DOUBLE-CHECK under the lock: recompute + re-validate + re-check cooldown
-        # + re-check idempotency so a preflight/execute race cannot slip through.
-        preflight2, readiness_before, cooldown2 = await _warmup_preflight_state(
-            db, symbols, now=datetime.now(timezone.utc))
-        verdict2 = validate_execute_request(body, preflight2, max_batch=max_batch)
-        if not verdict2["ok"] or verdict2["execution_identity"] != identity:
-            raise HTTPException(status_code=409, detail={
-                "error": "history_warmup_plan_changed_under_lock",
-                "reason": verdict2.get("reason")})
-        if not cooldown2["execution_allowed_by_cooldown"]:
-            raise _cooldown_409(cooldown2, reason=COOLDOWN_UNDER_LOCK_REASON)
-        again = await db.fetchval(
-            "SELECT status FROM history_warmup_runs WHERE idempotency_key = $1", identity)
-        if again == "completed":
-            return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
-                    "status": "already_applied", "mode": mode, "symbols": symbols,
-                    "provider_request_count": 0}
-
+    def _result(run_id, status, tel, readiness_before, readiness_after, batch_id):
         symbol = symbols[0]
-        attempt = (await db.fetchval(
-            "SELECT COALESCE(MAX(attempt),0)+1 FROM history_warmup_run_items "
-            "WHERE symbol = $1", symbol)) or 1
+        def _tf(rd, tf):
+            for s in rd["symbols"]:
+                if s["symbol"] == symbol:
+                    return s[tf]["state"]
+            return None
+        return {
+            "contract_version": EXECUTE_RESULT_CONTRACT_VERSION, "status": status,
+            "mode": mode, "run_id": run_id, "batch_identity": batch_id,
+            "universe_id": universe["universe_id"], "symbols": symbols,
+            "provider_request_count": tel["req_count"],
+            "daily": {k: tel["daily"][k] for k in ("inserted", "updated", "unchanged", "completed_count")},
+            "four_hour": {k: tel["four_hour"][k] for k in ("inserted", "updated", "unchanged", "completed_count")},
+            "error": ({"code": tel["err_code"], "class": tel["err_class"],
+                       "retryable": tel["retryable"]} if tel["err_code"] else None),
+            "readiness_before": {
+                "four_hour": _tf(readiness_before, "four_hour"),
+                "both_ready": next((s["both_ready"] for s in readiness_before["symbols"]
+                                    if s["symbol"] == symbol), None)},
+            "readiness_after": {
+                "four_hour": _tf(readiness_after, "four_hour"),
+                "both_ready": next((s["both_ready"] for s in readiness_after["symbols"]
+                                    if s["symbol"] == symbol), None),
+                "combined_readiness_manifest_hash": readiness_after["combined_readiness_manifest_hash"]},
+            "cooldown": {"min_batch_interval_seconds": _resolved_warmup_min_interval(),
+                         "next_execution_not_before": (
+                             datetime.now(timezone.utc)
+                             + timedelta(seconds=_resolved_warmup_min_interval())).isoformat()},
+        }
 
-        # ---- (Step 10/11) DURABLE pre-provider run marker (idempotency_key) --- #
-        run_id = str(_uuid.uuid4())
+    async def _do_symbol(run_id, symbol, run_mode):
+        """Set the durable PROVIDER-ACTIVITY marker (committed before any provider
+        call -> fail-closed cooldown), call the injected provider OUTSIDE any open
+        transaction, persist through canonical idempotent upserts, and finalize
+        the run + run item. Returns bounded telemetry."""
+        # (Part 6) durable provider-activity marker BEFORE the first provider call
         await db.execute(
-            """
-            INSERT INTO history_warmup_runs(
-              id, mode, status, universe_hash, readiness_manifest_hash,
-              requested_symbols, requested_symbol_count, idempotency_key,
-              started_at, created_at, updated_at)
-            VALUES($1,$2,'running',$3,$4,$5::jsonb,$6,$7,NOW(),NOW(),NOW())
-            ON CONFLICT (idempotency_key) DO NOTHING
-            """,
-            run_id, mode, preflight2["universe_hash"], verdict2["plan_hash"],
-            _json.dumps(symbols), len(symbols), identity)
-        run_row = await db.fetchrow(
-            "SELECT id FROM history_warmup_runs WHERE idempotency_key = $1", identity)
-        run_id = str(run_row["id"])
-
-        # ---- (Step 12) provider obtained + called OUTSIDE the DB tx ---------- #
+            "UPDATE history_warmup_runs SET provider_activity_state=$2, "
+            "provider_activity_started_at=NOW(), heartbeat_at=NOW(), updated_at=NOW() "
+            "WHERE id=$1", run_id, PROVIDER_ACTIVITY_STARTED)
         provider = _resolve_history_warmup_provider()
         provider_name = getattr(provider, "name", None) or "unknown"
         spacing = max(0, int(settings.HISTORY_WARMUP_PROVIDER_REQUEST_SPACING_SECONDS))
-        req_count = 0
-        daily_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
-        fourh_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
+        tel = {"req_count": 0,
+               "daily": {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0},
+               "four_hour": {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0},
+               "err_code": None, "err_class": None, "retryable": False}
         daily_status = four_hour_status = "pending"
-        err_code = err_class = None
         started = datetime.now(timezone.utc)
-        logger.info("[HWX] start run=%s identity=%s mode=%s symbol=%s attempt=%d",
-                    run_id, identity[:16], mode, symbol, attempt)
+        logger.info("[HWX] start run=%s identity=%s mode=%s symbol=%s", run_id, identity[:16], run_mode, symbol)
         try:
-            # daily
-            frm = (now.date() - timedelta(days=int(DAILY_WARMUP_TARGET_SESSIONS * 1.75)))
+            frm = now.date() - timedelta(days=int(DAILY_WARMUP_TARGET_SESSIONS * 1.75))
             to = now.date()
+            await db.execute("UPDATE history_warmup_runs SET provider_request_count_attempted"
+                             "=provider_request_count_attempted+1, last_provider_activity_at=NOW(),"
+                             " heartbeat_at=NOW() WHERE id=$1", run_id)
             raw_daily = await provider.get_daily_bars(symbol, str(frm), str(to))
-            req_count += 1
-            daily_bars = normalize_daily_bars(raw_daily, now=now)
-            daily_tel = await upsert_daily_bars(db, daily_bars, source=provider_name)
+            tel["req_count"] += 1
+            tel["daily"] = await upsert_daily_bars(db, normalize_daily_bars(raw_daily, now=now),
+                                                   source=provider_name)
             daily_status = "completed"
-            # (Step 9) explicit server-controlled spacing BEFORE the 4H request
             if spacing:
                 await asyncio.sleep(spacing)
-            # 4H
-            fh_start = now.date() - timedelta(days=FOUR_HOUR_FETCH_CALENDAR_DAYS)
+            await db.execute("UPDATE history_warmup_runs SET provider_request_count_attempted"
+                             "=provider_request_count_attempted+1, last_provider_activity_at=NOW(),"
+                             " heartbeat_at=NOW() WHERE id=$1", run_id)
             payload = await provider.get_intraday_history(
-                symbol, multiplier=4, timespan="hour", start=fh_start, end=to)
-            req_count += 1
-            fourh_rows = normalize_4h_bars(payload, symbol=symbol, now=now)
-            fourh_tel = await upsert_4h_bars(db, fourh_rows)
+                symbol, multiplier=4, timespan="hour", start=to - timedelta(days=FOUR_HOUR_FETCH_CALENDAR_DAYS), end=to)
+            tel["req_count"] += 1
+            tel["four_hour"] = await upsert_4h_bars(db, normalize_4h_bars(payload, symbol=symbol, now=now))
             four_hour_status = "completed"
             item_status = "completed"
         except Exception as exc:  # noqa: BLE001 - mapped to a bounded safe code
-            err_code, err_class = map_provider_error(exc)
+            tel["err_code"], tel["err_class"] = map_provider_error(exc)
+            tel["retryable"] = tel["err_class"] == "retryable"
             item_status = "failed"
-            if daily_status != "completed":
-                daily_status = "failed"
-            if four_hour_status != "completed":
-                four_hour_status = "failed" if daily_status == "completed" else "skipped"
+            daily_status = daily_status if daily_status == "completed" else "failed"
+            four_hour_status = ("failed" if daily_status == "completed" else "skipped") \
+                if four_hour_status != "completed" else "completed"
             logger.warning("[HWX] symbol failed run=%s symbol=%s code=%s class=%s exc=%s",
-                           run_id, symbol, err_code, err_class, type(exc).__name__)
-
-        retryable = err_class == "retryable"
-        # ---- (Step 15) run item + run finalization -------------------------- #
+                           run_id, symbol, tel["err_code"], tel["err_class"], type(exc).__name__)
         await db.execute(
             """
             INSERT INTO history_warmup_run_items(
@@ -2558,59 +2712,161 @@ async def history_warmup_execute(
               four_hour_rows_inserted, four_hour_rows_updated, four_hour_rows_unchanged,
               provider_request_count, error_code, error_class, retryable,
               execution_identity, started_at, finished_at, created_at, updated_at)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,NOW(),NOW(),NOW())
+            VALUES($1,$2,1,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NOW(),NOW(),NOW())
             ON CONFLICT (run_id, symbol, attempt) DO NOTHING
             """,
-            run_id, symbol, attempt, mode, item_status, daily_status, four_hour_status,
-            daily_tel["inserted"], daily_tel["updated"], daily_tel["unchanged"],
-            fourh_tel["inserted"], fourh_tel["updated"], fourh_tel["unchanged"],
-            req_count, err_code, err_class, retryable, identity, started)
+            run_id, symbol, run_mode, item_status, daily_status, four_hour_status,
+            tel["daily"]["inserted"], tel["daily"]["updated"], tel["daily"]["unchanged"],
+            tel["four_hour"]["inserted"], tel["four_hour"]["updated"], tel["four_hour"]["unchanged"],
+            tel["req_count"], tel["err_code"], tel["err_class"], tel["retryable"], identity, started)
         run_status = "completed" if item_status == "completed" else "failed"
         await db.execute(
-            "UPDATE history_warmup_runs SET status=$2, processed_symbol_count=1, "
-            "provider_request_count=$3, error_code=$4, error_message=$5, "
-            "finished_at=NOW(), updated_at=NOW(), cooldown_last_finished_at=NOW(), "
-            "cooldown_next_not_before=NOW() + ($6 || ' seconds')::interval "
-            "WHERE id=$1",
-            run_id, run_status, req_count, err_code,
-            (err_class if err_code else None), str(_resolved_warmup_min_interval()))
+            "UPDATE history_warmup_runs SET status=$2, provider_activity_state=$3, "
+            "processed_symbol_count=1, provider_request_count=$4, error_code=$5, "
+            "error_message=$6, finished_at=NOW(), updated_at=NOW(), last_provider_activity_at=NOW(), "
+            "cooldown_last_finished_at=NOW(), "
+            "cooldown_next_not_before=NOW() + ($7 || ' seconds')::interval WHERE id=$1",
+            run_id, run_status, PROVIDER_ACTIVITY_COMPLETED, tel["req_count"], tel["err_code"],
+            (tel["err_class"] if tel["err_code"] else None), str(_resolved_warmup_min_interval()))
+        tel["run_status"] = run_status
+        return tel
 
-        # ---- (Step 16) recompute readiness after ---------------------------- #
-        preflight_after, readiness_after, _ = await _warmup_preflight_state(
-            db, symbols, now=datetime.now(timezone.utc))
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        logger.info("[HWX] done run=%s status=%s symbol=%s daily=%s 4h=%s reqs=%d dur=%.3f",
-                    run_id, run_status, symbol, daily_status, four_hour_status, req_count, elapsed)
+    # ---- idempotency / lease short-circuits (before provider, before lock) --- #
+    prior = await db.fetchrow(
+        "SELECT id, status, reconciled, provider_activity_state, "
+        "execution_lease_expires_at, requested_symbols FROM history_warmup_runs "
+        "WHERE idempotency_key = $1", identity)
+    if prior is not None and prior["status"] == "completed":
+        return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+                "status": "reconciled_complete" if prior["reconciled"] else "already_applied",
+                "mode": mode, "run_id": str(prior["id"]), "universe_id": universe["universe_id"],
+                "batch_identity": body.get("next_batch_hash"), "symbols": symbols,
+                "provider_request_count": 0,
+                "detail": "identical batch already applied; obtain a fresh preflight"}
+    if prior is not None and prior["status"] == "running":
+        lease = prior["execution_lease_expires_at"]
+        if lease is not None and lease > now:
+            # active lease -> genuine in-progress (identical request)
+            raise HTTPException(status_code=409, detail={
+                "error": "history_warmup_execution_in_progress",
+                "run_id": str(prior["id"]),
+                "lease_expires_at": lease.isoformat()},
+                headers={"Retry-After": str(max(1, int((lease - now).total_seconds())))})
+        # ABANDONED run (lease expired): reconcile or re-drive under the lock.
+        got_lock = await db.fetchval(
+            "SELECT pg_try_advisory_lock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
+        if not got_lock:
+            raise HTTPException(status_code=409, detail={
+                "error": "history_warmup_execution_locked"})
+        try:
+            again = await db.fetchrow(
+                "SELECT status, reconciled FROM history_warmup_runs WHERE id=$1", prior["id"])
+            if again["status"] == "completed":
+                return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+                        "status": "reconciled_complete" if again["reconciled"] else "already_applied",
+                        "mode": mode, "run_id": str(prior["id"]),
+                        "universe_id": universe["universe_id"], "symbols": symbols,
+                        "provider_request_count": 0}
+            raw_stored = prior["requested_symbols"]
+            if isinstance(raw_stored, str):
+                raw_stored = _json.loads(raw_stored)
+            stored_syms = list(raw_stored) if raw_stored else list(symbols)
+            pf_r, readiness_r, _c, _e = await _warmup_preflight_state_v3(db, universe, now=now)
+            all_ready = all(
+                next((s["both_ready"] for s in readiness_r["symbols"] if s["symbol"] == sym), False)
+                for sym in stored_syms)
+            if all_ready:
+                # (Part 15) provable completion from local bars -> reconcile, no provider
+                await db.execute(
+                    "INSERT INTO history_warmup_run_items(run_id,symbol,attempt,mode,status,"
+                    "daily_status,four_hour_status,provider_request_count,execution_identity,"
+                    "started_at,finished_at,created_at,updated_at) VALUES($1,$2,1,$3,'completed',"
+                    "'completed','completed',0,$4,NOW(),NOW(),NOW(),NOW()) "
+                    "ON CONFLICT (run_id,symbol,attempt) DO NOTHING",
+                    str(prior["id"]), stored_syms[0], mode, identity)
+                await db.execute(
+                    "UPDATE history_warmup_runs SET status='completed', reconciled=TRUE, "
+                    "finished_at=NOW(), updated_at=NOW() WHERE id=$1", prior["id"])
+                return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+                        "status": "reconciled_complete", "mode": mode,
+                        "run_id": str(prior["id"]), "universe_id": universe["universe_id"],
+                        "symbols": symbols, "provider_request_count": 0,
+                        "detail": "abandoned run reconciled from persisted local bars; no provider call"}
+            # not reconcilable -> provider cooldown (from THIS run's activity) gates re-drive
+            cooldown = await _provider_cooldown(db, now=datetime.now(timezone.utc))
+            if not cooldown["execution_allowed_by_cooldown"]:
+                raise _cooldown_409(cooldown, reason=COOLDOWN_BLOCKING_REASON)
+            # safe re-drive reusing the same run marker (fresh lease)
+            await db.execute(
+                "UPDATE history_warmup_runs SET execution_lease_expires_at=NOW() + ($2 || ' seconds')"
+                "::interval, heartbeat_at=NOW(), updated_at=NOW() WHERE id=$1",
+                prior["id"], str(lease_seconds))
+            tel = await _do_symbol(str(prior["id"]), stored_syms[0], mode)
+            pf_after, readiness_after, _c2, _e2 = await _warmup_preflight_state_v3(
+                db, universe, now=datetime.now(timezone.utc))
+            return _result(str(prior["id"]),
+                           "executed" if tel["run_status"] == "completed" else "failed",
+                           tel, readiness_r, readiness_after, body.get("next_batch_hash"))
+        finally:
+            await db.fetchval("SELECT pg_advisory_unlock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
 
-        def _tf_state(rd, sym, tf):
-            for s in rd["symbols"]:
-                if s["symbol"] == sym:
-                    return s[tf]["state"]
-            return None
-        return {
-            "contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
-            "status": "executed" if run_status == "completed" else "failed",
-            "mode": mode, "run_id": run_id, "batch_identity": verdict2["batch_identity"],
-            "symbols": symbols, "provider_request_count": req_count,
-            "daily": {k: daily_tel[k] for k in ("inserted", "updated", "unchanged", "completed_count")},
-            "four_hour": {k: fourh_tel[k] for k in ("inserted", "updated", "unchanged", "completed_count")},
-            "error": ({"code": err_code, "class": err_class, "retryable": retryable}
-                      if err_code else None),
-            "readiness_before": {
-                "candidate": _tf_state(readiness_before, symbol, "four_hour"),
-                "both_ready": next((s["both_ready"] for s in readiness_before["symbols"]
-                                    if s["symbol"] == symbol), None)},
-            "readiness_after": {
-                "four_hour": _tf_state(readiness_after, symbol, "four_hour"),
-                "both_ready": next((s["both_ready"] for s in readiness_after["symbols"]
-                                    if s["symbol"] == symbol), None),
-                "combined_readiness_manifest_hash": readiness_after["combined_readiness_manifest_hash"]},
-            "cooldown": {
-                "min_batch_interval_seconds": _resolved_warmup_min_interval(),
-                "next_execution_not_before": (
-                    datetime.now(timezone.utc)
-                    + timedelta(seconds=_resolved_warmup_min_interval())).isoformat()},
-        }
+    # ---- NORMAL path: recompute live preflight v3 + strict validation -------- #
+    preflight, readiness_before, cooldown, _exec = await _warmup_preflight_state_v3(db, universe, now=now)
+    verdict = validate_execute_request(body, preflight, max_batch=max_batch)
+    if not verdict["ok"]:
+        reason = verdict["reason"]
+        code = 409 if reason in ("no_next_batch", "mode_not_current_batch",
+                                 "symbols_not_server_selected_batch", "universe_id_mismatch") else 422
+        raise HTTPException(status_code=code, detail={
+            "error": "history_warmup_validation_failed", "reason": reason})
+    if not cooldown["execution_allowed_by_cooldown"]:
+        raise _cooldown_409(cooldown, reason=COOLDOWN_BLOCKING_REASON)
+
+    got_lock = await db.fetchval(
+        "SELECT pg_try_advisory_lock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
+    if not got_lock:
+        raise HTTPException(status_code=409, detail={
+            "error": "history_warmup_execution_locked", "batch_identity": verdict["batch_identity"]})
+    try:
+        preflight2, readiness_before, cooldown2, _e2 = await _warmup_preflight_state_v3(
+            db, universe, now=datetime.now(timezone.utc))
+        verdict2 = validate_execute_request(body, preflight2, max_batch=max_batch)
+        if not verdict2["ok"] or verdict2["execution_identity"] != identity:
+            raise HTTPException(status_code=409, detail={
+                "error": "history_warmup_plan_changed_under_lock", "reason": verdict2.get("reason")})
+        if not cooldown2["execution_allowed_by_cooldown"]:
+            raise _cooldown_409(cooldown2, reason=COOLDOWN_UNDER_LOCK_REASON)
+        again = await db.fetchval(
+            "SELECT status FROM history_warmup_runs WHERE idempotency_key = $1", identity)
+        if again == "completed":
+            return {"contract_version": EXECUTE_RESULT_CONTRACT_VERSION,
+                    "status": "already_applied", "mode": mode, "symbols": symbols,
+                    "universe_id": universe["universe_id"], "provider_request_count": 0}
+
+        symbol = symbols[0]
+        run_id = str(_uuid.uuid4())
+        # DURABLE pre-provider run marker (idempotency_key + lease; activity=none)
+        await db.execute(
+            """
+            INSERT INTO history_warmup_runs(
+              id, mode, status, universe_id, universe_hash, readiness_manifest_hash,
+              requested_symbols, requested_symbol_count, idempotency_key,
+              provider_activity_state, execution_lease_expires_at, heartbeat_at,
+              started_at, created_at, updated_at)
+            VALUES($1,$2,'running',$3,$4,$5,$6::jsonb,$7,$8,'none',
+                   NOW() + ($9 || ' seconds')::interval, NOW(), NOW(), NOW(), NOW())
+            ON CONFLICT (idempotency_key) DO NOTHING
+            """,
+            run_id, mode, universe["universe_id"], preflight2["universe_hash"],
+            verdict2["plan_hash"], _json.dumps(symbols), len(symbols), identity, str(lease_seconds))
+        run_row = await db.fetchrow(
+            "SELECT id FROM history_warmup_runs WHERE idempotency_key = $1", identity)
+        run_id = str(run_row["id"])
+        tel = await _do_symbol(run_id, symbol, mode)
+        pf_after, readiness_after, _c3, _e3 = await _warmup_preflight_state_v3(
+            db, universe, now=datetime.now(timezone.utc))
+        return _result(run_id, "executed" if tel["run_status"] == "completed" else "failed",
+                       tel, readiness_before, readiness_after, verdict2["batch_identity"])
     finally:
         await db.fetchval("SELECT pg_advisory_unlock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
 

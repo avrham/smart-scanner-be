@@ -158,6 +158,15 @@ class Settings(BaseSettings):
     # provider client's own rolling limiter; keeps a symbol's 2-3 calls under the
     # 5/min window. Applied OUTSIDE any DB lock/transaction. 0 disables (tests).
     HISTORY_WARMUP_PROVIDER_REQUEST_SPACING_SECONDS: int = 15
+    # Durable execution-lease TTL. While a run is 'running' and its lease has NOT
+    # expired, an identical request is bounded-in-progress and a different one is
+    # execution_locked. Once the lease expires the run is treated as abandoned and
+    # is re-drivable / reconcilable per the documented rules — crash recovery
+    # never leaves a permanent blocker. Sized to comfortably cover one symbol's
+    # 2 provider calls + bounded client retries + spacing.
+    HISTORY_WARMUP_EXECUTION_LEASE_SECONDS: int = 120
+    # Hard cap on a frozen warmup universe's symbol membership.
+    HISTORY_WARMUP_MAX_UNIVERSE_SYMBOLS: int = 100
     # STABLE campaign-cohort membership lock (a sha256:... value). Required for
     # ready_for_maintenance_execution; compared against the recomputed cohort
     # lock hash (NEVER the dynamic remaining hash). Empty by default; installed

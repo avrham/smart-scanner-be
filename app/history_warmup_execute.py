@@ -28,12 +28,24 @@ from zoneinfo import ZoneInfo
 # Canonical daily upsert SQL reused verbatim (no second incompatible impl).
 from app.workers.market_store import UPSERT_DAILY_BAR_SQL
 
-EXECUTE_CONTRACT_VERSION = "history_warmup_execute.v1"
+EXECUTE_CONTRACT_VERSION = "history_warmup_execute.v2"
 PREFLIGHT_V2_CONTRACT_VERSION = "history_warmup_preflight.v2"
+PREFLIGHT_V3_CONTRACT_VERSION = "history_warmup_preflight.v3"
 EXECUTE_RESULT_CONTRACT_VERSION = "history_warmup_execute_result.v1"
+UNIVERSE_CREATE_CONTRACT_VERSION = "history_warmup_universe_create.v1"
 
 MODE_NORMAL = "normal"
 MODE_RETRY = "retry"
+
+# Provider-activity lifecycle (durable, fail-closed cooldown source).
+PROVIDER_ACTIVITY_NONE = "none"
+PROVIDER_ACTIVITY_STARTED = "started"
+PROVIDER_ACTIVITY_COMPLETED = "completed"
+
+# Universe lifecycle.
+UNIVERSE_DRAFT = "draft"
+UNIVERSE_FROZEN = "frozen"
+UNIVERSE_SUPERSEDED = "superseded"
 
 # Distinct fixed advisory-lock key ('WRMU'); only ONE warmup execution may hold
 # it at a time (single-Machine, single-process assumption). Session-scoped on the
@@ -259,19 +271,117 @@ def build_preflight_v2(readiness: Dict[str, Any],
     }
 
 
+def build_preflight_v3(*, universe: Dict[str, Any], readiness: Dict[str, Any],
+                       latest_items: Dict[str, Dict[str, Any]], cooldown: Dict[str, Any],
+                       execution_state: Dict[str, Any], max_batch: int) -> Dict[str, Any]:
+    """history_warmup_preflight.v3: frozen-universe identity + readiness v2
+    four-state + server-selected next batch + retry plan + provider-activity
+    cooldown + active/abandoned execution state. Provider-free."""
+    retry_plan = compute_retry_plan(latest_items)
+    progress = compute_progress(readiness, retry_plan)
+    next_batch = select_next_batch(readiness, retry_plan, progress, max_batch=max_batch)
+    return {
+        "contract_version": PREFLIGHT_V3_CONTRACT_VERSION,
+        "provider_called": False,
+        "provider_constructed": False,
+        "executable": True,
+        "universe_id": universe["universe_id"],
+        "universe_code": universe["universe_code"],
+        "universe_version": universe["universe_version"],
+        "universe_hash": universe["universe_hash"],
+        "universe_status": universe["status"],
+        "symbol_count": universe["symbol_count"],
+        "config_hash": readiness["config_hash"],
+        "combined_readiness_manifest_hash": readiness["combined_readiness_manifest_hash"],
+        "daily_manifest_hash": readiness["daily_manifest_hash"],
+        "four_hour_manifest_hash": readiness["four_hour_manifest_hash"],
+        "normal_pending_symbols": progress["normal_pending_symbols"],
+        "retryable_symbols": progress["retryable_symbols"],
+        "terminal_symbols": progress["terminal_symbols"],
+        "normal_complete": progress["normal_complete"],
+        "retry_plan_hash": retry_plan["retry_plan_hash"],
+        "retry_plan_entries": retry_plan["entries"],
+        "execution_allowed_by_cooldown": bool(cooldown.get("execution_allowed_by_cooldown")),
+        "next_execution_not_before": cooldown.get("next_execution_not_before"),
+        "cooldown_remaining_seconds": cooldown.get("cooldown_remaining_seconds"),
+        "execution_state": execution_state,
+        "next_batch": next_batch,
+        "readiness": readiness,
+        "max_symbols_per_batch": int(max_batch),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Idempotency identity + request validation
 # --------------------------------------------------------------------------- #
 def execution_identity(*, mode: str, universe_hash: str, config_hash: str,
                        plan_hash: str, next_batch_hash: str,
-                       symbols: List[str]) -> str:
-    """Deterministic idempotency identity for one execute request."""
+                       symbols: List[str], universe_id: Optional[str] = None) -> str:
+    """Deterministic idempotency identity for one execute request. Includes the
+    immutable universe_id (v2) so the identity is bound to a specific frozen
+    universe, not just its hash."""
     blob = "|".join([
-        EXECUTE_CONTRACT_VERSION, str(mode), str(universe_hash), str(config_hash),
-        str(plan_hash), str(next_batch_hash),
+        EXECUTE_CONTRACT_VERSION, str(mode), str(universe_id), str(universe_hash),
+        str(config_hash), str(plan_hash), str(next_batch_hash),
         ",".join(sorted(str(s) for s in symbols)),
     ])
     return "hwx:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Frozen-universe identity
+# --------------------------------------------------------------------------- #
+class UniverseError(ValueError):
+    """Bounded, safe universe validation failure (no secrets, no payloads)."""
+
+    def __init__(self, code: str, detail: Optional[str] = None):
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}" + (f": {detail}" if detail else ""))
+
+
+def normalize_universe_symbols(raw: Any, *, max_symbols: int) -> Dict[str, Any]:
+    """Upper/strip/dedupe (first-seen order) a requested symbol list. Returns
+    {symbols, duplicates_removed, invalid}. Raises UniverseError on empty / over
+    cap / malformed entries."""
+    if not isinstance(raw, list) or not raw:
+        raise UniverseError("symbols_required")
+    seen: set = set()
+    out: List[str] = []
+    dupes = 0
+    invalid: List[str] = []
+    for s in raw:
+        if not isinstance(s, str):
+            invalid.append(str(s)[:16]); continue
+        v = s.strip().upper()
+        if not v or not v.isascii() or len(v) > 16 or any(c.isspace() for c in v):
+            invalid.append(v[:16]); continue
+        if v in seen:
+            dupes += 1; continue
+        seen.add(v); out.append(v)
+    if invalid:
+        raise UniverseError("invalid_symbols", str(sorted(set(invalid))[:10]))
+    if not out:
+        raise UniverseError("symbols_required")
+    if len(out) > int(max_symbols):
+        raise UniverseError("too_many_symbols", f"{len(out)}>{max_symbols}")
+    return {"symbols": out, "duplicates_removed": dupes}
+
+
+def compute_universe_hash(*, universe_code: str, universe_version: int,
+                          symbols_in_ordinal_order: List[str]) -> str:
+    """Deterministic frozen-universe hash over code + version + ORDERED members."""
+    return _sha({"contract": UNIVERSE_CREATE_CONTRACT_VERSION,
+                 "code": str(universe_code), "version": int(universe_version),
+                 "symbols": [str(s) for s in symbols_in_ordinal_order]})
+
+
+def provider_activity_reference(run: Optional[Dict[str, Any]]):
+    """The provider-activity timestamp that establishes cooldown, or None when
+    the run had NO provider activity (a pre-provider crash never blocks)."""
+    if not run or run.get("provider_activity_state") in (None, PROVIDER_ACTIVITY_NONE):
+        return None
+    return run.get("last_provider_activity_at") or run.get("provider_activity_started_at")
 
 
 def _fail(reason: str) -> Dict[str, Any]:
@@ -304,6 +414,12 @@ def validate_execute_request(body: Any, preflight: Dict[str, Any], *,
     if mode != nb["mode"]:
         return _fail("mode_not_current_batch")
 
+    # v2: the immutable universe identity must match the loaded frozen universe
+    pf_universe_id = preflight.get("universe_id")
+    if pf_universe_id is not None:
+        if str(body.get("universe_id")) != str(pf_universe_id):
+            return _fail("universe_id_mismatch")
+
     # identity hashes must match the freshly recomputed plan
     if body.get("universe_hash") != preflight["universe_hash"]:
         return _fail("stale_universe_hash")
@@ -334,7 +450,7 @@ def validate_execute_request(body: Any, preflight: Dict[str, Any], *,
         return _fail("symbols_not_server_selected_batch")
 
     ident = execution_identity(
-        mode=mode, universe_hash=preflight["universe_hash"],
+        mode=mode, universe_id=pf_universe_id, universe_hash=preflight["universe_hash"],
         config_hash=preflight["config_hash"], plan_hash=plan_hash,
         next_batch_hash=nb["next_batch_hash"], symbols=symbols)
     return {"ok": True, "reason": None, "mode": mode, "symbols": symbols,
@@ -540,12 +656,17 @@ async def upsert_4h_bars(conn, rows: List[Dict[str, Any]]) -> Dict[str, int]:
 
 __all__ = [
     "EXECUTE_CONTRACT_VERSION", "PREFLIGHT_V2_CONTRACT_VERSION",
-    "EXECUTE_RESULT_CONTRACT_VERSION", "MODE_NORMAL", "MODE_RETRY",
+    "PREFLIGHT_V3_CONTRACT_VERSION", "EXECUTE_RESULT_CONTRACT_VERSION",
+    "UNIVERSE_CREATE_CONTRACT_VERSION", "MODE_NORMAL", "MODE_RETRY",
+    "PROVIDER_ACTIVITY_NONE", "PROVIDER_ACTIVITY_STARTED", "PROVIDER_ACTIVITY_COMPLETED",
+    "UNIVERSE_DRAFT", "UNIVERSE_FROZEN", "UNIVERSE_SUPERSEDED",
     "HISTORY_WARMUP_ADVISORY_LOCK_KEY", "FORBIDDEN_REQUEST_FIELDS",
     "FAILURE_TAXONOMY", "RETRYABLE", "TERMINAL", "OPERATOR_ERROR",
     "error_class", "is_retryable", "map_provider_error", "HistoryWarmupPayloadError",
-    "compute_retry_plan", "compute_progress", "select_next_batch",
-    "build_preflight_v2", "execution_identity", "validate_execute_request",
+    "UniverseError", "normalize_universe_symbols", "compute_universe_hash",
+    "provider_activity_reference", "compute_retry_plan", "compute_progress",
+    "select_next_batch", "build_preflight_v2", "build_preflight_v3",
+    "execution_identity", "validate_execute_request",
     "normalize_daily_bars", "normalize_4h_bars", "upsert_daily_bars", "upsert_4h_bars",
     "FOUR_HOUR_FETCH_CALENDAR_DAYS",
 ]

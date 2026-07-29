@@ -103,5 +103,57 @@ BEGIN
   ELSE
     RAISE NOTICE 'daily_bars RLS off (or absent) — warmer grant governs; no policy created';
   END IF;
+
+  -- Frozen universes (migration 016). universes: warmer SELECT/INSERT/UPDATE
+  -- (create + freeze); universe_symbols: warmer SELECT/INSERT ONLY (draft
+  -- membership) — NO UPDATE/DELETE policy (post-freeze immutability is also
+  -- enforced by the DB trigger). Audit reader: SELECT on both. No DELETE for
+  -- anyone.
+  rel_oid := to_regclass('public.history_warmup_universes');
+  IF rel_oid IS NOT NULL THEN
+    IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = rel_oid) THEN
+      EXECUTE 'ALTER TABLE public.history_warmup_universes ENABLE ROW LEVEL SECURITY';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = audit_role) THEN
+      EXECUTE format('GRANT SELECT ON public.history_warmup_universes TO %I', audit_role);
+      IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universes_audit_select') THEN
+        EXECUTE format('CREATE POLICY history_universes_audit_select ON public.history_warmup_universes '
+                       'AS PERMISSIVE FOR SELECT TO %I USING (true)', audit_role);
+      END IF;
+    END IF;
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE ON public.history_warmup_universes TO %I', warmer_role);
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universes_warmer_select') THEN
+      EXECUTE format('CREATE POLICY history_universes_warmer_select ON public.history_warmup_universes '
+                     'AS PERMISSIVE FOR SELECT TO %I USING (true)', warmer_role); END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universes_warmer_insert') THEN
+      EXECUTE format('CREATE POLICY history_universes_warmer_insert ON public.history_warmup_universes '
+                     'AS PERMISSIVE FOR INSERT TO %I WITH CHECK (true)', warmer_role); END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universes_warmer_update') THEN
+      EXECUTE format('CREATE POLICY history_universes_warmer_update ON public.history_warmup_universes '
+                     'AS PERMISSIVE FOR UPDATE TO %I USING (true) WITH CHECK (true)', warmer_role); END IF;
+    RAISE NOTICE 'warmer/audit universe policies ensured';
+  END IF;
+
+  rel_oid := to_regclass('public.history_warmup_universe_symbols');
+  IF rel_oid IS NOT NULL THEN
+    IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = rel_oid) THEN
+      EXECUTE 'ALTER TABLE public.history_warmup_universe_symbols ENABLE ROW LEVEL SECURITY';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = audit_role) THEN
+      EXECUTE format('GRANT SELECT ON public.history_warmup_universe_symbols TO %I', audit_role);
+      IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universe_symbols_audit_select') THEN
+        EXECUTE format('CREATE POLICY history_universe_symbols_audit_select ON public.history_warmup_universe_symbols '
+                       'AS PERMISSIVE FOR SELECT TO %I USING (true)', audit_role);
+      END IF;
+    END IF;
+    EXECUTE format('GRANT SELECT, INSERT ON public.history_warmup_universe_symbols TO %I', warmer_role);
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universe_symbols_warmer_select') THEN
+      EXECUTE format('CREATE POLICY history_universe_symbols_warmer_select ON public.history_warmup_universe_symbols '
+                     'AS PERMISSIVE FOR SELECT TO %I USING (true)', warmer_role); END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid=rel_oid AND polname='history_universe_symbols_warmer_insert') THEN
+      EXECUTE format('CREATE POLICY history_universe_symbols_warmer_insert ON public.history_warmup_universe_symbols '
+                     'AS PERMISSIVE FOR INSERT TO %I WITH CHECK (true)', warmer_role); END IF;
+    RAISE NOTICE 'warmer/audit universe_symbols policies ensured (no update/delete)';
+  END IF;
 END
 $$;

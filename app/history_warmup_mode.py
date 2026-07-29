@@ -23,17 +23,20 @@ HISTORY_WARMUP_ONLY_ALLOWLIST: Set[str] = frozenset({
 # Read-only methods for the allowlist above (HEAD/OPTIONS for infra + CORS).
 HISTORY_WARMUP_ONLY_METHODS: Set[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
-# The ONE mutation route reachable in warmup mode: bounded, server-selected,
-# advisory-locked, cooldown-gated execute. POST only, this exact path only.
+# The bounded mutation routes reachable in warmup mode (POST only, exact paths):
+#   * execute — the single provider-backed warmup batch;
+#   * universes — create/freeze a bounded frozen universe (no provider).
 HISTORY_WARMUP_EXECUTE_PATH: str = "/api/admin/history-warmup/execute"
+HISTORY_WARMUP_UNIVERSES_PATH: str = "/api/admin/history-warmup/universes"
+HISTORY_WARMUP_POST_PATHS = frozenset({HISTORY_WARMUP_EXECUTE_PATH, HISTORY_WARMUP_UNIVERSES_PATH})
 
 
 def is_history_warmup_route_allowed(method: str, path: str) -> bool:
     m = (method or "").upper()
     p = path or ""
-    # POST is permitted ONLY for the single execute route; OPTIONS is allowed on
-    # it for CORS preflight but never GET/HEAD (it is not a readable resource).
-    if p == HISTORY_WARMUP_EXECUTE_PATH:
+    # POST is permitted ONLY for the bounded mutation routes; OPTIONS is allowed
+    # on them for CORS preflight but never GET/HEAD (not readable resources).
+    if p in HISTORY_WARMUP_POST_PATHS:
         return m in ("POST", "OPTIONS")
     if m not in HISTORY_WARMUP_ONLY_METHODS:
         return False
@@ -44,5 +47,7 @@ __all__ = [
     "HISTORY_WARMUP_ONLY_ALLOWLIST",
     "HISTORY_WARMUP_ONLY_METHODS",
     "HISTORY_WARMUP_EXECUTE_PATH",
+    "HISTORY_WARMUP_UNIVERSES_PATH",
+    "HISTORY_WARMUP_POST_PATHS",
     "is_history_warmup_route_allowed",
 ]

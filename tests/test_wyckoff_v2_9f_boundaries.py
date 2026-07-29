@@ -86,9 +86,9 @@ class TestProductionSurfacesUnmodified:
         migrations = sorted(
             p.name for p in (ROOT / "app" / "db" / "migrations").glob("*.sql")
         )
-        assert migrations[-1] == "015_history_warmup_run_items.sql"
+        assert migrations[-1] == "016_history_warmup_leases_and_universes.sql"
         assert [m for m in migrations if m.startswith("014_")] == ["014_market_bars_4h.sql"]
-        assert not [m for m in migrations if m.startswith("016_")]
+        assert not [m for m in migrations if m.startswith("017_")]
 
 
 class TestNoActivationPath:

@@ -80,7 +80,7 @@ class TestMigration009:
             "013_wyckoff_v2_shadow_arms.sql"
         ]
         assert [q.name for q in sorted(MIGRATIONS.glob("014_*"))] == ["014_market_bars_4h.sql"]
-        assert not list(MIGRATIONS.glob("016_*"))
+        assert not list(MIGRATIONS.glob("017_*"))
     def test_migration_is_additive_and_idempotent(self):
         sql = self._statements()
         assert sql.count("ADD COLUMN IF NOT EXISTS") == 3

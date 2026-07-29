@@ -296,7 +296,10 @@ class TestHttp:
         finally:
             _teardown()
 
-    def test_preflight_v2_server_selected_batch_no_call(self, monkeypatch):
+    def test_preflight_symbols_is_nonexecutable_preview(self, monkeypatch):
+        # An ad hoc `symbols` preflight is an EXPLICITLY NON-EXECUTABLE preview:
+        # no next_batch / execute identity (executable preflight requires a frozen
+        # universe via universe_id — covered by the Docker integration suite).
         conn = _WarmupConn(daily_rows=[daily("AAA", 100, 5, 20)], fourh_rows=[])
         _warmup_on(monkeypatch, conn)
         try:
@@ -304,18 +307,10 @@ class TestHttp:
                 "/api/admin/history-warmup/preflight?symbols=AAA")
             assert r.status_code == 200, r.json()
             b = r.json()
-            assert b["contract_version"] == "history_warmup_preflight.v2"
             assert b["provider_called"] is False and b["provider_constructed"] is False
+            assert b["executable"] is False and b["preview"] is True
+            assert "next_batch" not in b
             assert b["readiness"]["contract_version"] == "shadow_prospective_readiness.v2"
-            # AAA is not launch-ready -> server-selected normal next batch of 1
-            assert b["normal_pending_symbols"] == ["AAA"]
-            assert b["retryable_symbols"] == [] and b["terminal_symbols"] == []
-            nb = b["next_batch"]
-            assert nb["available"] is True and nb["mode"] == "normal"
-            assert nb["symbols"] == ["AAA"] and nb["symbol_count"] == 1
-            assert nb["next_batch_hash"].startswith("sha256:")
-            assert b["execution_allowed_by_cooldown"] is True  # no prior run
-            assert b["max_symbols_per_batch"] == 1
             assert conn.write_calls == []
         finally:
             _teardown()
