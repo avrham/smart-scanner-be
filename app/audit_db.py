@@ -38,6 +38,8 @@ MODE_MAINTENANCE_EXPLICIT = "maintenance_explicit"
 MODE_MAINTENANCE_UNCONFIGURED = "maintenance_unconfigured"
 MODE_HISTORY_WARMUP_EXPLICIT = "history_warmup_explicit"
 MODE_HISTORY_WARMUP_UNCONFIGURED = "history_warmup_unconfigured"
+MODE_PROSPECTIVE_EXPLICIT = "prospective_explicit"
+MODE_PROSPECTIVE_UNCONFIGURED = "prospective_unconfigured"
 
 # asyncpg pool kwargs for the AUDIT pool. statement_cache_size=0 disables
 # prepared statements so the pool is safe behind a Supavisor pooler (and
@@ -66,6 +68,15 @@ HISTORY_WARMUP_POOL_KWARGS = {
     "command_timeout": 60,
     "statement_cache_size": 0,
 }
+# Prospective pool: WRITE-capable (campaign/pairs/evaluations + registration).
+# statement_cache_size=0 for pooler safety; a larger command_timeout since one
+# execute persists 25 pairs + 50 evaluations locally (no provider waits).
+PROSPECTIVE_POOL_KWARGS = {
+    "min_size": 1,
+    "max_size": 5,
+    "command_timeout": 120,
+    "statement_cache_size": 0,
+}
 DEFAULT_POOL_KWARGS = {"min_size": 1, "max_size": 10, "command_timeout": 60}
 
 
@@ -84,6 +95,10 @@ def _maintenance_url() -> str:
 
 def _history_warmup_url() -> str:
     return (getattr(settings, "HISTORY_WARMUP_DATABASE_URL", "") or "").strip()
+
+
+def _prospective_url() -> str:
+    return (getattr(settings, "PROSPECTIVE_DATABASE_URL", "") or "").strip()
 
 
 def maintenance_database_configured() -> bool:
@@ -174,6 +189,9 @@ def audit_dsn_diagnostic() -> Dict[str, Any]:
 
 def get_connection_mode() -> str:
     """The selected connection mode (safe to log/report; never the DSN)."""
+    if getattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", False):
+        return (MODE_PROSPECTIVE_EXPLICIT if _prospective_url()
+                else MODE_PROSPECTIVE_UNCONFIGURED)
     if getattr(settings, "HISTORY_WARMUP_ONLY_MODE", False):
         return (MODE_HISTORY_WARMUP_EXPLICIT if _history_warmup_url()
                 else MODE_HISTORY_WARMUP_UNCONFIGURED)
@@ -196,6 +214,17 @@ def select_connection_plan() -> Tuple[str, List[Tuple[str, str]], Dict[str, Any]
     it uses only the explicit audit DSN, or fails closed when none is set.
     """
     from app.deps import build_connection_dsns
+
+    if getattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", False):
+        raw = _prospective_url()
+        if not raw:
+            raise AuditDatabaseError(
+                "prospective database not configured: PROSPECTIVE_CAMPAIGN_ONLY_MODE"
+                "=true requires PROSPECTIVE_DATABASE_URL (no fallback to the audit, "
+                "maintenance, warmup or default database)")
+        validate_audit_database_url(raw)
+        return (MODE_PROSPECTIVE_EXPLICIT, [("prospective_explicit", raw)],
+                dict(PROSPECTIVE_POOL_KWARGS))
 
     if getattr(settings, "HISTORY_WARMUP_ONLY_MODE", False):
         raw = _history_warmup_url()
@@ -248,6 +277,8 @@ __all__ = [
     "MODE_MAINTENANCE_UNCONFIGURED",
     "MODE_HISTORY_WARMUP_EXPLICIT",
     "MODE_HISTORY_WARMUP_UNCONFIGURED",
+    "MODE_PROSPECTIVE_EXPLICIT",
+    "MODE_PROSPECTIVE_UNCONFIGURED",
     "AuditDatabaseError",
     "validate_audit_database_url",
     "audit_dsn_diagnostic",

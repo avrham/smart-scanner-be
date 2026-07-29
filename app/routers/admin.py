@@ -2872,6 +2872,487 @@ async def history_warmup_execute(
 
 
 # --------------------------------------------------------------------------- #
+# Prospective campaign (PROSPECTIVE_CAMPAIGN_ONLY_MODE). Local-data-only,
+# provider-free frozen-universe candidate/control evaluation. Reuses the pure
+# shadow runner via a local-history shim; creates NO outcomes.
+# --------------------------------------------------------------------------- #
+def _require_prospective_mode():
+    if not settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+async def _prospective_readiness(db, universe, *, now):
+    from app.prospective_readiness import build_prospective_readiness_v2
+    daily_rows, fourh_rows = await _fetch_local_readiness(db, universe["symbols"])
+    return build_prospective_readiness_v2(universe["symbols"], daily_rows, fourh_rows, now=now)
+
+
+async def _campaign_counts(db, run_id):
+    import app.prospective_campaign as pc
+    row = await db.fetchrow(
+        "SELECT (SELECT count(*) FROM strategy_shadow_run_pairs WHERE run_id=$1)::int AS pairs, "
+        "(SELECT count(*) FROM strategy_shadow_evaluations e JOIN strategy_shadow_run_pairs rp "
+        "ON rp.pair_id=e.pair_id WHERE rp.run_id=$1)::int AS evals, "
+        "(SELECT count(*) FROM strategy_shadow_evaluations e JOIN strategy_shadow_run_pairs rp "
+        "ON rp.pair_id=e.pair_id WHERE rp.run_id=$1 AND e.arm_code=$2)::int AS cand, "
+        "(SELECT count(*) FROM strategy_shadow_evaluations e JOIN strategy_shadow_run_pairs rp "
+        "ON rp.pair_id=e.pair_id WHERE rp.run_id=$1 AND e.arm_code=$3)::int AS ctrl",
+        run_id, pc.CANDIDATE_ARM_CODE, pc.CONTROL_ARM_CODE)
+    return dict(row)
+
+
+@router.get("/prospective/access-check")
+async def prospective_access_check(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db)):
+    """prospective_access_check.v1 — provider-free privilege verdict."""
+    _require_prospective_mode()
+    import app.prospective_campaign as pc
+    identity = await db.fetchval("SELECT current_user")
+
+    async def exists(rel):
+        return (await db.fetchval("SELECT to_regclass($1)", rel)) is not None
+
+    async def priv(rel, p):
+        try:
+            return bool(await db.fetchval("SELECT has_table_privilege($1,$2)", rel, p))
+        except asyncpg.PostgresError:
+            return False
+
+    write_ok = {
+        "prospective_campaign_registrations": await priv("public.prospective_campaign_registrations", "INSERT") if await exists("public.prospective_campaign_registrations") else False,
+        "strategy_shadow_runs": await priv("public.strategy_shadow_runs", "INSERT"),
+        "strategy_shadow_pairs": await priv("public.strategy_shadow_pairs", "INSERT"),
+        "strategy_shadow_evaluations": await priv("public.strategy_shadow_evaluations", "INSERT"),
+    }
+    daily_w = await priv("public.daily_bars", "INSERT")
+    fourh_w = await priv("public.market_bars_4h", "INSERT")
+    outcome_w = await priv("public.strategy_shadow_pair_outcomes", "INSERT")
+    delete_ok = await priv("public.strategy_shadow_pairs", "DELETE")
+    reasons = []
+    if identity != (settings.PROSPECTIVE_EXPECTED_DB_ROLE or None):
+        reasons.append("database_identity_mismatch")
+    if not settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE:
+        reasons.append("prospective_campaign_only_mode_disabled")
+    if settings.ENABLE_SCHEDULER:
+        reasons.append("scheduler_enabled")
+    if not all(write_ok.values()):
+        reasons.append(f"missing_campaign_writes:{sorted(k for k,v in write_ok.items() if not v)}")
+    if daily_w or fourh_w:
+        reasons.append("bar_writes_not_forbidden")
+    if outcome_w:
+        reasons.append("outcome_writes_not_forbidden")
+    if delete_ok:
+        reasons.append("delete_not_forbidden")
+    return {
+        "access_check_contract_version": pc.ACCESS_CHECK_CONTRACT_VERSION,
+        "ready": not reasons, "reasons": reasons,
+        "database_identity": identity,
+        "expected_database_role": settings.PROSPECTIVE_EXPECTED_DB_ROLE or None,
+        "prospective_campaign_only_mode": settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE,
+        "scheduler_enabled": settings.ENABLE_SCHEDULER,
+        "provider_constructed": False,
+        "provider_credential_configured": bool((settings.MASSIVE_API_KEY or "").strip()),
+        "local_daily_store_available": await exists("public.daily_bars"),
+        "local_4h_store_available": await exists("public.market_bars_4h"),
+        "required_relations": ["daily_bars", "market_bars_4h",
+                               "prospective_campaign_registrations",
+                               "strategy_shadow_runs", "strategy_shadow_pairs",
+                               "strategy_shadow_evaluations"],
+        "required_privileges": {"select": ["daily_bars", "market_bars_4h"],
+                                "insert_update": list(write_ok.keys())},
+        "campaign_writes_allowed": bool(write_ok["strategy_shadow_runs"]),
+        "pair_writes_allowed": bool(write_ok["strategy_shadow_pairs"]),
+        "evaluation_writes_allowed": bool(write_ok["strategy_shadow_evaluations"]),
+        "registration_writes_allowed": bool(write_ok["prospective_campaign_registrations"]),
+        "outcome_writes_forbidden": not outcome_w,
+        "bar_writes_forbidden": not (daily_w or fourh_w),
+        "delete_forbidden": not delete_ok,
+    }
+
+
+async def _prospective_preflight_state(db, universe_id, experiment_code, *, now):
+    import app.prospective_campaign as pc
+    from app.prospective_session import resolve_snapshot
+    universe = await _load_universe(db, universe_id=universe_id, require_frozen=True)
+    readiness = await _prospective_readiness(db, universe, now=now)
+    snap = resolve_snapshot(now)
+    reg_id = pc.registration_identity(
+        experiment_code=experiment_code, universe_id=universe["universe_id"],
+        universe_hash=universe["universe_hash"], history_config_hash=readiness["config_hash"],
+        snapshot_session_date=snap["snapshot_session_date"])
+    existing = await db.fetchrow(
+        "SELECT id, status, campaign_run_id FROM prospective_campaign_registrations "
+        "WHERE registration_identity = $1", reg_id)
+    both_ready = readiness["both_ready_count"] == len(universe["symbols"])
+    blocking = []
+    if universe["status"] != "frozen":
+        blocking.append("universe_not_frozen")
+    if not both_ready:
+        nr = [s["symbol"] for s in readiness["symbols"] if not s["both_ready"]]
+        blocking.append(f"symbols_not_ready:{nr[:10]}")
+    if experiment_code != settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE:
+        blocking.append("experiment_not_allowed")
+    if settings.ENABLE_SCHEDULER:
+        blocking.append("scheduler_enabled")
+    return universe, readiness, snap, reg_id, existing, blocking
+
+
+@router.get("/prospective/preflight")
+async def prospective_preflight(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    universe_id: Optional[str] = None, experiment_code: Optional[str] = None):
+    """prospective_preflight.v1 — server independently loads + validates the
+    frozen universe, recomputes hashes, resolves the completed snapshot session.
+    Provider-free."""
+    _require_prospective_mode()
+    import app.prospective_campaign as pc
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    exp = experiment_code or settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE
+    if not universe_id:
+        raise HTTPException(status_code=422, detail={"error": "universe_id_required"})
+    universe, readiness, snap, reg_id, existing, blocking = await _prospective_preflight_state(
+        db, universe_id, exp, now=now)
+    return {
+        "contract_version": pc.PREFLIGHT_CONTRACT_VERSION,
+        "provider_called": False, "provider_constructed": False,
+        "experiment_code": exp,
+        "experiment_contract_version": pc.EXPERIMENT_CONTRACT_VERSION,
+        "universe_id": universe["universe_id"], "universe_code": universe["universe_code"],
+        "universe_version": universe["universe_version"], "universe_hash": universe["universe_hash"],
+        "universe_status": universe["status"], "symbol_count": universe["symbol_count"],
+        "history_config_hash": readiness["config_hash"],
+        "history_readiness_manifest_hash": readiness["combined_readiness_manifest_hash"],
+        "all_ready": readiness["both_ready_count"] == universe["symbol_count"],
+        "both_ready_count": readiness["both_ready_count"],
+        "snapshot_session_date": snap["snapshot_session_date"],
+        "snapshot_cutoff_at": snap["snapshot_cutoff_at"],
+        "market_calendar_version": snap["market_calendar_version"],
+        "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
+        "candidate_strategy_version": pc.CANDIDATE_STRATEGY_VERSION,
+        "candidate_signal_definition": pc.CANDIDATE_SIGNAL_DEFINITION,
+        "candidate_allow_enter": pc.CANDIDATE_ALLOW_ENTER,
+        "control_strategy_code": pc.CONTROL_STRATEGY_CODE,
+        "control_strategy_version": pc.CONTROL_STRATEGY_VERSION,
+        "registration_identity": reg_id,
+        "existing_registration_id": str(existing["id"]) if existing else None,
+        "existing_registration_status": existing["status"] if existing else None,
+        "existing_campaign_run_id": str(existing["campaign_run_id"]) if existing and existing["campaign_run_id"] else None,
+        "execution_available": not blocking,
+        "blocking_reasons": blocking,
+        "readiness": readiness,
+    }
+
+
+@router.post("/prospective/register")
+async def prospective_register(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...)):
+    """prospective_campaign_registration.v1 — persist the immutable prospective
+    identity. Server owns strategy versions / allow_enter / snapshot. Idempotent."""
+    _require_prospective_mode()
+    import json as _json
+    import app.prospective_campaign as pc
+    from datetime import datetime, timezone, date as _date
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    if body.get("contract_version") != pc.REGISTRATION_CONTRACT_VERSION:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    exp = body.get("experiment_code")
+    if exp != settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE:
+        raise HTTPException(status_code=422, detail={"error": "experiment_not_allowed"})
+    forbidden = [f for f in ("strategy_version", "candidate_strategy_version", "allow_enter",
+                             "provider", "entry_price", "outcome_horizon", "symbols")
+                 if body.get(f) is not None]
+    if forbidden:
+        raise HTTPException(status_code=422, detail={"error": "forbidden_request_fields", "fields": sorted(forbidden)})
+    universe_id = body.get("universe_id")
+    if not universe_id:
+        raise HTTPException(status_code=422, detail={"error": "universe_id_required"})
+    now = datetime.now(timezone.utc)
+    universe, readiness, snap, reg_id, existing, blocking = await _prospective_preflight_state(
+        db, universe_id, exp, now=now)
+    # validate the client's pinned hashes/snapshot against fresh server values
+    if body.get("universe_hash") != universe["universe_hash"]:
+        raise HTTPException(status_code=409, detail={"error": "stale_universe_hash"})
+    if body.get("history_config_hash") not in (None, readiness["config_hash"]):
+        raise HTTPException(status_code=409, detail={"error": "stale_history_config_hash"})
+    if body.get("history_readiness_manifest_hash") not in (None, readiness["combined_readiness_manifest_hash"]):
+        raise HTTPException(status_code=409, detail={"error": "stale_history_manifest"})
+    if body.get("snapshot_session_date") not in (None, snap["snapshot_session_date"]):
+        raise HTTPException(status_code=409, detail={"error": "invalid_snapshot_session"})
+    if blocking:
+        raise HTTPException(status_code=409, detail={"error": "registration_blocked", "reasons": blocking})
+    if existing is not None:
+        return {"contract_version": pc.REGISTRATION_CONTRACT_VERSION,
+                "status": "already_registered", "registration_id": str(existing["id"]),
+                "registration_identity": reg_id, "detail": "identical registration exists"}
+    row = await db.fetchrow(
+        """
+        INSERT INTO prospective_campaign_registrations(
+          experiment_code, experiment_contract_version, universe_id, universe_code,
+          universe_version, universe_hash, history_config_hash, history_readiness_manifest_hash,
+          candidate_strategy_code, candidate_strategy_version, candidate_signal_definition,
+          candidate_allow_enter, control_strategy_code, control_strategy_version,
+          snapshot_session_date, snapshot_cutoff_at, market_calendar_version,
+          registration_identity, status, created_at, updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,FALSE,$12,$13,$14,$15,$16,$17,'registered',NOW(),NOW())
+        ON CONFLICT (registration_identity) DO NOTHING RETURNING id
+        """,
+        exp, pc.EXPERIMENT_CONTRACT_VERSION, universe["universe_id"], universe["universe_code"],
+        universe["universe_version"], universe["universe_hash"], readiness["config_hash"],
+        readiness["combined_readiness_manifest_hash"], pc.CANDIDATE_STRATEGY_CODE,
+        pc.CANDIDATE_STRATEGY_VERSION, pc.CANDIDATE_SIGNAL_DEFINITION, pc.CONTROL_STRATEGY_CODE,
+        pc.CONTROL_STRATEGY_VERSION,
+        _date.fromisoformat(snap["snapshot_session_date"]),
+        datetime.fromisoformat(snap["snapshot_cutoff_at"]),
+        snap["market_calendar_version"], reg_id)
+    if row is None:  # race: created between preflight and insert
+        again = await db.fetchrow("SELECT id FROM prospective_campaign_registrations WHERE registration_identity=$1", reg_id)
+        return {"contract_version": pc.REGISTRATION_CONTRACT_VERSION, "status": "already_registered",
+                "registration_id": str(again["id"]), "registration_identity": reg_id}
+    return {"contract_version": pc.REGISTRATION_CONTRACT_VERSION, "status": "registered",
+            "registration_id": str(row["id"]), "registration_identity": reg_id,
+            "snapshot_session_date": snap["snapshot_session_date"],
+            "snapshot_cutoff_at": snap["snapshot_cutoff_at"],
+            "universe_hash": universe["universe_hash"],
+            "history_readiness_manifest_hash": readiness["combined_readiness_manifest_hash"]}
+
+
+@router.post("/prospective/execute")
+async def prospective_execute(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...)):
+    """prospective_campaign_execute.v1 — create ONE campaign, 25 pairs, 50
+    evaluations, 0 outcomes, using ONLY local bars. Advisory-locked + idempotent."""
+    _require_prospective_mode()
+    import json as _json
+    import app.prospective_campaign as pc
+    from datetime import datetime, timezone
+    from app.prospective_local_provider import LocalHistoryProvider
+    from app.workers.shadow.campaigns import plan_shadow_campaign, run_shadow_campaign
+    logger = logging.getLogger(__name__)
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    if not isinstance(body, dict) or body.get("contract_version") != pc.EXECUTE_CONTRACT_VERSION:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    reg_pk = body.get("registration_id")
+    if not reg_pk:
+        raise HTTPException(status_code=422, detail={"error": "registration_id_required"})
+    now = datetime.now(timezone.utc)
+    lease_s = max(1, int(settings.PROSPECTIVE_EXECUTION_LEASE_SECONDS))
+
+    reg = await db.fetchrow(
+        "SELECT * FROM prospective_campaign_registrations WHERE id = $1", reg_pk)
+    if reg is None:
+        raise HTTPException(status_code=404, detail={"error": "unknown_registration"})
+    exec_id = pc.campaign_execution_identity(
+        registration_identity_value=reg["registration_identity"], universe_hash=reg["universe_hash"],
+        history_readiness_manifest_hash=reg["history_readiness_manifest_hash"],
+        snapshot_session_date=reg["snapshot_session_date"].isoformat())
+
+    async def _already(r):
+        counts = await _campaign_counts(db, r["campaign_run_id"]) if r["campaign_run_id"] else {"pairs": r["pair_count"], "evals": r["candidate_evaluation_count"]+r["control_evaluation_count"], "cand": r["candidate_evaluation_count"], "ctrl": r["control_evaluation_count"]}
+        return {"contract_version": pc.EXECUTE_CONTRACT_VERSION, "status": "already_applied",
+                "registration_id": str(r["id"]), "campaign_id": str(r["campaign_id"]) if r["campaign_id"] else None,
+                "campaign_run_id": str(r["campaign_run_id"]) if r["campaign_run_id"] else None,
+                "pair_count": counts["pairs"], "candidate_evaluations": counts["cand"],
+                "control_evaluations": counts["ctrl"], "outcomes": 0, "provider_request_count": 0}
+    if reg["status"] == "completed":
+        return await _already(reg)
+
+    got_lock = await db.fetchval("SELECT pg_try_advisory_lock($1)", pc.PROSPECTIVE_ADVISORY_LOCK_KEY)
+    if not got_lock:
+        raise HTTPException(status_code=409, detail={"error": "prospective_campaign_execution_locked"})
+    try:
+        reg = await db.fetchrow("SELECT * FROM prospective_campaign_registrations WHERE id=$1", reg_pk)
+        if reg["status"] == "completed":
+            return await _already(reg)
+        if reg["status"] == "executing" and reg["execution_lease_expires_at"] and reg["execution_lease_expires_at"] > now:
+            raise HTTPException(status_code=409, detail={
+                "error": "prospective_campaign_execution_in_progress",
+                "registration_id": str(reg["id"]),
+                "lease_expires_at": reg["execution_lease_expires_at"].isoformat()})
+        # revalidate immutable identities against fresh server state
+        universe = await _load_universe(db, universe_id=str(reg["universe_id"]), require_frozen=True)
+        readiness = await _prospective_readiness(db, universe, now=now)
+        if body.get("registration_identity") not in (None, reg["registration_identity"]):
+            raise HTTPException(status_code=409, detail={"error": "registration_identity_mismatch"})
+        if universe["universe_hash"] != reg["universe_hash"] or body.get("universe_hash") not in (None, reg["universe_hash"]):
+            raise HTTPException(status_code=409, detail={"error": "stale_universe"})
+        if readiness["combined_readiness_manifest_hash"] != reg["history_readiness_manifest_hash"] or body.get("history_readiness_manifest_hash") not in (None, reg["history_readiness_manifest_hash"]):
+            raise HTTPException(status_code=409, detail={"error": "stale_history_manifest"})
+        if body.get("snapshot_session_date") not in (None, reg["snapshot_session_date"].isoformat()):
+            raise HTTPException(status_code=409, detail={"error": "invalid_snapshot_session"})
+        if readiness["both_ready_count"] != len(universe["symbols"]):
+            raise HTTPException(status_code=409, detail={"error": "history_not_ready"})
+
+        expected = len(universe["symbols"])
+        # crash recovery: a prior campaign already fully persisted -> reconcile
+        if reg["campaign_run_id"]:
+            c = await _campaign_counts(db, reg["campaign_run_id"])
+            if c["pairs"] == expected and c["cand"] == expected and c["ctrl"] == expected:
+                await db.execute(
+                    "UPDATE prospective_campaign_registrations SET status='completed', "
+                    "pair_count=$3, candidate_evaluation_count=$3, control_evaluation_count=$3, "
+                    "campaign_execution_identity=$2, finished_at=NOW(), updated_at=NOW() WHERE id=$1",
+                    reg_pk, exec_id, expected)
+                reg = await db.fetchrow("SELECT * FROM prospective_campaign_registrations WHERE id=$1", reg_pk)
+                return await _already(reg)
+
+        # mark executing + lease
+        await db.execute(
+            "UPDATE prospective_campaign_registrations SET status='executing', "
+            "campaign_execution_identity=$2, execution_lease_expires_at=NOW() + ($3||' seconds')::interval, "
+            "updated_at=NOW() WHERE id=$1", reg_pk, exec_id, str(lease_s))
+
+        # build the local-history shim (NO provider) + run the reused campaign
+        shim = LocalHistoryProvider(
+            snapshot_session_date=reg["snapshot_session_date"],
+            snapshot_cutoff_at=reg["snapshot_cutoff_at"])
+        plan = plan_shadow_campaign(
+            experiment_code=reg["experiment_code"], symbols=universe["symbols"],
+            max_symbols=len(universe["symbols"]),
+            as_of_date=reg["snapshot_session_date"].isoformat())
+        started = datetime.now(timezone.utc)
+        logger.info("[PROS] execute reg=%s exp=%s symbols=%d snapshot=%s",
+                    reg_pk, reg["experiment_code"], len(universe["symbols"]),
+                    reg["snapshot_session_date"])
+        summary = await run_shadow_campaign(shim, plan, now_utc=reg["snapshot_cutoff_at"])
+        run_ids = [r["run_id"] for r in (summary.get("runs") or []) if r.get("run_id")]
+        # one chunk of 25 -> one run
+        run_id = run_ids[0] if run_ids else (summary.get("runs") or [{}])[0].get("run_id")
+        counts = await _campaign_counts(db, run_id) if run_id else {"pairs": 0, "evals": 0, "cand": 0, "ctrl": 0}
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+
+        if not (counts["pairs"] == expected and counts["cand"] == expected and counts["ctrl"] == expected):
+            await db.execute(
+                "UPDATE prospective_campaign_registrations SET status='failed', "
+                "error_code=$2, error_message=$3, updated_at=NOW() WHERE id=$1",
+                reg_pk, "campaign_count_mismatch",
+                f"pairs={counts['pairs']} cand={counts['cand']} ctrl={counts['ctrl']} expected={expected}")
+            raise HTTPException(status_code=500, detail={
+                "error": "prospective_campaign_incomplete", "counts": counts, "expected": expected})
+        outcomes = await db.fetchval("SELECT count(*)::int FROM strategy_shadow_pair_outcomes")
+        await db.execute(
+            "UPDATE prospective_campaign_registrations SET status='completed', "
+            "campaign_id=$2, campaign_run_id=$3, pair_count=$5, candidate_evaluation_count=$5, "
+            "control_evaluation_count=$5, telemetry=$4::jsonb, finished_at=NOW(), "
+            "updated_at=NOW(), execution_lease_expires_at=NULL WHERE id=$1",
+            reg_pk, plan.get("campaign_id"), run_id,
+            _json.dumps({"duration_s": round(elapsed, 2), "provider": shim.name,
+                         "daily_reads": shim.daily_reads, "intraday_reads": shim.intraday_reads}),
+            expected)
+        logger.info("[PROS] done reg=%s run=%s pairs=%d cand=%d ctrl=%d outcomes=%d dur=%.2f",
+                    reg_pk, run_id, counts["pairs"], counts["cand"], counts["ctrl"], outcomes, elapsed)
+        return {"contract_version": pc.EXECUTE_CONTRACT_VERSION, "status": "executed",
+                "registration_id": str(reg_pk), "campaign_id": str(plan.get("campaign_id")),
+                "campaign_run_id": str(run_id), "pair_count": counts["pairs"],
+                "candidate_evaluations": counts["cand"], "control_evaluations": counts["ctrl"],
+                "outcomes": int(outcomes or 0), "provider_request_count": 0,
+                "provider_constructed": False, "duration_seconds": round(elapsed, 2)}
+    finally:
+        await db.fetchval("SELECT pg_advisory_unlock($1)", pc.PROSPECTIVE_ADVISORY_LOCK_KEY)
+
+
+@router.get("/prospective/audit")
+async def prospective_audit(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    registration_id: Optional[str] = None):
+    """prospective_campaign_audit.v1 — read-only reconciliation + descriptive
+    candidate/control signal distributions. provider_called=false, outcomes=0."""
+    _require_prospective_mode()
+    import app.prospective_campaign as pc
+    if not registration_id:
+        reg = await db.fetchrow("SELECT * FROM prospective_campaign_registrations ORDER BY created_at DESC LIMIT 1")
+    else:
+        reg = await db.fetchrow("SELECT * FROM prospective_campaign_registrations WHERE id=$1", registration_id)
+    if reg is None:
+        raise HTTPException(status_code=404, detail={"error": "unknown_registration"})
+    run_id = reg["campaign_run_id"]
+    counts = await _campaign_counts(db, run_id) if run_id else {"pairs": 0, "evals": 0, "cand": 0, "ctrl": 0}
+    cand_rows = ctrl_rows = []
+    if run_id:
+        cand_rows = await db.fetch(
+            "SELECT e.verdict, e.score, e.details_snapshot, p.symbol FROM strategy_shadow_evaluations e "
+            "JOIN strategy_shadow_run_pairs rp ON rp.pair_id=e.pair_id "
+            "JOIN strategy_shadow_pairs p ON p.id=e.pair_id "
+            "WHERE rp.run_id=$1 AND e.arm_code=$2", run_id, pc.CANDIDATE_ARM_CODE)
+        ctrl_rows = await db.fetch(
+            "SELECT e.verdict, e.score, p.symbol FROM strategy_shadow_evaluations e "
+            "JOIN strategy_shadow_run_pairs rp ON rp.pair_id=e.pair_id "
+            "JOIN strategy_shadow_pairs p ON p.id=e.pair_id "
+            "WHERE rp.run_id=$1 AND e.arm_code=$2", run_id, pc.CONTROL_ARM_CODE)
+    cand_decisions, cand_readiness, watch_reasons = {}, {}, {}
+    setup_n = trig_n = pre_entry_n = rollout_blocked_n = score_cov = 0
+    cand_signal_syms = set()
+    fourh_states = {}
+    import json as _json
+    def _details(v):
+        if isinstance(v, str):
+            try:
+                return _json.loads(v)
+            except (ValueError, TypeError):
+                return {}
+        return v or {}
+    for r in cand_rows:
+        cand_decisions[r["verdict"]] = cand_decisions.get(r["verdict"], 0) + 1
+        sig = pc.candidate_signal_fields(_details(r["details_snapshot"]))
+        cand_readiness[sig["readiness_status"]] = cand_readiness.get(sig["readiness_status"], 0) + 1
+        setup_n += 1 if sig["setup_present"] else 0
+        trig_n += 1 if sig["trigger_confirmed"] else 0
+        if sig["enter_eligible_without_rollout_gate"]:
+            pre_entry_n += 1; cand_signal_syms.add(r["symbol"])
+        rollout_blocked_n += 1 if sig["rollout_blocked"] else 0
+        score_cov += 1 if r["score"] is not None else 0
+        fs = sig.get("four_hour_state"); fourh_states[fs] = fourh_states.get(fs, 0) + 1
+        if r["verdict"] == "WATCH":
+            for wr in (sig["waiting_reasons"] or ["unspecified"]):
+                watch_reasons[wr] = watch_reasons.get(wr, 0) + 1
+    ctrl_decisions = {}
+    ctrl_signal_syms = set()
+    for r in ctrl_rows:
+        ctrl_decisions[r["verdict"]] = ctrl_decisions.get(r["verdict"], 0) + 1
+        if r["verdict"] == "ENTER":
+            ctrl_signal_syms.add(r["symbol"])
+    outcomes = await db.fetchval("SELECT count(*)::int FROM strategy_shadow_pair_outcomes")
+    return {
+        "contract_version": pc.AUDIT_CONTRACT_VERSION,
+        "provider_called": False,
+        "registration_id": str(reg["id"]), "registration_identity": reg["registration_identity"],
+        "registration_status": reg["status"],
+        "campaign_id": str(reg["campaign_id"]) if reg["campaign_id"] else None,
+        "campaign_run_id": str(run_id) if run_id else None,
+        "experiment_code": reg["experiment_code"],
+        "experiment_contract_version": reg["experiment_contract_version"],
+        "universe_id": str(reg["universe_id"]), "universe_hash": reg["universe_hash"],
+        "snapshot_session_date": reg["snapshot_session_date"].isoformat(),
+        "snapshot_cutoff_at": reg["snapshot_cutoff_at"].isoformat(),
+        "pair_count": counts["pairs"],
+        "candidate_evaluation_count": counts["cand"], "control_evaluation_count": counts["ctrl"],
+        "missing_candidate_arms": max(0, counts["pairs"] - counts["cand"]),
+        "missing_control_arms": max(0, counts["pairs"] - counts["ctrl"]),
+        "duplicate_arms": max(0, counts["evals"] - counts["cand"] - counts["ctrl"]),
+        "candidate_readiness_distribution": cand_readiness,
+        "candidate_decision_counts": cand_decisions,
+        "candidate_setup_present_count": setup_n,
+        "candidate_trigger_confirmed_count": trig_n,
+        "candidate_pre_rollout_entry_count": pre_entry_n,
+        "candidate_rollout_blocked_count": rollout_blocked_n,
+        "candidate_watch_classification_counts": watch_reasons,
+        "candidate_score_coverage": score_cov,
+        "four_hour_frame_states": fourh_states,
+        "control_decision_counts": ctrl_decisions,
+        "control_signal_count": len(ctrl_signal_syms),
+        "both_signal_intersection_count": len(cand_signal_syms & ctrl_signal_syms),
+        "outcome_count": int(outcomes or 0),
+        "campaign_completion_state": reg["status"],
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Shadow Outcome Maintenance Environment (maintenance-only mode).
 # --------------------------------------------------------------------------- #
 def _require_maintenance_mode():

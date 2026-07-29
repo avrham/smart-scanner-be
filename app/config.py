@@ -172,6 +172,27 @@ class Settings(BaseSettings):
     HISTORY_WARMUP_EXECUTION_LEASE_SECONDS: int = 120
     # Hard cap on a frozen warmup universe's symbol membership.
     HISTORY_WARMUP_MAX_UNIVERSE_SYMBOLS: int = 100
+
+    # Prospective-campaign-only mode (frozen-universe local evaluation). When true
+    # the app exposes ONLY liveness/version + the prospective access-check /
+    # preflight / register / execute / audit routes and connects as the dedicated
+    # least-privilege smart_scanner_prospective_runner role. Mutually exclusive
+    # with AUDIT/MAINTENANCE/HISTORY_WARMUP modes; incompatible with
+    # ENABLE_SCHEDULER=true. Constructs NO provider (local daily_bars +
+    # market_bars_4h only). Default false leaves all deployments unchanged.
+    PROSPECTIVE_CAMPAIGN_ONLY_MODE: bool = False
+    # Explicit prospective database identity. A COMPLETE PostgreSQL DSN used ONLY
+    # when PROSPECTIVE_CAMPAIGN_ONLY_MODE=true (fail closed if absent — never
+    # falls back to audit/maintenance/warmup/Supabase-default). Supplies the
+    # dedicated smart_scanner_prospective_runner role. SECRET; Fly secret only.
+    PROSPECTIVE_DATABASE_URL: str = ""
+    # The PostgreSQL role the prospective connection must authenticate as.
+    PROSPECTIVE_EXPECTED_DB_ROLE: str = "smart_scanner_prospective_runner"
+    # The single experiment the prospective app is locked to.
+    PROSPECTIVE_ALLOWED_EXPERIMENT_CODE: str = "wyckoff_v2_vs_baseline"
+    PROSPECTIVE_EXPERIMENT_CONTRACT_VERSION: str = "wyckoff_v2_prospective_experiment.v1"
+    # Durable execution-lease TTL for a prospective campaign execute.
+    PROSPECTIVE_EXECUTION_LEASE_SECONDS: int = 300
     # STABLE campaign-cohort membership lock (a sha256:... value). Required for
     # ready_for_maintenance_execution; compared against the recomputed cohort
     # lock hash (NEVER the dynamic remaining hash). Empty by default; installed
