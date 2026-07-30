@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import signal
 import socket
@@ -29,6 +30,21 @@ from app.jobs import registry as R
 from app.jobs.prospective_enqueue import sync_prospective_campaign
 
 logger = logging.getLogger("app.jobs.worker")
+
+
+def _make_executor(max_workers: int) -> ProcessPoolExecutor:
+    """Handler children MUST start via ``spawn``, never the platform default.
+
+    On Linux the default start method is ``fork``: a forked child inherits the
+    parent's module globals AND open socket FDs — including the live asyncpg
+    pool (``app.deps._db_pool``) — so the child's ``init_db_pool()`` reuses the
+    PARENT's connections and both processes interleave on the same PostgreSQL
+    sockets (protocol desync; observed live as a lease-renewal hang and a stuck
+    claim loop). ``spawn`` gives every child a clean interpreter whose pool
+    global is None, so it builds its own pool as the handler contract requires.
+    """
+    return ProcessPoolExecutor(max_workers=max_workers,
+                               mp_context=multiprocessing.get_context("spawn"))
 
 
 def _json_payload(raw: Any) -> Dict[str, Any]:
@@ -321,11 +337,11 @@ class JobWorker:
                 self.executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-        self.executor = ProcessPoolExecutor(max_workers=self.concurrency)
+        self.executor = _make_executor(self.concurrency)
 
     # ----- run -----
     async def run(self) -> None:
-        self.executor = ProcessPoolExecutor(max_workers=self.concurrency)
+        self.executor = _make_executor(self.concurrency)
         await self.register()
         self._install_signals()
         bg = [asyncio.create_task(self.heartbeat_loop()),

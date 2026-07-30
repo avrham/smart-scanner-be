@@ -35,4 +35,15 @@ def run_synthetic_task(payload: Dict[str, Any]) -> Dict[str, Any]:
             "result": {"echo": payload.get("echo"), "mode": mode}}
 
 
-__all__ = ["SYNTHETIC_TASK_TYPE", "SYNTHETIC_QUEUE", "run_synthetic_task"]
+def run_pool_isolation_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Child-process probe: report whether this child inherited the parent's
+    module-global asyncpg pool. A handler child MUST see ``app.deps._db_pool``
+    as None (it owns its pool); a fork-started child inherits the parent's live
+    pool object (and its socket FDs) — the exact defect this probe detects."""
+    import os
+    import app.deps as deps
+    return {"pool_inherited": deps._db_pool is not None, "child_pid": os.getpid()}
+
+
+__all__ = ["SYNTHETIC_TASK_TYPE", "SYNTHETIC_QUEUE", "run_synthetic_task",
+           "run_pool_isolation_probe"]
