@@ -25,6 +25,7 @@ PROSPECTIVE_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/api/admin/prospective/access-check",
     "/api/admin/prospective/preflight",
     "/api/admin/prospective/audit",
+    "/api/admin/prospective/outcomes/preflight",
     # generic job-management listing (read-only)
     "/api/admin/jobs",
     "/api/admin/jobs/workers",
@@ -40,10 +41,12 @@ PROSPECTIVE_ONLY_METHODS: Set[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 PROSPECTIVE_REGISTER_PATH: str = "/api/admin/prospective/register"
 PROSPECTIVE_EXECUTE_PATH: str = "/api/admin/prospective/execute"
 PROSPECTIVE_ENQUEUE_PATH: str = "/api/admin/prospective/jobs"
+PROSPECTIVE_OUTCOME_ENQUEUE_PATH: str = "/api/admin/prospective/outcomes/jobs"
 PROSPECTIVE_POST_PATHS = frozenset({
     PROSPECTIVE_REGISTER_PATH,
     PROSPECTIVE_EXECUTE_PATH,
     PROSPECTIVE_ENQUEUE_PATH,
+    PROSPECTIVE_OUTCOME_ENQUEUE_PATH,
     "/api/admin/job-schedules",  # create a schedule (POST)
 })
 
@@ -91,6 +94,7 @@ __all__ = [
     "PROSPECTIVE_REGISTER_PATH",
     "PROSPECTIVE_EXECUTE_PATH",
     "PROSPECTIVE_ENQUEUE_PATH",
+    "PROSPECTIVE_OUTCOME_ENQUEUE_PATH",
     "PROSPECTIVE_POST_PATHS",
     "is_prospective_route_allowed",
 ]

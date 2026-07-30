@@ -18,6 +18,16 @@ PROSPECTIVE_SYMBOL_EVALUATION_TASK = "prospective_symbol_evaluation.v1"
 JOB_TYPE_PROSPECTIVE_CAMPAIGN = "prospective_campaign"
 PROSPECTIVE_QUEUE = "prospective"
 
+# --- prospective outcome maturation (Concept A shared market-path only) ----
+# Reuses the existing pair-level `strategy_shadow_pair_outcomes` schema and
+# pure outcome.v1 formulas UNCHANGED; forward bars are read exclusively from
+# the LOCAL daily_bars cache (no provider construction) — see
+# app/jobs/prospective_outcome_local_reader.py.
+PROSPECTIVE_OUTCOME_MATURATION_ENQUEUE_CONTRACT = "prospective_outcome_maturation_enqueue.v1"
+PROSPECTIVE_OUTCOME_MATURATION_TASK = "prospective_outcome_maturation.v1"
+JOB_TYPE_PROSPECTIVE_OUTCOME_MATURATION = "prospective_outcome_maturation"
+PROSPECTIVE_OUTCOME_QUEUE = "prospective_outcomes"
+
 # --- job states ------------------------------------------------------------
 JOB_QUEUED = "queued"
 JOB_RUNNING = "running"
@@ -190,11 +200,71 @@ class ProspectiveSymbolPayload:
         }
 
 
+# --- typed outcome-maturation task payload ---------------------------------
+OUTCOME_PAYLOAD_FIELDS = (
+    "registration_id",
+    "registration_identity",
+    "campaign_id",
+    "campaign_run_id",
+    "pair_id",
+    "symbol",
+)
+
+
+@dataclass(frozen=True)
+class ProspectiveOutcomePayload:
+    """Server-pinned references only, re-validated against the immutable
+    registration/pair before any read or write — the payload only addresses
+    which frozen pair to mature, exactly like ProspectiveSymbolPayload does
+    for evaluation tasks."""
+
+    registration_id: str
+    registration_identity: str
+    campaign_id: str
+    campaign_run_id: str
+    pair_id: str
+    symbol: str
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ProspectiveOutcomePayload":
+        missing = [k for k in OUTCOME_PAYLOAD_FIELDS if k not in d]
+        if missing:
+            raise TerminalJobError(
+                "invalid_task_payload",
+                f"outcome payload missing fields: {missing}")
+        try:
+            return cls(
+                registration_id=str(d["registration_id"]),
+                registration_identity=str(d["registration_identity"]),
+                campaign_id=str(d["campaign_id"]),
+                campaign_run_id=str(d["campaign_run_id"]),
+                pair_id=str(d["pair_id"]),
+                symbol=str(d["symbol"]).upper(),
+            )
+        except (TypeError, ValueError) as exc:
+            raise TerminalJobError("invalid_task_payload", str(exc))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "registration_id": self.registration_id,
+            "registration_identity": self.registration_identity,
+            "campaign_id": self.campaign_id,
+            "campaign_run_id": self.campaign_run_id,
+            "pair_id": self.pair_id,
+            "symbol": self.symbol,
+        }
+
+
 __all__ = [
     "PROSPECTIVE_CAMPAIGN_ENQUEUE_CONTRACT",
     "PROSPECTIVE_SYMBOL_EVALUATION_TASK",
     "JOB_TYPE_PROSPECTIVE_CAMPAIGN",
     "PROSPECTIVE_QUEUE",
+    "PROSPECTIVE_OUTCOME_MATURATION_ENQUEUE_CONTRACT",
+    "PROSPECTIVE_OUTCOME_MATURATION_TASK",
+    "JOB_TYPE_PROSPECTIVE_OUTCOME_MATURATION",
+    "PROSPECTIVE_OUTCOME_QUEUE",
+    "ProspectiveOutcomePayload", "OUTCOME_PAYLOAD_FIELDS",
     "JOB_STATUSES", "JOB_TERMINAL",
     "JOB_QUEUED", "JOB_RUNNING", "JOB_SUCCEEDED", "JOB_FAILED",
     "JOB_CANCEL_REQUESTED", "JOB_CANCELLED",

@@ -3,7 +3,7 @@ Admin API endpoints for Smart Scanner
 Write endpoints protected by worker token
 """
 
-from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException, Response
+from fastapi import APIRouter, Depends, BackgroundTasks, Body, HTTPException, Query, Response
 from typing import Any, List, Optional
 import re
 import uuid
@@ -3433,6 +3433,69 @@ async def prospective_enqueue_jobs(
     except JobError as e:
         raise HTTPException(status_code=409, detail={"error": e.safe_error_code})
     response.status_code = 200 if result.get("status") == "already_applied" else 202
+    return result
+
+
+@router.get("/prospective/outcomes/preflight")
+async def prospective_outcome_preflight(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    registration_id: str = Query(...), registration_identity: str = Query(...)):
+    """prospective_outcome_maturity_preflight.v1 — read-only maturity report
+    for outcome maturation of a COMPLETED campaign's frozen pairs. Reuses the
+    existing eligibility classifier unchanged; NO provider construction, NO
+    outcome calculation, NO write."""
+    _require_prospective_mode()
+    from app.jobs.contracts import JobError
+    from app.jobs.prospective_outcome_enqueue import build_outcome_maturity_preflight
+    try:
+        uuid.UUID(str(registration_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail={"error": "invalid_registration_id"})
+    try:
+        return await build_outcome_maturity_preflight(
+            db, registration_id=str(registration_id),
+            registration_identity=str(registration_identity))
+    except JobError as e:
+        raise HTTPException(status_code=409, detail={"error": e.safe_error_code})
+
+
+@router.post("/prospective/outcomes/jobs")
+async def prospective_outcome_enqueue_jobs(
+    response: Response, _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db), body: Any = Body(...)):
+    """prospective_outcome_maturation_enqueue.v1 — create ONE durable job +
+    one task per MATURE-ELIGIBLE pair (never unmatured horizons, never a
+    duplicate of an already-applied outcome). NO strategy evaluation and NO
+    provider construction happen in this request. Idempotent: exact replay →
+    already_queued/already_applied (same job); zero eligible pairs →
+    no_eligible_work (no job created, safely re-checkable later)."""
+    _require_prospective_mode()
+    from app.jobs import contracts as jc
+    from app.jobs.contracts import JobError
+    from app.jobs.prospective_outcome_enqueue import enqueue_outcome_maturation
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    if (not isinstance(body, dict)
+            or body.get("contract_version") != jc.PROSPECTIVE_OUTCOME_MATURATION_ENQUEUE_CONTRACT):
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    reg_id = body.get("registration_id")
+    reg_identity = body.get("registration_identity")
+    if not reg_id or not reg_identity:
+        raise HTTPException(status_code=422, detail={"error": "registration_id_and_identity_required"})
+    try:
+        uuid.UUID(str(reg_id))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail={"error": "invalid_registration_id"})
+    try:
+        result = await enqueue_outcome_maturation(
+            db, registration_id=str(reg_id), registration_identity=str(reg_identity),
+            requested_by="prospective_outcome_api")
+    except JobError as e:
+        raise HTTPException(status_code=409, detail={"error": e.safe_error_code})
+    if result.get("status") == "no_eligible_work":
+        response.status_code = 200
+    else:
+        response.status_code = 200 if result.get("status") == "already_applied" else 202
     return result
 
 

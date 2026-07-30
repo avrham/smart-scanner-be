@@ -13,9 +13,9 @@ Concrete work is registered here. Rules:
 
 Future handlers plug in by adding a HandlerSpec:
   history_universe_warmup / prospective_campaign_registration /
-  prospective_symbol_evaluation / outcome_maturation / daily_scanner_run /
-  quality_audit / notification_delivery.
-Only prospective_symbol_evaluation.v1 is live-enabled now.
+  daily_scanner_run / quality_audit / notification_delivery.
+prospective_symbol_evaluation.v1 and prospective_outcome_maturation.v1 are
+live-enabled now.
 """
 
 from __future__ import annotations
@@ -92,6 +92,15 @@ def _install_default_handlers() -> None:
         queue_name=C.PROSPECTIVE_QUEUE,
         child_callable=_p.run_prospective_symbol_task,
         probe_fn=_p.probe_prospective_durable_output,
+        max_attempts=getattr(settings, "JOB_MAX_ATTEMPTS_DEFAULT", 3),
+        production_enabled=True,
+    ))
+    from app.jobs.handlers import prospective_outcome as _po
+    register(HandlerSpec(
+        task_type=C.PROSPECTIVE_OUTCOME_MATURATION_TASK,
+        queue_name=C.PROSPECTIVE_OUTCOME_QUEUE,
+        child_callable=_po.run_prospective_outcome_task,
+        probe_fn=_po.probe_prospective_outcome_durable_output,
         max_attempts=getattr(settings, "JOB_MAX_ATTEMPTS_DEFAULT", 3),
         production_enabled=True,
     ))

@@ -59,6 +59,48 @@ def prospective_task_idempotency_key(*, registration_identity: str,
     })
 
 
+def prospective_outcome_job_idempotency_key(*, job_type: str, registration_identity: str,
+                                            campaign_execution_identity: str,
+                                            eligible_pairs: list) -> str:
+    """One outcome-maturation job per (campaign, BATCH). Unlike the campaign
+    evaluation job (exactly one job for its whole lifetime), outcome
+    maturation is inherently multi-round — a later enqueue call may target
+    the SAME pairs with MORE forward sessions now available (still-partial
+    pairs remain eligible as history advances), a different now-eligible set
+    (a retryable error became eligible again), or both — and must NOT
+    collide with an earlier round's already-succeeded job. ``eligible_pairs``
+    is an iterable of (pair_id, completed_forward_sessions) tuples: the key
+    changes whenever EITHER the eligible set OR any pair's observed session
+    count changes, and stays identical for a true exact replay. Mirrors this
+    repo's own established batch-hash pattern (progressive locked
+    shadow-outcome maturation) rather than inventing a new idiom."""
+    return _sha256("ojob", {
+        "job_type": job_type,
+        "registration_identity": registration_identity,
+        "campaign_execution_identity": campaign_execution_identity,
+        "eligible_pairs": sorted(
+            [str(pid), int(sessions)] for pid, sessions in eligible_pairs),
+    })
+
+
+def prospective_outcome_task_idempotency_key(*, job_idempotency_key: str, pair_id: str) -> str:
+    """One outcome-maturation task per (BATCH, frozen pair id) — scoped by
+    the parent job's own (round-aware) idempotency key, not just the pair,
+    because outcome maturation is multi-round: the same pair legitimately
+    gets a NEW task in a later round (more forward sessions arrived). Task
+    uniqueness must track the job's round scoping exactly, or a second
+    round's INSERT ... ON CONFLICT DO NOTHING would silently collide with an
+    earlier round's already-succeeded task for the same pair and insert
+    nothing — a job with the correct total_task_count but zero real rows.
+    Deliberately excludes strategy identity — a pair's shared market-path
+    outcome (Concept A) does not depend on which arm's strategy version
+    produced the pair, only on the pair itself."""
+    return _sha256("otask", {
+        "job_idempotency_key": job_idempotency_key,
+        "pair_id": str(pair_id),
+    })
+
+
 def schedule_occurrence_idempotency_key(*, schedule_code: str, schedule_version: int,
                                         occurrence_iso: str) -> str:
     """One job per scheduled occurrence — prevents an occurrence being enqueued
@@ -74,5 +116,6 @@ __all__ = [
     "payload_hash",
     "job_idempotency_key",
     "prospective_task_idempotency_key",
+    "prospective_outcome_task_idempotency_key",
     "schedule_occurrence_idempotency_key",
 ]
