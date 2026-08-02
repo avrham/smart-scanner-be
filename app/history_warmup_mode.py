@@ -18,17 +18,26 @@ HISTORY_WARMUP_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/api/health",
     "/api/admin/history-warmup/access-check",
     "/api/admin/history-warmup/preflight",
+    "/api/admin/history-warmup/incremental/preflight",
 })
 
 # Read-only methods for the allowlist above (HEAD/OPTIONS for infra + CORS).
 HISTORY_WARMUP_ONLY_METHODS: Set[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
 # The bounded mutation routes reachable in warmup mode (POST only, exact paths):
-#   * execute — the single provider-backed warmup batch;
+#   * execute — the single provider-backed INITIAL-DEPTH warmup batch;
+#   * incremental/execute — the single provider-backed INCREMENTAL-REFRESH
+#     batch (distinct mode, distinct contract, shares the provider/rate-limit
+#     boundary and advisory lock — never a second execute path with its own
+#     provider client);
 #   * universes — create/freeze a bounded frozen universe (no provider).
 HISTORY_WARMUP_EXECUTE_PATH: str = "/api/admin/history-warmup/execute"
+HISTORY_WARMUP_INCREMENTAL_EXECUTE_PATH: str = "/api/admin/history-warmup/incremental/execute"
 HISTORY_WARMUP_UNIVERSES_PATH: str = "/api/admin/history-warmup/universes"
-HISTORY_WARMUP_POST_PATHS = frozenset({HISTORY_WARMUP_EXECUTE_PATH, HISTORY_WARMUP_UNIVERSES_PATH})
+HISTORY_WARMUP_POST_PATHS = frozenset({
+    HISTORY_WARMUP_EXECUTE_PATH, HISTORY_WARMUP_INCREMENTAL_EXECUTE_PATH,
+    HISTORY_WARMUP_UNIVERSES_PATH,
+})
 
 
 def is_history_warmup_route_allowed(method: str, path: str) -> bool:
@@ -47,6 +56,7 @@ __all__ = [
     "HISTORY_WARMUP_ONLY_ALLOWLIST",
     "HISTORY_WARMUP_ONLY_METHODS",
     "HISTORY_WARMUP_EXECUTE_PATH",
+    "HISTORY_WARMUP_INCREMENTAL_EXECUTE_PATH",
     "HISTORY_WARMUP_UNIVERSES_PATH",
     "HISTORY_WARMUP_POST_PATHS",
     "is_history_warmup_route_allowed",

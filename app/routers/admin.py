@@ -2872,6 +2872,324 @@ async def history_warmup_execute(
 
 
 # --------------------------------------------------------------------------- #
+# Incremental daily-history refresh (history_incremental_refresh.v1) — DISTINCT
+# from the initial-depth warmup above. Applies even when a symbol is already
+# launch_ready; advances local daily_bars from each symbol's latest completed
+# session through the latest safely-completed US session. Shares the SAME
+# advisory lock, provider abstraction, cooldown and daily-bar persistence path
+# as initial warmup (never a second provider client / rate limiter); bookkept
+# in history_warmup_runs (mode='incremental') only — never
+# history_warmup_run_items, whose mode CHECK constraint would reject it.
+# --------------------------------------------------------------------------- #
+async def _resolve_incremental_scope(db, *, registration_id, campaign_id, universe_id, symbols):
+    """Explicit bounded scope ONLY — never a default-all-symbols query.
+    Exactly one selector, priority: registration_id > campaign_id >
+    universe_id > symbols. Returns (raw_symbols, source_detail)."""
+    provided = [k for k, v in (
+        ("registration_id", registration_id), ("campaign_id", campaign_id),
+        ("universe_id", universe_id), ("symbols", symbols)) if v]
+    if not provided:
+        raise HTTPException(status_code=422, detail={
+            "error": "explicit_scope_required",
+            "detail": "one of registration_id, campaign_id, universe_id, symbols is required"})
+    if registration_id:
+        row = await db.fetchrow(
+            "SELECT universe_id FROM prospective_campaign_registrations WHERE id=$1",
+            registration_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={"error": "unknown_registration"})
+        universe = await _load_universe(db, universe_id=str(row["universe_id"]))
+        return universe["symbols"], {"source": "registration_id", "registration_id": str(registration_id),
+                                     "universe_id": universe["universe_id"]}
+    if campaign_id:
+        row = await db.fetchrow(
+            "SELECT universe_id FROM prospective_campaign_registrations WHERE campaign_id=$1",
+            campaign_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={"error": "unknown_campaign"})
+        universe = await _load_universe(db, universe_id=str(row["universe_id"]))
+        return universe["symbols"], {"source": "campaign_id", "campaign_id": str(campaign_id),
+                                     "universe_id": universe["universe_id"]}
+    if universe_id:
+        universe = await _load_universe(db, universe_id=universe_id)
+        return universe["symbols"], {"source": "universe_id", "universe_id": universe["universe_id"]}
+    raw = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()]
+    return raw, {"source": "symbols"}
+
+
+async def _latest_local_daily_by_symbol(db, syms):
+    rows = await db.fetch(
+        "SELECT symbol, MAX(trading_date) AS latest FROM daily_bars "
+        "WHERE symbol = ANY($1::text[]) GROUP BY symbol", syms)
+    return {r["symbol"]: r["latest"] for r in rows}
+
+
+@router.get("/history-warmup/incremental/preflight")
+async def history_warmup_incremental_preflight(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    registration_id: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    universe_id: Optional[str] = None,
+    symbols: Optional[str] = None,
+):
+    """Read-only incremental-refresh preflight (`history_incremental_refresh_
+    preflight.v1`). Explicit bounded scope only — no default-all-symbols path.
+    Provider-free, no mutation."""
+    _require_history_warmup_mode()
+    from datetime import datetime, timezone
+    from app.history_warmup_execute import (
+        UniverseError, normalize_universe_symbols, build_incremental_preflight)
+    from app.prospective_session import resolve_latest_completed_session
+    from app.prospective_readiness import build_prospective_readiness_v2
+    now = datetime.now(timezone.utc)
+    raw_symbols, scope = await _resolve_incremental_scope(
+        db, registration_id=registration_id, campaign_id=campaign_id,
+        universe_id=universe_id, symbols=symbols)
+    try:
+        norm = normalize_universe_symbols(
+            raw_symbols, max_symbols=settings.HISTORY_WARMUP_MAX_UNIVERSE_SYMBOLS)
+    except UniverseError as exc:
+        raise HTTPException(status_code=422, detail={"error": exc.code, "detail": exc.detail})
+    target_session = resolve_latest_completed_session(now)
+    latest_by_symbol = await _latest_local_daily_by_symbol(db, norm["symbols"])
+    daily_rows, fourh_rows = await _fetch_local_readiness(db, norm["symbols"])
+    readiness = build_prospective_readiness_v2(norm["symbols"], daily_rows, fourh_rows, now=now)
+    depth_ready = {s["symbol"]: bool(s.get("both_ready"))
+                   for s in readiness.get("symbols", [])}
+    cooldown = await _provider_cooldown(db, now=now)
+    preflight = build_incremental_preflight(
+        requested_symbol_count=len(raw_symbols), normalized_symbols=norm["symbols"],
+        duplicates_removed=norm["duplicates_removed"], latest_by_symbol=latest_by_symbol,
+        target_session=target_session, depth_ready_by_symbol=depth_ready,
+        cooldown=cooldown, max_batch=settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH,
+        provider_rate_limit_per_minute=settings.MASSIVE_REQUESTS_PER_MINUTE)
+    preflight["scope"] = scope
+    return preflight
+
+
+@router.post("/history-warmup/incremental/execute")
+async def history_warmup_incremental_execute(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...),
+):
+    """The bounded incremental-refresh mutation route
+    (`history_incremental_refresh.v1`). ONE symbol per call (matches the
+    existing single-symbol-per-execute granularity); server independently
+    recomputes the target session + per-symbol gap; advisory-locked (SAME
+    lock as initial warmup — only one history-warmup execution of ANY kind
+    runs at a time on this Machine); idempotent by deterministic
+    (symbol, latest_local_session, target_completed_session) identity;
+    provider obtained via the existing abstraction only after all gates pass
+    and called OUTSIDE any open transaction."""
+    _require_history_warmup_mode()
+    import json as _json
+    import uuid as _uuid
+    from datetime import date, datetime, timezone
+    from app.history_warmup_execute import (
+        INCREMENTAL_REFRESH_CONTRACT_VERSION, INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+        HISTORY_WARMUP_ADVISORY_LOCK_KEY, MODE_INCREMENTAL, FORBIDDEN_REQUEST_FIELDS,
+        UniverseError, normalize_universe_symbols, missing_trading_sessions,
+        incremental_refresh_identity, normalize_daily_bars, upsert_daily_bars,
+        map_provider_error, PROVIDER_ACTIVITY_STARTED, PROVIDER_ACTIVITY_COMPLETED,
+    )
+    from app.prospective_session import resolve_latest_completed_session
+    from app.maintenance_cooldown import COOLDOWN_BLOCKING_REASON, retry_after_seconds
+    logger = logging.getLogger(__name__)
+    if settings.ENABLE_SCHEDULER:
+        raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
+    lease_seconds = max(1, int(settings.HISTORY_WARMUP_EXECUTION_LEASE_SECONDS))
+    now = datetime.now(timezone.utc)
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="request body must be a JSON object")
+    present = [f for f in FORBIDDEN_REQUEST_FIELDS if body.get(f) is not None]
+    if present:
+        raise HTTPException(status_code=422, detail={
+            "error": "forbidden_request_fields", "fields": sorted(present)})
+    if body.get("contract_version") != INCREMENTAL_REFRESH_CONTRACT_VERSION:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    symbol_raw = body.get("symbol")
+    if not isinstance(symbol_raw, str) or not symbol_raw.strip():
+        raise HTTPException(status_code=422, detail={"error": "symbol_required"})
+    try:
+        symbol = normalize_universe_symbols([symbol_raw], max_symbols=1)["symbols"][0]
+    except UniverseError as exc:
+        raise HTTPException(status_code=422, detail={"error": exc.code, "detail": exc.detail})
+
+    target_str = body.get("target_completed_session")
+    if not isinstance(target_str, str):
+        raise HTTPException(status_code=422, detail={"error": "target_completed_session_required"})
+    try:
+        client_target = date.fromisoformat(target_str)
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"error": "invalid_target_completed_session"})
+    latest_str = body.get("latest_local_session")
+    if latest_str is not None and not isinstance(latest_str, str):
+        raise HTTPException(status_code=422, detail={"error": "invalid_latest_local_session"})
+    client_latest = date.fromisoformat(latest_str) if latest_str else None
+
+    def _cooldown_409(cd):
+        return HTTPException(status_code=409, detail={
+            "error": COOLDOWN_BLOCKING_REASON,
+            "detail": "provider request window not yet cleared — obtain a fresh "
+                      "incremental preflight after the cooldown elapses",
+            "cooldown_remaining_seconds": cd["cooldown_remaining_seconds"]},
+            headers={"Retry-After": str(retry_after_seconds(cd))})
+
+    # ---- idempotency FIRST (before any "is this still current" staleness
+    # check) — an EXACT REPLAY of an already-completed request must return
+    # already_applied even though the world (server_target/server_latest)
+    # has since moved on; the identity is derived from the CLIENT-supplied
+    # (symbol, latest, target) tuple, exactly what the original request used. #
+    identity = incremental_refresh_identity(
+        symbol=symbol, latest_local_session=client_latest, target_completed_session=client_target)
+    prior = await db.fetchrow(
+        "SELECT id, status, execution_lease_expires_at FROM history_warmup_runs "
+        "WHERE idempotency_key=$1", identity)
+    if prior is not None and prior["status"] == "completed":
+        return {"contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+                "status": "already_applied", "mode": MODE_INCREMENTAL, "symbol": symbol,
+                "run_id": str(prior["id"]), "target_completed_session": client_target.isoformat(),
+                "provider_request_count": 0}
+    if prior is not None and prior["status"] == "running":
+        lease = prior["execution_lease_expires_at"]
+        if lease is not None and lease > now:
+            raise HTTPException(status_code=409, detail={
+                "error": "history_warmup_execution_in_progress", "run_id": str(prior["id"]),
+                "lease_expires_at": lease.isoformat()},
+                headers={"Retry-After": str(max(1, int((lease - now).total_seconds())))})
+        # lease expired (abandoned) — reconcile-or-redrive happens under the lock below
+
+    # ---- NOT a replay of completed work: validate against CURRENT server
+    # state before doing anything new. ------------------------------------ #
+    server_target = resolve_latest_completed_session(now)
+    if client_target != server_target:
+        raise HTTPException(status_code=409, detail={
+            "error": "stale_target_completed_session", "server_target": server_target.isoformat()})
+    server_latest = await db.fetchval(
+        "SELECT MAX(trading_date) FROM daily_bars WHERE symbol=$1", symbol)
+    if client_latest != server_latest:
+        raise HTTPException(status_code=409, detail={
+            "error": "stale_latest_local_session",
+            "server_latest_local_session": server_latest.isoformat() if server_latest else None})
+
+    missing = missing_trading_sessions(server_latest, server_target)
+    if not missing:
+        return {"contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+                "status": "no-op", "reason": "incremental_current", "mode": MODE_INCREMENTAL,
+                "symbol": symbol, "target_completed_session": server_target.isoformat(),
+                "latest_local_session": server_latest.isoformat() if server_latest else None,
+                "provider_request_count": 0}
+
+    cooldown = await _provider_cooldown(db, now=now)
+    if not cooldown["execution_allowed_by_cooldown"]:
+        raise _cooldown_409(cooldown)
+
+    got_lock = await db.fetchval(
+        "SELECT pg_try_advisory_lock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
+    if not got_lock:
+        raise HTTPException(status_code=409, detail={"error": "history_warmup_execution_locked"})
+    try:
+        again = await db.fetchrow(
+            "SELECT id, status, execution_lease_expires_at FROM history_warmup_runs "
+            "WHERE idempotency_key=$1", identity)
+        if again is not None and again["status"] == "completed":
+            return {"contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+                    "status": "already_applied", "mode": MODE_INCREMENTAL, "symbol": symbol,
+                    "run_id": str(again["id"]), "target_completed_session": server_target.isoformat(),
+                    "provider_request_count": 0}
+        if again is not None and again["status"] == "running":
+            lease = again["execution_lease_expires_at"]
+            if lease is not None and lease > now:
+                raise HTTPException(status_code=409, detail={
+                    "error": "history_warmup_execution_in_progress", "run_id": str(again["id"])})
+        cooldown2 = await _provider_cooldown(db, now=datetime.now(timezone.utc))
+        if not cooldown2["execution_allowed_by_cooldown"]:
+            raise _cooldown_409(cooldown2)
+
+        if again is None:
+            run_id = str(_uuid.uuid4())
+            await db.execute(
+                """
+                INSERT INTO history_warmup_runs(
+                  id, mode, status, requested_symbols, requested_symbol_count,
+                  idempotency_key, provider_activity_state, execution_lease_expires_at,
+                  heartbeat_at, started_at, created_at, updated_at)
+                VALUES($1,$2,'running',$3::jsonb,1,$4,'none',
+                       NOW() + ($5 || ' seconds')::interval, NOW(), NOW(), NOW(), NOW())
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                run_id, MODE_INCREMENTAL, _json.dumps([symbol]), identity, str(lease_seconds))
+            row = await db.fetchrow(
+                "SELECT id FROM history_warmup_runs WHERE idempotency_key=$1", identity)
+            run_id = str(row["id"])
+        else:
+            run_id = str(again["id"])
+            await db.execute(
+                "UPDATE history_warmup_runs SET execution_lease_expires_at=NOW() + "
+                "($2 || ' seconds')::interval, heartbeat_at=NOW(), updated_at=NOW() WHERE id=$1",
+                run_id, str(lease_seconds))
+
+        await db.execute(
+            "UPDATE history_warmup_runs SET provider_activity_state=$2, "
+            "provider_activity_started_at=COALESCE(provider_activity_started_at, NOW()), "
+            "heartbeat_at=NOW(), updated_at=NOW() WHERE id=$1", run_id, PROVIDER_ACTIVITY_STARTED)
+        provider = _resolve_history_warmup_provider()
+        provider_name = getattr(provider, "name", None) or "unknown"
+        req_count = 0
+        daily_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
+        err_code = err_class = None
+        try:
+            frm = missing[0]
+            to = missing[-1]
+            await db.execute(
+                "UPDATE history_warmup_runs SET provider_request_count_attempted="
+                "provider_request_count_attempted+1, last_provider_activity_at=NOW(), "
+                "heartbeat_at=NOW() WHERE id=$1", run_id)
+            raw_daily = await provider.get_daily_bars(symbol, str(frm), str(to))
+            req_count += 1
+            bars = normalize_daily_bars(raw_daily, now=now)
+            # never persist a bar outside the requested missing-session set —
+            # a provider returning a wider range than asked must not silently
+            # rewrite arbitrary history via this bounded path.
+            missing_set = set(missing)
+            bars = [b for b in bars if b["symbol"] == symbol and b["trading_date"] in missing_set]
+            daily_tel = await upsert_daily_bars(db, bars, source=provider_name)
+            run_status = "completed"
+        except Exception as exc:  # noqa: BLE001 - mapped to a bounded safe code
+            err_code, err_class = map_provider_error(exc)
+            run_status = "failed"
+            logger.warning("[HWI] symbol failed run=%s symbol=%s code=%s class=%s exc=%s",
+                           run_id, symbol, err_code, err_class, type(exc).__name__)
+        await db.execute(
+            "UPDATE history_warmup_runs SET status=$2, provider_activity_state=$3, "
+            "processed_symbol_count=1, provider_request_count=$4, error_code=$5, "
+            "error_message=$6, finished_at=NOW(), updated_at=NOW(), last_provider_activity_at=NOW(), "
+            "cooldown_last_finished_at=NOW(), "
+            "cooldown_next_not_before=NOW() + ($7 || ' seconds')::interval WHERE id=$1",
+            run_id, run_status, PROVIDER_ACTIVITY_COMPLETED, req_count, err_code,
+            err_class, str(_resolved_warmup_min_interval()))
+        new_latest = await db.fetchval(
+            "SELECT MAX(trading_date) FROM daily_bars WHERE symbol=$1", symbol)
+        return {
+            "contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+            "status": "executed" if run_status == "completed" else "failed",
+            "mode": MODE_INCREMENTAL, "run_id": run_id, "symbol": symbol,
+            "target_completed_session": server_target.isoformat(),
+            "latest_local_session_before": server_latest.isoformat() if server_latest else None,
+            "latest_local_session_after": new_latest.isoformat() if new_latest else None,
+            "requested_missing_sessions": [d.isoformat() for d in missing],
+            "provider_request_count": req_count,
+            "daily": daily_tel,
+            "error": ({"code": err_code, "class": err_class} if err_code else None),
+        }
+    finally:
+        await db.fetchval("SELECT pg_advisory_unlock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
+
+
+# --------------------------------------------------------------------------- #
 # Prospective campaign (PROSPECTIVE_CAMPAIGN_ONLY_MODE). Local-data-only,
 # provider-free frozen-universe candidate/control evaluation. Reuses the pure
 # shadow runner via a local-history shim; creates NO outcomes.

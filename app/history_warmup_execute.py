@@ -654,6 +654,176 @@ async def upsert_4h_bars(conn, rows: List[Dict[str, Any]]) -> Dict[str, int]:
             "completed_count": int(completed or 0)}
 
 
+# ============================================================================ #
+# Incremental daily-history refresh (history_incremental_refresh.v1)
+# ============================================================================ #
+# A DISTINCT mode from initial warmup (MODE_NORMAL/MODE_RETRY, which ensure
+# sufficient historical DEPTH once and then stop — see select_next_batch's
+# "all_symbols_launch_ready" terminal state). Incremental refresh applies even
+# when a symbol is already launch_ready (`both_ready`/history_depth_ready):
+# it finds each symbol's latest LOCAL completed daily bar, resolves the latest
+# safely-completed US session via the SAME existing policy
+# (app.prospective_session.resolve_latest_completed_session — never local
+# calendar-day subtraction, never an assumed-current-date session), and
+# fetches ONLY the bounded gap of missing trading sessions in between — never
+# an unlimited backfill, never the still-forming current session.
+#
+# Bookkeeping deliberately reuses `history_warmup_runs` (mode='incremental')
+# ONLY — never `history_warmup_run_items`, whose `mode` column has a hard
+# CHECK constraint (`IN ('normal','retry')`, migration 015) that would reject
+# an incremental value. `history_warmup_runs.mode` has no such constraint
+# (free TEXT, default 'history_warmup'), and its existing single-symbol-per-
+# run granularity (unchanged since migration 014) already matches the unit
+# this mode needs — no migration is required.
+INCREMENTAL_REFRESH_CONTRACT_VERSION = "history_incremental_refresh.v1"
+INCREMENTAL_PREFLIGHT_CONTRACT_VERSION = "history_incremental_refresh_preflight.v1"
+INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION = "history_incremental_refresh_result.v1"
+MODE_INCREMENTAL = "incremental"
+
+# history_depth_ready mirrors the EXISTING both_ready/launch_ready verdict
+# UNCHANGED (read from readiness v2, never recomputed here) — incremental
+# freshness is a SEPARATE axis, never a redefinition of launch_ready.
+STATE_HISTORY_DEPTH_READY = "history_depth_ready"
+STATE_INCREMENTAL_CURRENT = "incremental_current"
+STATE_INCREMENTAL_STALE = "incremental_stale"
+STATE_INCREMENTAL_REFRESH_NEEDED = "incremental_refresh_needed"
+STATE_INCREMENTAL_UNVERIFIABLE = "incremental_unverifiable"
+
+_INCREMENTAL_MAX_SESSION_WALK = 400  # bounded forward-walk guard (~well over a year)
+
+
+def missing_trading_sessions(latest_local_date: Optional[date],
+                             target_session: Optional[date]) -> List[date]:
+    """Trading sessions STRICTLY after `latest_local_date` through
+    `target_session` (inclusive), using the existing is_trading_day policy
+    (app.prospective_session — weekends + the fixed US holiday set, never
+    reimplemented). Bounded: the gap between two real dates in this system is
+    always small (days, at most a long holiday cluster)."""
+    from app.prospective_session import is_trading_day
+    if latest_local_date is None or target_session is None:
+        return []
+    if latest_local_date >= target_session:
+        return []
+    out: List[date] = []
+    d = latest_local_date + timedelta(days=1)
+    guard = 0
+    while d <= target_session and guard < _INCREMENTAL_MAX_SESSION_WALK:
+        if is_trading_day(d):
+            out.append(d)
+        d += timedelta(days=1)
+        guard += 1
+    return out
+
+
+def classify_incremental_symbol_state(latest_local_date: Optional[date],
+                                      target_session: Optional[date]) -> str:
+    """Per-symbol freshness state. `target_session=None` (unresolvable) or
+    `latest_local_date=None` (symbol never warmed — no baseline to refresh
+    from) are BOTH unverifiable, never guessed around."""
+    if target_session is None or latest_local_date is None:
+        return STATE_INCREMENTAL_UNVERIFIABLE
+    if latest_local_date >= target_session:
+        return STATE_INCREMENTAL_CURRENT
+    return STATE_INCREMENTAL_REFRESH_NEEDED
+
+
+def incremental_refresh_identity(*, symbol: str, latest_local_session: Optional[date],
+                                 target_completed_session: date,
+                                 refresh_contract_version: str = INCREMENTAL_REFRESH_CONTRACT_VERSION
+                                 ) -> str:
+    """Deterministic per-(symbol, latest local session, target session)
+    identity. A repeated call for the SAME identity (same symbol, same
+    observed local starting point, same target) is idempotent — replay never
+    creates a duplicate run. A LATER target session (more time has passed,
+    resolve_latest_completed_session advanced) is a NEW valid identity, never
+    a collision with a prior round."""
+    blob = "|".join([
+        refresh_contract_version, str(symbol).upper(),
+        latest_local_session.isoformat() if latest_local_session else "none",
+        target_completed_session.isoformat(),
+    ])
+    return "hwi:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_incremental_preflight(*, requested_symbol_count: int,
+                                normalized_symbols: List[str], duplicates_removed: int,
+                                latest_by_symbol: Dict[str, Optional[date]],
+                                target_session: Optional[date],
+                                depth_ready_by_symbol: Dict[str, bool],
+                                cooldown: Dict[str, Any], max_batch: int,
+                                provider_rate_limit_per_minute: int) -> Dict[str, Any]:
+    """Read-only incremental-refresh preflight. Provider-free, no mutation.
+    `depth_ready_by_symbol` is passed through UNCHANGED from the existing
+    readiness v2 both_ready computation — history_depth_ready is reported,
+    never recomputed or redefined here."""
+    per_symbol: List[Dict[str, Any]] = []
+    current: List[str] = []
+    refresh_needed: List[str] = []
+    unverifiable: List[str] = []
+    total_missing = 0
+    for sym in normalized_symbols:
+        latest = latest_by_symbol.get(sym)
+        state = classify_incremental_symbol_state(latest, target_session)
+        missing = (missing_trading_sessions(latest, target_session)
+                  if state == STATE_INCREMENTAL_REFRESH_NEEDED else [])
+        per_symbol.append({
+            "symbol": sym,
+            "history_depth_ready": bool(depth_ready_by_symbol.get(sym, False)),
+            "latest_local_daily_bar_date": latest.isoformat() if latest else None,
+            "state": state,
+            "missing_session_count": len(missing),
+            "first_missing_session": missing[0].isoformat() if missing else None,
+            "last_missing_session": missing[-1].isoformat() if missing else None,
+        })
+        if state == STATE_INCREMENTAL_CURRENT:
+            current.append(sym)
+        elif state == STATE_INCREMENTAL_REFRESH_NEEDED:
+            refresh_needed.append(sym)
+            total_missing += len(missing)
+        else:
+            unverifiable.append(sym)
+
+    overall_state = (
+        STATE_INCREMENTAL_STALE if refresh_needed
+        else STATE_INCREMENTAL_UNVERIFIABLE if unverifiable
+        else STATE_INCREMENTAL_CURRENT
+    )
+    allowed = bool(cooldown.get("execution_allowed_by_cooldown"))
+    batch = refresh_needed[: max(1, int(max_batch))]
+    reasons: List[str] = []
+    if not refresh_needed:
+        reasons.append("no_symbols_require_refresh")
+    elif not allowed:
+        reasons.append("provider_cooldown_active")
+    return {
+        "contract_version": INCREMENTAL_PREFLIGHT_CONTRACT_VERSION,
+        "mode": MODE_INCREMENTAL,
+        "requested_symbol_count": int(requested_symbol_count),
+        "normalized_symbol_count": len(normalized_symbols),
+        "duplicates_removed": int(duplicates_removed),
+        "target_completed_session": target_session.isoformat() if target_session else None,
+        "symbols": per_symbol,
+        "symbols_current": current,
+        "symbols_requiring_refresh": refresh_needed,
+        "symbols_unverifiable": unverifiable,
+        "state": overall_state,
+        "total_missing_session_count": total_missing,
+        "estimated_provider_requests": len(refresh_needed),
+        "configured_provider_rate_limit_per_minute": int(provider_rate_limit_per_minute),
+        "next_batch": {
+            "available": bool(batch) and allowed,
+            "symbols": batch,
+            "symbol_count": len(batch),
+        },
+        "execution_allowed_by_cooldown": allowed,
+        "cooldown_remaining_seconds": cooldown.get("cooldown_remaining_seconds"),
+        "next_execution_not_before": cooldown.get("next_execution_not_before"),
+        "unavailable_reasons": reasons,
+        "provider_called": False,
+        "provider_constructed": False,
+    }
+
+
 __all__ = [
     "EXECUTE_CONTRACT_VERSION", "PREFLIGHT_V2_CONTRACT_VERSION",
     "PREFLIGHT_V3_CONTRACT_VERSION", "EXECUTE_RESULT_CONTRACT_VERSION",
@@ -669,6 +839,12 @@ __all__ = [
     "execution_identity", "validate_execute_request",
     "normalize_daily_bars", "normalize_4h_bars", "upsert_daily_bars", "upsert_4h_bars",
     "FOUR_HOUR_FETCH_CALENDAR_DAYS",
+    "INCREMENTAL_REFRESH_CONTRACT_VERSION", "INCREMENTAL_PREFLIGHT_CONTRACT_VERSION",
+    "INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION", "MODE_INCREMENTAL",
+    "STATE_HISTORY_DEPTH_READY", "STATE_INCREMENTAL_CURRENT", "STATE_INCREMENTAL_STALE",
+    "STATE_INCREMENTAL_REFRESH_NEEDED", "STATE_INCREMENTAL_UNVERIFIABLE",
+    "missing_trading_sessions", "classify_incremental_symbol_state",
+    "incremental_refresh_identity", "build_incremental_preflight",
 ]
 
 # Bounded fetch window for a symbol's 4H warmup (mirrors the shadow runner's
