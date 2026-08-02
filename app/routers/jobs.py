@@ -251,6 +251,12 @@ async def patch_schedule(schedule_id: str, _: str = Depends(get_worker_token),
         except ValueError:
             raise HTTPException(status_code=422, detail={"error": "invalid_next_run_at"})
         sets.append(f"next_run_at=${len(args)}")
+    if "payload_template" in body:
+        template = body["payload_template"]
+        if template is not None and len(json.dumps(template)) > 8192:
+            raise HTTPException(status_code=422, detail={"error": "payload_template_too_large"})
+        args.append(json.dumps(template) if template is not None else None)
+        sets.append(f"payload_template=${len(args)}::jsonb")
     if not sets:
         raise HTTPException(status_code=422, detail={"error": "no_mutable_fields"})
     row = await db.fetchrow(
