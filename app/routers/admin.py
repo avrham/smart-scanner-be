@@ -3668,7 +3668,7 @@ async def prospective_audit(
             "SELECT worker_id, status, draining, last_heartbeat_at, current_task_id,"
             " (NOW() - last_heartbeat_at) > (($2)::text || ' seconds')::interval AS stale "
             "FROM job_workers WHERE $1 = ANY(queue_names) ORDER BY last_heartbeat_at DESC LIMIT 10",
-            "prospective", int(getattr(settings, "JOB_WORKER_STALE_SECONDS", 90)))
+            "prospective", str(int(getattr(settings, "JOB_WORKER_STALE_SECONDS", 90))))
         job_block = {
             "job_id": str(job["id"]), "job_status": job["status"],
             "total_tasks": tc["total"], "queued_tasks": tc["queued"],

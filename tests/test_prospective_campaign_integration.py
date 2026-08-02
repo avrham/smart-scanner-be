@@ -31,7 +31,8 @@ MIGRATIONS = ["001_initial_schema", "002_phase1_sma150_config", "003_phase2_sign
               "007_scan_signal_provenance", "008_sma150_v3", "009_watch_outcome_coverage",
               "010_sma150_shadow_evaluations", "011_shadow_pair_outcomes", "012_wyckoff_mtf_v2",
               "013_wyckoff_v2_shadow_arms", "014_market_bars_4h", "015_history_warmup_run_items",
-              "016_history_warmup_leases_and_universes", "017_prospective_campaign_registration"]
+              "016_history_warmup_leases_and_universes", "017_prospective_campaign_registration",
+              "018_durable_job_queue"]
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEGACY_RLS = ["strategy_shadow_evaluations", "strategy_shadow_pairs", "strategy_shadow_pair_outcomes",
               "strategy_shadow_run_pairs", "strategy_shadow_runs", "strategy_shadow_outcome_runs",
@@ -263,6 +264,23 @@ class TestProspectivePipeline:
                 assert au["pair_count"] == 2 and au["candidate_evaluation_count"] == 2 and au["control_evaluation_count"] == 2
                 assert au["missing_candidate_arms"] == 0 and au["missing_control_arms"] == 0 and au["duplicate_arms"] == 0
                 assert au["campaign_completion_state"] == "completed"
+                # regression: audit must not crash when a durable-queue job_runs
+                # row (+ a job_workers row) exists for this registration — the
+                # workers query binds the stale-threshold as text, and it must
+                # be sent as a str, not an int (asyncpg param-type inference).
+                _psql(prospective["cid"],
+                      "INSERT INTO job_runs(job_type, job_contract_version, queue_name, "
+                      "idempotency_key, status, registration_id) VALUES "
+                      f"('prospective_campaign', 'prospective_campaign_enqueue.v1', 'prospective', "
+                      f"'test-audit-regress-{reg_id}', 'succeeded', '{reg_id}');")
+                _psql(prospective["cid"],
+                      "INSERT INTO job_workers(worker_id, worker_type, queue_names) VALUES "
+                      "('test-audit-regress-worker', 'prospective', ARRAY['prospective']) "
+                      "ON CONFLICT (worker_id) DO NOTHING;")
+                au2 = await prospective_audit(_="t", db=conn, registration_id=reg_id)
+                assert au2["job"] is not None and au2["job"]["job_status"] == "succeeded"
+                assert len(au2["job"]["workers"]) == 1
+                assert isinstance(au2["job"]["workers"][0]["stale"], bool)
             finally:
                 import app.deps as _deps
                 await pool.release(conn)

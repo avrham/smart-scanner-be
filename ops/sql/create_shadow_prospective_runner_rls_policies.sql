@@ -20,7 +20,8 @@ DECLARE
   read_rels constant text[] := ARRAY[
     'public.daily_bars','public.market_bars_4h','public.patterns','public.pattern_configs',
     'public.history_warmup_universes','public.history_warmup_universe_symbols',
-    'public.strategy_shadow_pair_outcomes','public.strategy_shadow_outcome_runs'];
+    'public.strategy_shadow_pair_outcomes','public.strategy_shadow_outcome_runs',
+    'public.job_runs','public.job_tasks','public.job_workers','public.job_events'];
   write_rels constant text[] := ARRAY[
     'public.prospective_campaign_registrations','public.strategy_shadow_runs',
     'public.strategy_shadow_run_pairs','public.strategy_shadow_pairs',

@@ -7,7 +7,9 @@
 --   SELECT  : daily_bars, market_bars_4h, patterns, pattern_configs,
 --             history_warmup_universes, history_warmup_universe_symbols,
 --             strategy_shadow_* (read for dedup/audit),
---             prospective_campaign_registrations
+--             prospective_campaign_registrations,
+--             job_runs, job_tasks, job_workers, job_events (read-only, for
+--             the /prospective/audit job block; migration 018)
 --   INSERT/UPDATE : prospective_campaign_registrations, strategy_shadow_runs,
 --             strategy_shadow_run_pairs, strategy_shadow_pairs,
 --             strategy_shadow_evaluations
@@ -67,6 +69,14 @@ BEGIN
   IF to_regclass('public.prospective_campaign_registrations') IS NOT NULL THEN
     GRANT SELECT, INSERT, UPDATE ON public.prospective_campaign_registrations
       TO smart_scanner_prospective_runner;
+  END IF;
+  -- read-only durable-queue visibility for the /prospective/audit job block
+  -- (migration 018); guarded since older/isolated setups may predate it.
+  IF to_regclass('public.job_runs') IS NOT NULL THEN
+    GRANT SELECT ON public.job_runs    TO smart_scanner_prospective_runner;
+    GRANT SELECT ON public.job_tasks   TO smart_scanner_prospective_runner;
+    GRANT SELECT ON public.job_workers TO smart_scanner_prospective_runner;
+    GRANT SELECT ON public.job_events  TO smart_scanner_prospective_runner;
   END IF;
 END
 $$;
