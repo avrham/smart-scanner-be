@@ -96,7 +96,8 @@ class JobWorker:
             await release_db_connection(conn)
         logger.info("worker registered", extra={"extra_data": {
             "worker_id": self.worker_id, "queues": self.queues,
-            "concurrency": self.concurrency}})
+            "concurrency": self.concurrency,
+            "git_sha": build_provenance().get("git_sha", "unknown")}})
 
     async def mark_stopped(self) -> None:
         from app.workers.persistence import get_db_connection, release_db_connection

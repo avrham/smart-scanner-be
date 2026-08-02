@@ -1,0 +1,55 @@
+# fly.prospective-outcome-worker.toml — smart-scanner-be-prospective-outcome-worker-staging
+#
+# DEDICATED NON-HTTP JOB WORKER for prospective_outcome_maturation.v1. Runs
+# `python -m app.jobs.worker` continuously (NO http_service / NO TCP service
+# -> no Fly Proxy, no autostart/autostop). It claims ONLY queue_name=
+# 'prospective_outcomes' tasks (concurrency 1) from the ISOLATED Fly Postgres
+# via the least-privilege smart_scanner_prospective_outcome_worker role
+# (JOB_WORKER_DATABASE_URL, a SECRET, set to that role's DSN — never the
+# prospective-runner or history-warmer role password). Reads only local
+# daily_bars (no provider). Genuinely separate app/Machine from
+# smart-scanner-be-prospective-worker-staging: distinct queue, distinct DB
+# role, distinct RLS scope — this worker is structurally unable to claim a
+# 'prospective' evaluation task even if JOB_WORKER_QUEUES were misconfigured,
+# because the DB role's own RLS policy on job_runs/job_tasks is
+# queue_name='prospective_outcomes' only. No provider credential and no
+# shared Supabase credential are installed. Git SHA supplied at deploy via
+# --build-arg APP_GIT_SHA.
+
+app = 'smart-scanner-be-prospective-outcome-worker-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_ENVIRONMENT = 'prospective-outcome-worker-staging'
+  # Not an HTTP-mode app — every HTTP-mode flag is false.
+  PROSPECTIVE_CAMPAIGN_ONLY_MODE = 'false'
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  HISTORY_WARMUP_ONLY_MODE = 'false'
+  ENABLE_SCHEDULER = 'false'
+  JOB_WORKER_ENABLED = 'true'
+  JOB_WORKER_TYPE = 'prospective_outcome'
+  JOB_WORKER_QUEUES = 'prospective_outcomes'
+  JOB_WORKER_CONCURRENCY = '1'
+  JOB_SCHEDULER_ENABLED = 'true'
+  JOB_ALLOW_TEST_HANDLERS = 'false'
+  REQUIRE_WORKER_TOKEN = 'true'
+  MARKET_DATA_PROVIDER = 'massive'          # name only; NO key installed
+  LOG_FORMAT = 'json'
+  JOB_WORKER_EXPECTED_DB_ROLE = 'smart_scanner_prospective_outcome_worker'
+
+# No [http_service] and no [[services]] — the Machine has no exposed port,
+# is never started/stopped by inbound traffic, and runs continuously.
+[processes]
+  worker = 'python -m app.jobs.worker'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '1024mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
+  processes = ['worker']
