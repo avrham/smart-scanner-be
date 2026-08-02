@@ -63,6 +63,52 @@ def test_schedule_occurrence_key_is_unique_per_occurrence():
     assert a != b
 
 
+# --- daily-pipeline occurrence identity + state machine ---------------------
+def _pipeline_key(**over):
+    base = dict(schedule_code="SMART-SCANNER-DAILY-PIPELINE", schedule_version=1,
+               resolved_session_date="2026-07-31", frozen_universe_hash="sha256:aaa",
+               pipeline_contract_version="smart_scanner_daily_pipeline.v1")
+    base.update(over)
+    return ident.pipeline_occurrence_identity(**base)
+
+
+def test_pipeline_occurrence_identity_deterministic_and_scoped():
+    assert _pipeline_key() == _pipeline_key()
+    assert _pipeline_key() != _pipeline_key(resolved_session_date="2026-08-03")
+    assert _pipeline_key() != _pipeline_key(frozen_universe_hash="sha256:bbb")
+    assert _pipeline_key() != _pipeline_key(schedule_version=2)
+    assert _pipeline_key() != _pipeline_key(pipeline_contract_version="smart_scanner_daily_pipeline.v2")
+
+
+def test_pipeline_stage_order_and_status_view():
+    from app.jobs.daily_pipeline import (STAGE_ORDER, STAGE_HISTORY_REFRESH,
+                                         STAGE_PROSPECTIVE_CAMPAIGN, STAGE_OUTCOME_MATURATION,
+                                         STAGE_AUDIT_REPORT, STAGE_STATE_COMPLETED,
+                                         STAGE_STATE_PENDING, build_status_view)
+    assert STAGE_ORDER == [STAGE_HISTORY_REFRESH, STAGE_PROSPECTIVE_CAMPAIGN,
+                           STAGE_OUTCOME_MATURATION, STAGE_AUDIT_REPORT]
+    occ = {
+        "id": "33333333-3333-3333-3333-333333333333",
+        "status": "running", "created_at": None, "finished_at": None,
+        "result_summary": {
+            "resolved_session_date": "2026-07-31", "frozen_universe_hash": "sha256:aaa",
+            "universe_id": "u1", "current_stage": STAGE_PROSPECTIVE_CAMPAIGN,
+            "campaign_registration_id": "r1", "campaign_job_id": "j1", "outcome_job_id": None,
+            "stages": {STAGE_HISTORY_REFRESH: {"state": STAGE_STATE_COMPLETED},
+                      STAGE_PROSPECTIVE_CAMPAIGN: {"state": STAGE_STATE_PENDING},
+                      STAGE_OUTCOME_MATURATION: {"state": STAGE_STATE_PENDING},
+                      STAGE_AUDIT_REPORT: {"state": STAGE_STATE_PENDING}},
+        },
+    }
+    view = build_status_view(occ)
+    assert view["current_stage"] == STAGE_PROSPECTIVE_CAMPAIGN
+    assert view["completed_stages"] == [STAGE_HISTORY_REFRESH]
+    assert view["blocked_stage"] is None
+    assert view["campaign_registration_id"] == "r1"
+    assert view["campaign_job_id"] == "j1"
+    assert view["outcome_job_id"] is None
+
+
 # --- typed payload ----------------------------------------------------------
 def _payload_dict():
     return {

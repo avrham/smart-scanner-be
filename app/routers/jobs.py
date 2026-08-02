@@ -308,4 +308,26 @@ async def preview_schedule(schedule_id: str, _: str = Depends(get_worker_token),
             "next_occurrences": occ}
 
 
+# --------------------------------------------------------------------------
+# daily-pipeline occurrence status (operator-visible, read-only)
+# --------------------------------------------------------------------------
+@router.get("/daily-pipeline/status")
+async def daily_pipeline_status(_: str = Depends(get_worker_token),
+                                db: asyncpg.Connection = Depends(get_db),
+                                occurrence_id: Optional[str] = None):
+    """Bounded, read-only status view for the durable daily-pipeline
+    orchestrator (smart_scanner_daily_pipeline.v1). Without ``occurrence_id``,
+    reports the most recently created occurrence. No secrets, no DSNs."""
+    from app.jobs.daily_pipeline import (build_status_view, get_pipeline_occurrence,
+                                         latest_pipeline_occurrence)
+    if occurrence_id:
+        oid = _uuid_or_422(occurrence_id, "occurrence_id")
+        occ = await get_pipeline_occurrence(db, oid)
+    else:
+        occ = await latest_pipeline_occurrence(db)
+    if occ is None:
+        return {"occurrence": None, "reason": "no_occurrence_yet"}
+    return build_status_view(occ)
+
+
 __all__ = ["router"]

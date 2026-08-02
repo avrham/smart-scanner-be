@@ -8,11 +8,15 @@
 --             history_warmup_universes, history_warmup_universe_symbols,
 --             strategy_shadow_* (read for dedup/audit),
 --             prospective_campaign_registrations,
---             job_runs, job_tasks, job_workers, job_events (read-only, for
---             the /prospective/audit job block; migration 018)
+--             job_runs, job_tasks, job_events (also write — see below),
+--             job_workers (read-only; for the /prospective/audit job block
+--             and the durable-queue enqueue paths; migration 018)
 --   INSERT/UPDATE : prospective_campaign_registrations, strategy_shadow_runs,
 --             strategy_shadow_run_pairs, strategy_shadow_pairs,
---             strategy_shadow_evaluations
+--             strategy_shadow_evaluations, job_runs (INSERT+UPDATE — the
+--             prospective/outcome ENQUEUE paths create+recompute their own
+--             parent job), job_tasks (INSERT — per-symbol/per-pair task
+--             creation), job_events (INSERT — append-only event log)
 --   NONE (write) : daily_bars, market_bars_4h, strategy_shadow_pair_outcomes,
 --             strategy_shadow_outcome_runs, history_warmup_* ;
 --             NO DELETE / TRUNCATE / DDL / TRIGGER anywhere; no role admin.
@@ -70,13 +74,25 @@ BEGIN
     GRANT SELECT, INSERT, UPDATE ON public.prospective_campaign_registrations
       TO smart_scanner_prospective_runner;
   END IF;
-  -- read-only durable-queue visibility for the /prospective/audit job block
-  -- (migration 018); guarded since older/isolated setups may predate it.
+  -- durable-queue access (migration 018); guarded since older/isolated
+  -- setups may predate it. job_runs/job_tasks/job_events are WRITABLE here
+  -- because the prospective + daily-pipeline ENQUEUE paths run under this
+  -- role and create their own parent job/tasks/events directly (traced from
+  -- app.jobs.prospective_enqueue.enqueue_prospective_campaign,
+  -- app.jobs.prospective_outcome_enqueue.enqueue_outcome_maturation, and
+  -- app.jobs.daily_pipeline). job_workers stays read-only: this role never
+  -- registers as a worker.
   IF to_regclass('public.job_runs') IS NOT NULL THEN
-    GRANT SELECT ON public.job_runs    TO smart_scanner_prospective_runner;
-    GRANT SELECT ON public.job_tasks   TO smart_scanner_prospective_runner;
-    GRANT SELECT ON public.job_workers TO smart_scanner_prospective_runner;
-    GRANT SELECT ON public.job_events  TO smart_scanner_prospective_runner;
+    GRANT SELECT, INSERT, UPDATE ON public.job_runs  TO smart_scanner_prospective_runner;
+    GRANT SELECT, INSERT        ON public.job_tasks  TO smart_scanner_prospective_runner;
+    GRANT SELECT, INSERT        ON public.job_events TO smart_scanner_prospective_runner;
+    GRANT SELECT                ON public.job_workers TO smart_scanner_prospective_runner;
+    -- Defensive: this role only ever enqueues (INSERT) tasks; it never
+    -- claims, runs, or mutates an existing task's lease/status (that is the
+    -- WORKER role's job).
+    REVOKE UPDATE, DELETE, TRUNCATE ON public.job_tasks  FROM smart_scanner_prospective_runner;
+    REVOKE UPDATE, DELETE, TRUNCATE ON public.job_events FROM smart_scanner_prospective_runner;
+    REVOKE DELETE, TRUNCATE          ON public.job_runs  FROM smart_scanner_prospective_runner;
   END IF;
 END
 $$;

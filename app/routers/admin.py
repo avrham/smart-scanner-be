@@ -3817,6 +3817,135 @@ async def prospective_outcome_enqueue_jobs(
     return result
 
 
+@router.post("/daily-pipeline/advance")
+async def daily_pipeline_advance(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...)):
+    """smart_scanner_daily_pipeline.v1 — ONE bounded advance of the durable
+    daily-pipeline occurrence for ``universe_id``. Resolves the latest
+    completed session itself (never accepts a client-supplied date), then
+    performs (at most) the CURRENT stage's bounded unit of work and persists
+    the result via app.jobs.daily_pipeline.record_stage_result. Idempotent:
+    a stage already completed elsewhere is recognized as such, never redone;
+    a stage still in flight (e.g. a campaign job still processing tasks) is
+    reported in_progress with no new writes. NEVER calls a provider. The
+    history_refresh stage is READ-CHECKED here (local daily_bars freshness
+    only) — the actual incremental refresh runs on the history-warmup app;
+    this endpoint reports it blocked, with the exact operator command, until
+    that has been run."""
+    _require_prospective_mode()
+    import uuid as _uuid
+    from datetime import datetime, timezone
+    from app.jobs import daily_pipeline as DP
+    from app.jobs.contracts import JobError
+    from app.jobs.prospective_enqueue import enqueue_prospective_campaign
+    from app.jobs.prospective_outcome_enqueue import build_outcome_maturity_preflight, enqueue_outcome_maturation
+    from app.prospective_session import resolve_latest_completed_session
+    if not isinstance(body, dict) or body.get("contract_version") != DP.PIPELINE_CONTRACT_VERSION:
+        raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    universe_id = body.get("universe_id")
+    if not universe_id:
+        raise HTTPException(status_code=422, detail={"error": "universe_id_required"})
+    schedule_code = body.get("schedule_code") or "SMART-SCANNER-DAILY-PIPELINE"
+    schedule_version = int(body.get("schedule_version") or 1)
+
+    universe = await _load_universe(db, universe_id=universe_id, require_frozen=True)
+    now = datetime.now(timezone.utc)
+    resolved_session_date = str(resolve_latest_completed_session(now))
+
+    occ = await DP.ensure_pipeline_occurrence(
+        db, schedule_code=schedule_code, schedule_version=schedule_version,
+        resolved_session_date=resolved_session_date, frozen_universe_hash=universe["universe_hash"],
+        universe_id=universe["universe_id"])
+    stage = DP.current_stage(occ)
+    occurrence_id = str(occ["id"])
+
+    if stage == DP.STAGE_HISTORY_REFRESH:
+        rows = await db.fetch(
+            "SELECT symbol, MAX(trading_date) AS latest FROM daily_bars WHERE symbol = ANY($1) GROUP BY symbol",
+            universe["symbols"])
+        latest_by_symbol = {r["symbol"]: r["latest"] for r in rows}
+        target = resolve_latest_completed_session(now)
+        stale = sorted(s for s in universe["symbols"]
+                       if latest_by_symbol.get(s) is None or latest_by_symbol[s] < target)
+        if not stale:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_COMPLETED, "symbols_checked": len(universe["symbols"])})
+        else:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_BLOCKED, "stale_symbol_count": len(stale),
+                "operator_action": "POST /api/admin/history-warmup/incremental/execute "
+                                   "per stale symbol on smart-scanner-be-history-warmup-staging"})
+
+    elif stage == DP.STAGE_PROSPECTIVE_CAMPAIGN:
+        exp = settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE
+        _u, readiness, snap, reg_identity, existing, blocking = await _prospective_preflight_state(
+            db, universe["universe_id"], exp, now=now)
+        if existing is not None and existing["status"] == "completed":
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_COMPLETED, "campaign_registration_id": str(existing["id"])})
+        elif blocking:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_BLOCKED, "reasons": blocking})
+        else:
+            if existing is None:
+                reg = await prospective_register(_="daily_pipeline", db=db, body={
+                    "contract_version": "prospective_campaign_registration.v1",
+                    "experiment_code": exp, "universe_id": universe["universe_id"],
+                    "universe_hash": universe["universe_hash"],
+                    "history_config_hash": readiness["config_hash"],
+                    "history_readiness_manifest_hash": readiness["combined_readiness_manifest_hash"],
+                    "snapshot_session_date": snap["snapshot_session_date"],
+                    "snapshot_cutoff_at": snap["snapshot_cutoff_at"],
+                    "candidate_signal_definition": "pre_rollout_enter_eligible.v1"})
+                registration_id = reg["registration_id"]
+            else:
+                registration_id = str(existing["id"])
+            try:
+                enq = await enqueue_prospective_campaign(
+                    db, registration_id=registration_id, registration_identity=reg_identity,
+                    requested_by="daily_pipeline")
+            except JobError as e:
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_TERMINAL_FAILURE, "safe_error_code": e.safe_error_code})
+            else:
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_IN_PROGRESS,
+                    "campaign_registration_id": registration_id,
+                    "campaign_job_id": enq.get("job_id")})
+
+    elif stage == DP.STAGE_OUTCOME_MATURATION:
+        summary = DP.pipeline_summary(occ)
+        campaign_job_id = summary.get("campaign_job_id")
+        if campaign_job_id:
+            job = await db.fetchrow("SELECT status FROM job_runs WHERE id=$1", campaign_job_id)
+            if job is not None and job["status"] not in ("succeeded", "failed", "cancelled"):
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "campaign_job"})
+                return DP.build_status_view(occ)
+        occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+            "state": DP.STAGE_STATE_BLOCKED,
+            "reason": "prospective_outcome_worker_role_not_provisioned",
+            "operator_action": "apply ops/sql/create_prospective_outcome_worker.sql + "
+                               "_rls_policies.sql via the isolated-DB admin bridge, deploy "
+                               "smart-scanner-be-prospective-outcome-worker-staging"})
+
+    elif stage == DP.STAGE_AUDIT_REPORT:
+        summary = DP.pipeline_summary(occ)
+        reg_id = summary.get("campaign_registration_id")
+        if not reg_id:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "missing_campaign_registration_id"})
+        else:
+            audit = await prospective_audit(_="daily_pipeline", db=db, registration_id=reg_id)
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_COMPLETED,
+                "pair_count": audit["pair_count"], "outcome_count": audit["outcome_count"],
+                "campaign_completion_state": audit["campaign_completion_state"]})
+
+    return DP.build_status_view(occ)
+
+
 # --------------------------------------------------------------------------- #
 # Shadow Outcome Maintenance Environment (maintenance-only mode).
 # --------------------------------------------------------------------------- #

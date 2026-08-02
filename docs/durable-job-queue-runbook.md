@@ -308,23 +308,70 @@ Isolated DB (`shared-cpu-1x`, 1GB volume) + the always-on worker
 $15/month. A resize to `shared-cpu-2x`/1GB is authorized ONLY if CPU profiling
 shows a meaningful benefit AND the total stays < $15/mo.
 
-## Future handlers
+## Daily-pipeline orchestrator (`app/jobs/daily_pipeline.py`)
 The disabled `SMART-SCANNER-DAILY-PIPELINE` `market_daily` template (seeded
 `enabled=false` in migration 018, so the scheduler NEVER enqueues it yet)
-documents the intended daily order:
-history refresh → readiness verification → prospective campaign →
-outcome maturation → quality audit.
+documents the intended daily order: history refresh → prospective campaign →
+outcome maturation → audit/reporting. A durable ORCHESTRATOR FOUNDATION now
+exists for this — it is a state machine, not yet a self-driving process:
 
-To adopt the full daily pipeline, introduce these as queue handlers (each per
-the "Adding a new task type" checklist — reuse existing pure code, no new
-strategy math):
-- `history_universe_refresh.v1` — refresh the frozen-universe daily/4H history.
-- `readiness_verification` — verify both-ready history readiness manifest.
+- ONE `job_runs` row per occurrence (`job_type='smart_scanner_daily_pipeline'`,
+  `queue_name='daily_pipeline'` — a distinct queue NAME in the SAME tables,
+  never a second queue system). Stage progress lives in that row's
+  `result_summary` JSONB.
+- Occurrence identity (`ident.pipeline_occurrence_identity`) is deterministic
+  over `schedule_code`, `schedule_version`, `resolved_session_date`,
+  `frozen_universe_hash`, `pipeline_contract_version` — a repeated call for
+  the same resolved session + universe always resumes the SAME occurrence
+  (idempotent `ON CONFLICT (idempotency_key) DO NOTHING`); a later completed
+  session, or a genuinely different universe, is a new one.
+- `ensure_pipeline_occurrence` / `record_stage_result` / `get_pipeline_occurrence`
+  / `latest_pipeline_occurrence` / `build_status_view` implement create-or-
+  resume, stage advancement (`pending → in_progress → completed`, or
+  `blocked` / `retryable_failure` / `terminal_failure`), and the bounded
+  operator status view (`GET /api/admin/daily-pipeline/status`, no secrets).
+  A `terminal_failure` freezes `current_stage` at the blocked stage and marks
+  the occurrence `failed` — it never silently advances past a failed stage. A
+  stale write against an already-passed stage is ignored (never rewinds state).
+- Stage EXECUTION (actually calling the history-warmup incremental-refresh
+  endpoint, the prospective register/enqueue endpoints, the outcome-
+  maturation enqueue endpoint, and the audit endpoints) is intentionally
+  NOT performed by this module — `record_stage_result` takes the stage's
+  outcome as an argument. This keeps the state machine testable without live
+  HTTP/DB-role dependencies, and separates "did stage N succeed" from "how do
+  we run stage N", exactly like this repo's existing split between queue
+  mechanics and task handlers.
+
+**Not yet wired**: an autonomous driver that calls the stage endpoints and
+feeds their results into `record_stage_result` from inside the worker
+process. The four component endpoints (history-warmup, prospective register/
+enqueue, prospective outcome enqueue, prospective audit) live on THREE
+different Fly apps, each behind its own `WORKER_TOKEN` — confirmed
+experimentally to be per-app-distinct secrets (a token from one app returns
+401 against another). Wiring autonomous cross-app self-execution requires
+either a dedicated internal-auth mechanism or per-app token secrets
+installed on the worker process; neither has been provisioned, consistent
+with this project's existing credential-boundary discipline (worker roles
+and their DSNs are also never shared across apps). Until then, an operator
+(or an external script with multi-app credentials) drives the pipeline by
+calling `ensure_pipeline_occurrence`, running each stage's existing endpoint,
+and calling `record_stage_result` with the outcome — the exact same
+sequence a future autonomous driver would perform, just invoked externally.
+
+To adopt full autonomy, introduce these as queue handlers (each per the
+"Adding a new task type" checklist — reuse existing pure code, no new
+strategy math) OR wire an internal stage-executor with the cross-app tokens
+above:
+- `history_universe_refresh.v1` — refresh the frozen-universe daily/4H history
+  (now: `app.history_warmup_execute` incremental-refresh functions, exposed at
+  `POST /api/admin/history-warmup/incremental/execute`).
 - `prospective_daily_campaign.v1` — enqueue the daily prospective campaign
-  (per-symbol `prospective_symbol_evaluation.v1` tasks).
-- `outcome_maturation.v1` — mature forward outcomes for prior snapshots.
-- `daily_quality_audit.v1` — reconcile + assert daily quality invariants.
+  (`POST /api/admin/prospective/register` + `.../jobs`).
+- `outcome_maturation.v1` — mature forward outcomes for prior snapshots
+  (`POST /api/admin/prospective/outcomes/jobs`).
+- `daily_quality_audit.v1` — reconcile + assert daily quality invariants
+  (`GET /api/admin/prospective/audit`).
 
-Enable the template only after the history + outcome handlers use this shared
-queue framework (use `job_dependencies` for the minimal stage ordering — not a
-DAG engine).
+Enable the schedule template only after an autonomous driver exists AND the
+outcome-worker role/Fly app (see "Roles & RLS" and the prospective-outcome-
+worker sections) are live — never before.

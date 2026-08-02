@@ -112,10 +112,28 @@ def schedule_occurrence_idempotency_key(*, schedule_code: str, schedule_version:
     })
 
 
+def pipeline_occurrence_identity(*, schedule_code: str, schedule_version: int,
+                                 resolved_session_date: str, frozen_universe_hash: str,
+                                 pipeline_contract_version: str) -> str:
+    """One daily-pipeline occurrence per (schedule, resolved completed session,
+    frozen universe, pipeline contract). A repeated tick for the same resolved
+    session and the same frozen universe always resumes the SAME occurrence;
+    a later completed session, or a genuinely different universe, is a new one."""
+    return _sha256("dpo", {
+        "schedule_code": schedule_code,
+        "schedule_version": int(schedule_version),
+        "resolved_session_date": str(resolved_session_date),
+        "frozen_universe_hash": str(frozen_universe_hash),
+        "pipeline_contract_version": pipeline_contract_version,
+    })
+
+
 __all__ = [
     "payload_hash",
     "job_idempotency_key",
     "prospective_task_idempotency_key",
+    "prospective_outcome_job_idempotency_key",
     "prospective_outcome_task_idempotency_key",
     "schedule_occurrence_idempotency_key",
+    "pipeline_occurrence_identity",
 ]

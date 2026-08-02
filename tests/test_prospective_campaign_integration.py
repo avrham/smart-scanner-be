@@ -304,3 +304,77 @@ class TestProspectivePipeline:
                 await pool.release(conn)
                 await _deps.close_db_pool()
         asyncio.run(drive())
+
+
+class TestDailyPipelineAdvanceEndpoint:
+    """POST /api/admin/daily-pipeline/advance — the actual wiring, not just
+    the pure state machine (already covered by test_jobs_queue_integration.py's
+    TestDailyPipelineOrchestrator)."""
+
+    def test_advance_completes_history_refresh_then_creates_campaign_then_resumes(
+            self, prospective, monkeypatch):
+        from app.routers.admin import daily_pipeline_advance
+        from app.jobs import daily_pipeline as DP
+        from app.history_warmup_execute import compute_universe_hash
+        cid = prospective["cid"]
+        dp_syms = ["ZZDP", "ZZDQ"]
+        today = datetime.now(timezone.utc).date()
+        yday = today - timedelta(days=1)
+        _psql(cid, "INSERT INTO history_warmup_universes(universe_code,universe_version,"
+              "universe_hash,config_hash,status,symbol_count,frozen_at) VALUES('ZZDPIPE',1,"
+              f"'pending','cfg','draft',{len(dp_syms)},NULL) RETURNING id;")
+        dp_uid = _sh(["docker", "exec", "-i", cid, "psql", "-tA", "-U", "postgres", "-d", DBNAME,
+                     "-c", "SELECT id FROM history_warmup_universes WHERE universe_code='ZZDPIPE';"]).stdout.strip()
+        for i, s in enumerate(dp_syms):
+            _psql(cid, f"INSERT INTO history_warmup_universe_symbols(universe_id,symbol,ordinal) VALUES('{dp_uid}','{s}',{i});")
+        dp_uhash = compute_universe_hash(universe_code="ZZDPIPE", universe_version=1,
+                                         symbols_in_ordinal_order=dp_syms)
+        _psql(cid, f"UPDATE history_warmup_universes SET status='frozen', universe_hash='{dp_uhash}', "
+              f"frozen_at=NOW() WHERE id='{dp_uid}';")
+        for s in dp_syms:
+            vals = ",".join(f"('{r[0]}','{r[1]}',{r[2]},{r[3]},{r[4]},{r[5]},{r[6]})" for r in _gen_daily(s, yday))
+            _psql(cid, f"INSERT INTO daily_bars(symbol,trading_date,open,high,low,close,volume) VALUES {vals};")
+            f4 = _gen_4h(s, datetime.now(timezone.utc) - timedelta(hours=2))
+            v4 = ",".join(f"('{r[0]}','{r[1].isoformat()}','{r[2].isoformat()}','{r[3]}',{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},true,true,'sha256:dpfp{i}')" for i, r in enumerate(f4))
+            _psql(cid, f"INSERT INTO market_bars_4h(symbol,bar_start,bar_end,session_date,open,high,low,close,volume,is_completed,is_regular_session,content_fingerprint) VALUES {v4};")
+        uid = dp_uid
+
+        async def drive():
+            conn, pool = await _db()
+            try:
+                body = {"contract_version": DP.PIPELINE_CONTRACT_VERSION, "universe_id": uid}
+                r1 = await daily_pipeline_advance(_="t", db=conn, body=body)
+                assert r1["current_stage"] == DP.STAGE_PROSPECTIVE_CAMPAIGN
+                assert r1["stage_states"][DP.STAGE_HISTORY_REFRESH] == DP.STAGE_STATE_COMPLETED
+                occurrence_id = r1["occurrence_id"]
+
+                r2 = await daily_pipeline_advance(_="t", db=conn, body=body)
+                assert r2["occurrence_id"] == occurrence_id  # SAME occurrence, never a duplicate
+                assert r2["campaign_registration_id"] is not None
+                assert r2["campaign_job_id"] is not None
+                reg_id = r2["campaign_registration_id"]
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM prospective_campaign_registrations WHERE id=$1", reg_id) == 1
+
+                # replay while the campaign job is still queued/running: no new
+                # registration, no new job — same ids, still in_progress.
+                r3 = await daily_pipeline_advance(_="t", db=conn, body=body)
+                assert r3["occurrence_id"] == occurrence_id
+                assert r3["campaign_registration_id"] == reg_id
+                assert r3["campaign_job_id"] == r2["campaign_job_id"]
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM prospective_campaign_registrations "
+                    "WHERE universe_id=$1", uid) == 1
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM job_runs WHERE registration_id=$1", reg_id) == 1
+
+                # a second occurrence for the SAME (session, universe) resumes
+                # the SAME job_runs row rather than creating a second occurrence.
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM job_runs WHERE job_type=$1",
+                    DP.PIPELINE_JOB_TYPE) == 1
+            finally:
+                import app.deps as _deps
+                await pool.release(conn)
+                await _deps.close_db_pool()
+        asyncio.run(drive())

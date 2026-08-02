@@ -116,3 +116,10 @@ class TestModeAllowlist:
         # every non-prospective admin route is blocked in this mode
         assert is_prospective_route_allowed("GET", "/api/admin/shadow-cohort/closeout") is False
         assert is_prospective_route_allowed("POST", "/api/admin/history-warmup/execute") is False
+        # daily-pipeline status is read-only reachable; never a POST/PATCH target
+        assert is_prospective_route_allowed("GET", "/api/admin/daily-pipeline/status") is True
+        assert is_prospective_route_allowed("POST", "/api/admin/daily-pipeline/status") is False
+        assert is_prospective_route_allowed("PATCH", "/api/admin/daily-pipeline/status") is False
+        # daily-pipeline advance is a bounded POST mutation, never a GET target
+        assert is_prospective_route_allowed("POST", "/api/admin/daily-pipeline/advance") is True
+        assert is_prospective_route_allowed("GET", "/api/admin/daily-pipeline/advance") is False

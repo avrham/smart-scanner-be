@@ -624,3 +624,119 @@ class TestProspectiveQueue:
                 await deps.close_db_pool()
 
         _run(go())
+
+
+class TestDailyPipelineOrchestrator:
+    """smart_scanner_daily_pipeline.v1 — occurrence identity, idempotent
+    create-or-resume, stage advancement, and the operator status view. Uses
+    the same job_runs table as everything else (no second queue system)."""
+
+    def test_ensure_occurrence_is_idempotent_and_resumable(self, pg):
+        from app.jobs.daily_pipeline import (ensure_pipeline_occurrence, get_pipeline_occurrence,
+                                             latest_pipeline_occurrence, record_stage_result,
+                                             build_status_view, current_stage,
+                                             STAGE_HISTORY_REFRESH, STAGE_PROSPECTIVE_CAMPAIGN,
+                                             STAGE_OUTCOME_MATURATION, STAGE_AUDIT_REPORT,
+                                             STAGE_DONE, STAGE_STATE_COMPLETED,
+                                             STAGE_STATE_IN_PROGRESS, STAGE_STATE_TERMINAL_FAILURE)
+
+        async def go():
+            conn = await asyncpg.connect(pg["su_dsn"])
+            try:
+                occ1 = await ensure_pipeline_occurrence(
+                    conn, schedule_code="SMART-SCANNER-DAILY-PIPELINE", schedule_version=1,
+                    resolved_session_date="2026-08-03", frozen_universe_hash=pg["universe_hash"],
+                    universe_id=pg["universe_id"])
+                assert current_stage(occ1) == STAGE_HISTORY_REFRESH
+
+                # a second ensure-call for the SAME identity resumes the SAME row
+                occ2 = await ensure_pipeline_occurrence(
+                    conn, schedule_code="SMART-SCANNER-DAILY-PIPELINE", schedule_version=1,
+                    resolved_session_date="2026-08-03", frozen_universe_hash=pg["universe_hash"],
+                    universe_id=pg["universe_id"])
+                assert occ1["id"] == occ2["id"]
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM job_runs WHERE job_type='smart_scanner_daily_pipeline'") == 1
+
+                # advance stage 1 -> completed; occurrence should move to stage 2
+                occ = await record_stage_result(conn, str(occ1["id"]), stage=STAGE_HISTORY_REFRESH,
+                                                result={"state": STAGE_STATE_COMPLETED,
+                                                        "symbols_refreshed": 25})
+                assert current_stage(occ) == STAGE_PROSPECTIVE_CAMPAIGN
+
+                # in-progress write on the CURRENT stage keeps it in place (resumable)
+                occ = await record_stage_result(conn, str(occ1["id"]), stage=STAGE_PROSPECTIVE_CAMPAIGN,
+                                                result={"state": STAGE_STATE_IN_PROGRESS,
+                                                        "campaign_registration_id": "reg-1",
+                                                        "campaign_job_id": "job-1"})
+                assert current_stage(occ) == STAGE_PROSPECTIVE_CAMPAIGN
+                assert occ["status"] == "running"
+                view = build_status_view(occ)
+                assert view["campaign_registration_id"] == "reg-1"
+                assert view["campaign_job_id"] == "job-1"
+
+                # a stale write against an already-passed stage is a no-op (never
+                # rewinds or corrupts a later stage's state)
+                stale = await record_stage_result(conn, str(occ1["id"]), stage=STAGE_HISTORY_REFRESH,
+                                                  result={"state": STAGE_STATE_COMPLETED})
+                assert current_stage(stale) == STAGE_PROSPECTIVE_CAMPAIGN
+
+                # complete remaining stages -> occurrence succeeds
+                occ = await record_stage_result(conn, str(occ1["id"]), stage=STAGE_PROSPECTIVE_CAMPAIGN,
+                                                result={"state": STAGE_STATE_COMPLETED})
+                occ = await record_stage_result(conn, str(occ1["id"]), stage=STAGE_OUTCOME_MATURATION,
+                                                result={"state": STAGE_STATE_COMPLETED})
+                occ = await record_stage_result(conn, str(occ1["id"]), stage=STAGE_AUDIT_REPORT,
+                                                result={"state": STAGE_STATE_COMPLETED})
+                assert current_stage(occ) == STAGE_DONE
+                assert occ["status"] == "succeeded"
+                assert occ["finished_at"] is not None
+                view = build_status_view(occ)
+                assert view["completed_stages"] == [STAGE_HISTORY_REFRESH, STAGE_PROSPECTIVE_CAMPAIGN,
+                                                    STAGE_OUTCOME_MATURATION, STAGE_AUDIT_REPORT]
+                assert view["terminal_failure_stage"] is None
+
+                got = await get_pipeline_occurrence(conn, str(occ1["id"]))
+                assert got["id"] == occ1["id"]
+                latest = await latest_pipeline_occurrence(conn)
+                assert latest["id"] == occ1["id"]
+
+                # a DIFFERENT resolved session is a genuinely new occurrence
+                occ3 = await ensure_pipeline_occurrence(
+                    conn, schedule_code="SMART-SCANNER-DAILY-PIPELINE", schedule_version=1,
+                    resolved_session_date="2026-08-04", frozen_universe_hash=pg["universe_hash"],
+                    universe_id=pg["universe_id"])
+                assert occ3["id"] != occ1["id"]
+                assert await conn.fetchval(
+                    "SELECT count(*) FROM job_runs WHERE job_type='smart_scanner_daily_pipeline'") == 2
+            finally:
+                await conn.close()
+
+        _run(go())
+
+    def test_terminal_stage_failure_halts_and_never_advances(self, pg):
+        from app.jobs.daily_pipeline import (ensure_pipeline_occurrence, record_stage_result,
+                                             current_stage, build_status_view,
+                                             STAGE_HISTORY_REFRESH, STAGE_PROSPECTIVE_CAMPAIGN,
+                                             STAGE_STATE_TERMINAL_FAILURE)
+
+        async def go():
+            conn = await asyncpg.connect(pg["su_dsn"])
+            try:
+                occ = await ensure_pipeline_occurrence(
+                    conn, schedule_code="SMART-SCANNER-DAILY-PIPELINE", schedule_version=1,
+                    resolved_session_date="2026-08-05", frozen_universe_hash=pg["universe_hash"],
+                    universe_id=pg["universe_id"])
+                occ = await record_stage_result(conn, str(occ["id"]), stage=STAGE_HISTORY_REFRESH,
+                                                result={"state": STAGE_STATE_TERMINAL_FAILURE,
+                                                        "reason": "provider_rate_limited_permanently"})
+                assert occ["status"] == "failed"
+                assert current_stage(occ) == STAGE_HISTORY_REFRESH  # never silently advances
+                view = build_status_view(occ)
+                assert view["terminal_failure_stage"] == STAGE_HISTORY_REFRESH
+                assert view["blocked_stage"] is None
+                assert view["completed_stages"] == []
+            finally:
+                await conn.close()
+
+        _run(go())
