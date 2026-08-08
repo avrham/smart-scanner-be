@@ -37,6 +37,10 @@ primary_region = 'fra'
   JOB_SCHEDULER_ENABLED = 'true'
   JOB_ALLOW_TEST_HANDLERS = 'false'
   REQUIRE_WORKER_TOKEN = 'true'
+  # Non-HTTP worker: no inbound endpoints, so the token is never used for auth.
+  # Present only to satisfy the required Settings field at boot (mirrors the
+  # sibling prospective-worker app). NOT a secret; carries no privilege.
+  WORKER_TOKEN = 'unused-placeholder-non-http-worker'
   MARKET_DATA_PROVIDER = 'massive'          # name only; NO key installed
   LOG_FORMAT = 'json'
   JOB_WORKER_EXPECTED_DB_ROLE = 'smart_scanner_prospective_outcome_worker'

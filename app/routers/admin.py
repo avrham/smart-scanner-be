@@ -3916,6 +3916,8 @@ async def daily_pipeline_advance(
 
     elif stage == DP.STAGE_OUTCOME_MATURATION:
         summary = DP.pipeline_summary(occ)
+        # (a) Never mature until the campaign job that produced the pairs is
+        # terminal — otherwise the frozen pair set could still be growing.
         campaign_job_id = summary.get("campaign_job_id")
         if campaign_job_id:
             job = await db.fetchrow("SELECT status FROM job_runs WHERE id=$1", campaign_job_id)
@@ -3923,12 +3925,83 @@ async def daily_pipeline_advance(
                 occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
                     "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "campaign_job"})
                 return DP.build_status_view(occ)
+        # (b) Resolve THIS occurrence's own campaign — never another's. The
+        # outcome job is scoped to this registration; there is no cross-campaign
+        # reuse (a mismatched registration_id would mint a distinct idempotency
+        # key and a distinct job).
+        reg_id = summary.get("campaign_registration_id")
+        if not reg_id:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "missing_campaign_registration_id"})
+            return DP.build_status_view(occ)
+        reg_row = await db.fetchrow(
+            "SELECT registration_identity FROM prospective_campaign_registrations WHERE id=$1", reg_id)
+        if reg_row is None:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "unknown_registration"})
+            return DP.build_status_view(occ)
+        reg_identity = reg_row["registration_identity"]
+        # (c) If a prior advance already recorded an outcome job, recognise and
+        # resume it rather than re-deriving — idempotent across restarts. A
+        # succeeded job completes the stage; a still-running job keeps it
+        # in_progress; only a failed/cancelled job falls through to a fresh
+        # eligibility round.
+        outcome_job_id = summary.get("outcome_job_id")
+        if outcome_job_id:
+            oj = await db.fetchrow("SELECT status FROM job_runs WHERE id=$1", outcome_job_id)
+            if oj is not None:
+                if oj["status"] == "succeeded":
+                    occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                        "state": DP.STAGE_STATE_COMPLETED, "outcome_result": "recognized_succeeded",
+                        "outcome_job_id": outcome_job_id})
+                    return DP.build_status_view(occ)
+                if oj["status"] not in ("failed", "cancelled"):
+                    occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                        "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "outcome_job",
+                        "outcome_job_id": outcome_job_id})
+                    return DP.build_status_view(occ)
+        # (d) Read-only maturity preflight (never constructs a provider).
+        try:
+            pf = await build_outcome_maturity_preflight(
+                db, registration_id=str(reg_id), registration_identity=reg_identity)
+        except JobError as e:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_TERMINAL_FAILURE, "safe_error_code": e.safe_error_code})
+            return DP.build_status_view(occ)
+        # (e) Unknown eligibility is NOT success — stay blocked and re-checkable.
+        if int(pf.get("eligibility_unknown_count", 0)) > 0:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_BLOCKED, "reason": "eligibility_unknown",
+                "eligibility_unknown_count": int(pf["eligibility_unknown_count"])})
+            return DP.build_status_view(occ)
+        # (f) No mature-eligible pair yet (e.g. the campaign's own session has no
+        # completed forward sessions) → a bounded, honest no-op success. A later
+        # occurrence (once forward sessions exist) enqueues its own round.
+        actionable = int(pf.get("enqueue_available_count", 0))
+        if actionable == 0:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_COMPLETED, "outcome_result": "no_eligible_work",
+                "eligible_pair_count": 0, "matured_count": int(pf.get("matured_count", 0)),
+                "outcome_job_id": None})
+            return DP.build_status_view(occ)
+        # (g) Idempotently enqueue-or-recognise the outcome job for the eligible
+        # set. A repeat of the same eligible set maps to the SAME job (no
+        # duplicate); a genuinely later round gets its own job.
+        try:
+            enq = await enqueue_outcome_maturation(
+                db, registration_id=str(reg_id), registration_identity=reg_identity,
+                requested_by="daily_pipeline")
+        except JobError as e:
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_TERMINAL_FAILURE, "safe_error_code": e.safe_error_code})
+            return DP.build_status_view(occ)
+        job_done = enq.get("status") == "already_applied" or enq.get("job_status") == "succeeded"
         occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-            "state": DP.STAGE_STATE_BLOCKED,
-            "reason": "prospective_outcome_worker_role_not_provisioned",
-            "operator_action": "apply ops/sql/create_prospective_outcome_worker.sql + "
-                               "_rls_policies.sql via the isolated-DB admin bridge, deploy "
-                               "smart-scanner-be-prospective-outcome-worker-staging"})
+            "state": DP.STAGE_STATE_COMPLETED if job_done else DP.STAGE_STATE_IN_PROGRESS,
+            "outcome_result": enq.get("status"),
+            "outcome_job_id": enq.get("job_id"),
+            "eligible_pair_count": int(enq.get("total_task_count") or 0),
+            **({} if job_done else {"waiting_on": "outcome_job"})})
 
     elif stage == DP.STAGE_AUDIT_REPORT:
         summary = DP.pipeline_summary(occ)
