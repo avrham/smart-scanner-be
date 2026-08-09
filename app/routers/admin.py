@@ -2924,6 +2924,22 @@ async def _latest_local_daily_by_symbol(db, syms):
     return {r["symbol"]: r["latest"] for r in rows}
 
 
+def _latest_4h_maps(fourh_rows):
+    """From _fetch_local_readiness 4H aggregates → (latest bar_end by symbol,
+    latest ET session_date by symbol). Empty maps when the 4H store is
+    absent/unreadable (→ v2 classifies those symbols unverifiable, never
+    silently current)."""
+    from zoneinfo import ZoneInfo
+    end_by: Dict[str, Any] = {}
+    session_by: Dict[str, Any] = {}
+    for r in (fourh_rows or []):
+        le = r.get("latest_4h")
+        end_by[r["symbol"]] = le
+        session_by[r["symbol"]] = (le.astimezone(ZoneInfo("America/New_York")).date()
+                                   if le is not None else None)
+    return end_by, session_by
+
+
 @router.get("/history-warmup/incremental/preflight")
 async def history_warmup_incremental_preflight(
     _: str = Depends(get_worker_token),
@@ -2932,14 +2948,18 @@ async def history_warmup_incremental_preflight(
     campaign_id: Optional[str] = None,
     universe_id: Optional[str] = None,
     symbols: Optional[str] = None,
+    contract_version: Optional[str] = None,
 ):
-    """Read-only incremental-refresh preflight (`history_incremental_refresh_
-    preflight.v1`). Explicit bounded scope only — no default-all-symbols path.
-    Provider-free, no mutation."""
+    """Read-only incremental-refresh preflight. Explicit bounded scope only —
+    no default-all-symbols path. Provider-free, no mutation. Pass
+    ``contract_version=history_incremental_refresh.v2`` for the daily+4H
+    preflight (three separate axes: history depth, daily freshness, 4H
+    freshness); default is the v1 daily-only preflight (back-compat)."""
     _require_history_warmup_mode()
     from datetime import datetime, timezone
     from app.history_warmup_execute import (
-        UniverseError, normalize_universe_symbols, build_incremental_preflight)
+        UniverseError, normalize_universe_symbols, build_incremental_preflight,
+        build_incremental_preflight_v2, INCREMENTAL_REFRESH_CONTRACT_VERSION_V2)
     from app.prospective_session import resolve_latest_completed_session
     from app.prospective_readiness import build_prospective_readiness_v2
     now = datetime.now(timezone.utc)
@@ -2958,12 +2978,22 @@ async def history_warmup_incremental_preflight(
     depth_ready = {s["symbol"]: bool(s.get("both_ready"))
                    for s in readiness.get("symbols", [])}
     cooldown = await _provider_cooldown(db, now=now)
-    preflight = build_incremental_preflight(
-        requested_symbol_count=len(raw_symbols), normalized_symbols=norm["symbols"],
-        duplicates_removed=norm["duplicates_removed"], latest_by_symbol=latest_by_symbol,
-        target_session=target_session, depth_ready_by_symbol=depth_ready,
-        cooldown=cooldown, max_batch=settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH,
-        provider_rate_limit_per_minute=settings.MASSIVE_REQUESTS_PER_MINUTE)
+    if contract_version == INCREMENTAL_REFRESH_CONTRACT_VERSION_V2:
+        end_by, session_by = _latest_4h_maps(fourh_rows)
+        preflight = build_incremental_preflight_v2(
+            requested_symbol_count=len(raw_symbols), normalized_symbols=norm["symbols"],
+            duplicates_removed=norm["duplicates_removed"], latest_daily_by_symbol=latest_by_symbol,
+            latest_4h_end_by_symbol=end_by, latest_4h_session_by_symbol=session_by,
+            target_session=target_session, depth_ready_by_symbol=depth_ready, cooldown=cooldown,
+            max_batch=settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH,
+            provider_rate_limit_per_minute=settings.MASSIVE_REQUESTS_PER_MINUTE, now=now)
+    else:
+        preflight = build_incremental_preflight(
+            requested_symbol_count=len(raw_symbols), normalized_symbols=norm["symbols"],
+            duplicates_removed=norm["duplicates_removed"], latest_by_symbol=latest_by_symbol,
+            target_session=target_session, depth_ready_by_symbol=depth_ready,
+            cooldown=cooldown, max_batch=settings.HISTORY_WARMUP_MAX_SYMBOLS_PER_BATCH,
+            provider_rate_limit_per_minute=settings.MASSIVE_REQUESTS_PER_MINUTE)
     preflight["scope"] = scope
     return preflight
 
@@ -2989,11 +3019,15 @@ async def history_warmup_incremental_execute(
     from datetime import date, datetime, timezone
     from app.history_warmup_execute import (
         INCREMENTAL_REFRESH_CONTRACT_VERSION, INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+        INCREMENTAL_REFRESH_CONTRACT_VERSION_V2, INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION_V2,
         HISTORY_WARMUP_ADVISORY_LOCK_KEY, MODE_INCREMENTAL, FORBIDDEN_REQUEST_FIELDS,
         UniverseError, normalize_universe_symbols, missing_trading_sessions,
         incremental_refresh_identity, normalize_daily_bars, upsert_daily_bars,
+        classify_incremental_4h_state, incremental_4h_fetch_window,
+        normalize_4h_bars, upsert_4h_bars, STATE_INCREMENTAL_REFRESH_NEEDED,
         map_provider_error, PROVIDER_ACTIVITY_STARTED, PROVIDER_ACTIVITY_COMPLETED,
     )
+    from zoneinfo import ZoneInfo
     from app.prospective_session import resolve_latest_completed_session
     from app.maintenance_cooldown import COOLDOWN_BLOCKING_REASON, retry_after_seconds
     logger = logging.getLogger(__name__)
@@ -3008,8 +3042,12 @@ async def history_warmup_incremental_execute(
     if present:
         raise HTTPException(status_code=422, detail={
             "error": "forbidden_request_fields", "fields": sorted(present)})
-    if body.get("contract_version") != INCREMENTAL_REFRESH_CONTRACT_VERSION:
+    contract = body.get("contract_version")
+    if contract not in (INCREMENTAL_REFRESH_CONTRACT_VERSION, INCREMENTAL_REFRESH_CONTRACT_VERSION_V2):
         raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    is_v2 = contract == INCREMENTAL_REFRESH_CONTRACT_VERSION_V2
+    result_contract = (INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION_V2 if is_v2
+                       else INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION)
     symbol_raw = body.get("symbol")
     if not isinstance(symbol_raw, str) or not symbol_raw.strip():
         raise HTTPException(status_code=422, detail={"error": "symbol_required"})
@@ -3029,6 +3067,11 @@ async def history_warmup_incremental_execute(
     if latest_str is not None and not isinstance(latest_str, str):
         raise HTTPException(status_code=422, detail={"error": "invalid_latest_local_session"})
     client_latest = date.fromisoformat(latest_str) if latest_str else None
+    # v2 additionally binds the observed latest local 4H session.
+    latest_4h_str = body.get("latest_local_4h_session")
+    if latest_4h_str is not None and not isinstance(latest_4h_str, str):
+        raise HTTPException(status_code=422, detail={"error": "invalid_latest_local_4h_session"})
+    client_latest_4h = date.fromisoformat(latest_4h_str) if latest_4h_str else None
 
     def _cooldown_409(cd):
         return HTTPException(status_code=409, detail={
@@ -3044,12 +3087,13 @@ async def history_warmup_incremental_execute(
     # has since moved on; the identity is derived from the CLIENT-supplied
     # (symbol, latest, target) tuple, exactly what the original request used. #
     identity = incremental_refresh_identity(
-        symbol=symbol, latest_local_session=client_latest, target_completed_session=client_target)
+        symbol=symbol, latest_local_session=client_latest, target_completed_session=client_target,
+        refresh_contract_version=contract, latest_local_4h_session=client_latest_4h)
     prior = await db.fetchrow(
         "SELECT id, status, execution_lease_expires_at FROM history_warmup_runs "
         "WHERE idempotency_key=$1", identity)
     if prior is not None and prior["status"] == "completed":
-        return {"contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+        return {"contract_version": result_contract,
                 "status": "already_applied", "mode": MODE_INCREMENTAL, "symbol": symbol,
                 "run_id": str(prior["id"]), "target_completed_session": client_target.isoformat(),
                 "provider_request_count": 0}
@@ -3076,8 +3120,29 @@ async def history_warmup_incremental_execute(
             "server_latest_local_session": server_latest.isoformat() if server_latest else None})
 
     missing = missing_trading_sessions(server_latest, server_target)
-    if not missing:
-        return {"contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+
+    # v2: also assess 4H freshness. Server-side latest COMPLETED 4H session; a
+    # refresh is needed when it lags the target. Validate the client's observed
+    # 4H point too (symmetric with daily) so a stale view re-preflights.
+    server_latest_4h_end = None
+    server_latest_4h_session = None
+    fourh_needs = False
+    if is_v2:
+        server_latest_4h_end = await db.fetchval(
+            "SELECT MAX(bar_end) FROM market_bars_4h WHERE symbol=$1 AND is_completed", symbol)
+        if server_latest_4h_end is not None:
+            server_latest_4h_session = server_latest_4h_end.astimezone(
+                ZoneInfo("America/New_York")).date()
+        if client_latest_4h != server_latest_4h_session:
+            raise HTTPException(status_code=409, detail={
+                "error": "stale_latest_local_4h_session",
+                "server_latest_local_4h_session": (server_latest_4h_session.isoformat()
+                                                   if server_latest_4h_session else None)})
+        fourh_needs = classify_incremental_4h_state(
+            server_latest_4h_session, server_target) == STATE_INCREMENTAL_REFRESH_NEEDED
+
+    if not missing and not fourh_needs:
+        return {"contract_version": result_contract,
                 "status": "no-op", "reason": "incremental_current", "mode": MODE_INCREMENTAL,
                 "symbol": symbol, "target_completed_session": server_target.isoformat(),
                 "latest_local_session": server_latest.isoformat() if server_latest else None,
@@ -3096,7 +3161,7 @@ async def history_warmup_incremental_execute(
             "SELECT id, status, execution_lease_expires_at FROM history_warmup_runs "
             "WHERE idempotency_key=$1", identity)
         if again is not None and again["status"] == "completed":
-            return {"contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+            return {"contract_version": result_contract,
                     "status": "already_applied", "mode": MODE_INCREMENTAL, "symbol": symbol,
                     "run_id": str(again["id"]), "target_completed_session": server_target.isoformat(),
                     "provider_request_count": 0}
@@ -3140,23 +3205,42 @@ async def history_warmup_incremental_execute(
         provider_name = getattr(provider, "name", None) or "unknown"
         req_count = 0
         daily_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
+        fourh_tel = {"inserted": 0, "updated": 0, "unchanged": 0, "completed_count": 0}
         err_code = err_class = None
         try:
-            frm = missing[0]
-            to = missing[-1]
-            await db.execute(
-                "UPDATE history_warmup_runs SET provider_request_count_attempted="
-                "provider_request_count_attempted+1, last_provider_activity_at=NOW(), "
-                "heartbeat_at=NOW() WHERE id=$1", run_id)
-            raw_daily = await provider.get_daily_bars(symbol, str(frm), str(to))
-            req_count += 1
-            bars = normalize_daily_bars(raw_daily, now=now)
-            # never persist a bar outside the requested missing-session set —
-            # a provider returning a wider range than asked must not silently
-            # rewrite arbitrary history via this bounded path.
-            missing_set = set(missing)
-            bars = [b for b in bars if b["symbol"] == symbol and b["trading_date"] in missing_set]
-            daily_tel = await upsert_daily_bars(db, bars, source=provider_name)
+            # (i) DAILY — only when there are missing sessions (skip refetch when
+            # daily is already current; the v2 4H-only case does no daily work).
+            if missing:
+                frm = missing[0]
+                to = missing[-1]
+                await db.execute(
+                    "UPDATE history_warmup_runs SET provider_request_count_attempted="
+                    "provider_request_count_attempted+1, last_provider_activity_at=NOW(), "
+                    "heartbeat_at=NOW() WHERE id=$1", run_id)
+                raw_daily = await provider.get_daily_bars(symbol, str(frm), str(to))
+                req_count += 1
+                bars = normalize_daily_bars(raw_daily, now=now)
+                # never persist a bar outside the requested missing-session set —
+                # a provider returning a wider range than asked must not silently
+                # rewrite arbitrary history via this bounded path.
+                missing_set = set(missing)
+                bars = [b for b in bars if b["symbol"] == symbol and b["trading_date"] in missing_set]
+                daily_tel = await upsert_daily_bars(db, bars, source=provider_name)
+            # (ii) 4H — v2 only, only when stale. Bounded window from the latest
+            # local completed 4H bar_end to now; normalize drops the forming
+            # bucket; upsert tolerates duplicate/out-of-order rows and never
+            # persists incomplete/future bars.
+            if is_v2 and fourh_needs:
+                fh_from, fh_to = incremental_4h_fetch_window(
+                    latest_4h_bar_end=server_latest_4h_end, now=now)
+                await db.execute(
+                    "UPDATE history_warmup_runs SET provider_request_count_attempted="
+                    "provider_request_count_attempted+1, last_provider_activity_at=NOW(), "
+                    "heartbeat_at=NOW() WHERE id=$1", run_id)
+                payload = await provider.get_intraday_history(
+                    symbol, multiplier=4, timespan="hour", start=fh_from, end=fh_to)
+                req_count += 1
+                fourh_tel = await upsert_4h_bars(db, normalize_4h_bars(payload, symbol=symbol, now=now))
             run_status = "completed"
         except Exception as exc:  # noqa: BLE001 - mapped to a bounded safe code
             err_code, err_class = map_provider_error(exc)
@@ -3173,8 +3257,12 @@ async def history_warmup_incremental_execute(
             err_class, str(_resolved_warmup_min_interval()))
         new_latest = await db.fetchval(
             "SELECT MAX(trading_date) FROM daily_bars WHERE symbol=$1", symbol)
-        return {
-            "contract_version": INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION,
+        new_latest_4h = None
+        if is_v2:
+            new_latest_4h = await db.fetchval(
+                "SELECT MAX(bar_end) FROM market_bars_4h WHERE symbol=$1 AND is_completed", symbol)
+        result = {
+            "contract_version": result_contract,
             "status": "executed" if run_status == "completed" else "failed",
             "mode": MODE_INCREMENTAL, "run_id": run_id, "symbol": symbol,
             "target_completed_session": server_target.isoformat(),
@@ -3185,6 +3273,13 @@ async def history_warmup_incremental_execute(
             "daily": daily_tel,
             "error": ({"code": err_code, "class": err_class} if err_code else None),
         }
+        if is_v2:
+            result["four_hour"] = fourh_tel
+            result["four_hour_refresh_needed"] = fourh_needs
+            result["latest_local_4h_before"] = (
+                server_latest_4h_end.isoformat() if server_latest_4h_end else None)
+            result["latest_local_4h_after"] = new_latest_4h.isoformat() if new_latest_4h else None
+        return result
     finally:
         await db.fetchval("SELECT pg_advisory_unlock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
 

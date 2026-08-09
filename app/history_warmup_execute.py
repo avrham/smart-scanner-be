@@ -678,6 +678,14 @@ async def upsert_4h_bars(conn, rows: List[Dict[str, Any]]) -> Dict[str, int]:
 INCREMENTAL_REFRESH_CONTRACT_VERSION = "history_incremental_refresh.v1"
 INCREMENTAL_PREFLIGHT_CONTRACT_VERSION = "history_incremental_refresh_preflight.v1"
 INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION = "history_incremental_refresh_result.v1"
+# v2 additionally maintains 4H freshness in the SAME bounded incremental unit
+# (daily depth-readiness is NOT redefined; daily-freshness and 4H-freshness stay
+# separate axes). v1 remains valid (daily-only) for back-compat.
+INCREMENTAL_REFRESH_CONTRACT_VERSION_V2 = "history_incremental_refresh.v2"
+INCREMENTAL_PREFLIGHT_CONTRACT_VERSION_V2 = "history_incremental_refresh_preflight.v2"
+INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION_V2 = "history_incremental_refresh_result.v2"
+INCREMENTAL_REFRESH_CONTRACT_VERSIONS = (
+    INCREMENTAL_REFRESH_CONTRACT_VERSION, INCREMENTAL_REFRESH_CONTRACT_VERSION_V2)
 MODE_INCREMENTAL = "incremental"
 
 # history_depth_ready mirrors the EXISTING both_ready/launch_ready verdict
@@ -729,20 +737,60 @@ def classify_incremental_symbol_state(latest_local_date: Optional[date],
 
 def incremental_refresh_identity(*, symbol: str, latest_local_session: Optional[date],
                                  target_completed_session: date,
-                                 refresh_contract_version: str = INCREMENTAL_REFRESH_CONTRACT_VERSION
-                                 ) -> str:
+                                 refresh_contract_version: str = INCREMENTAL_REFRESH_CONTRACT_VERSION,
+                                 latest_local_4h_session: Optional[date] = None) -> str:
     """Deterministic per-(symbol, latest local session, target session)
     identity. A repeated call for the SAME identity (same symbol, same
     observed local starting point, same target) is idempotent — replay never
     creates a duplicate run. A LATER target session (more time has passed,
     resolve_latest_completed_session advanced) is a NEW valid identity, never
-    a collision with a prior round."""
-    blob = "|".join([
+    a collision with a prior round.
+
+    v2 (daily+4H) additionally binds the observed latest local 4H session, so
+    "daily already current but 4H stale" is DISTINCT work from "both current"
+    and a later 4H bar makes a new valid round. The v1 blob is preserved
+    byte-for-byte (no 4H component) so already-completed v1 runs stay idempotent.
+    """
+    parts = [
         refresh_contract_version, str(symbol).upper(),
         latest_local_session.isoformat() if latest_local_session else "none",
         target_completed_session.isoformat(),
-    ])
-    return "hwi:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+    ]
+    if refresh_contract_version == INCREMENTAL_REFRESH_CONTRACT_VERSION_V2:
+        parts.append(latest_local_4h_session.isoformat() if latest_local_4h_session else "none")
+    return "hwi:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def classify_incremental_4h_state(latest_4h_session_date: Optional[date],
+                                  target_session: Optional[date]) -> str:
+    """Per-symbol 4H freshness state, mirroring the daily classifier. A missing
+    target (unresolvable) or a symbol never 4H-warmed (no baseline) is
+    unverifiable, never guessed. `latest_4h_session_date` = the ET session date
+    of the latest COMPLETED local 4H bar."""
+    if target_session is None or latest_4h_session_date is None:
+        return STATE_INCREMENTAL_UNVERIFIABLE
+    if latest_4h_session_date >= target_session:
+        return STATE_INCREMENTAL_CURRENT
+    return STATE_INCREMENTAL_REFRESH_NEEDED
+
+
+def incremental_4h_fetch_window(*, latest_4h_bar_end, now: datetime,
+                                fallback_calendar_days: Optional[int] = None):
+    """Bounded (start, end) UTC window for an incremental 4H fetch. Starts at the
+    latest local completed 4H bar_end (re-confirming the last bar; upsert dedups
+    the overlap) or `fallback_calendar_days` back when there is no local 4H
+    baseline. `end`=now; normalize_4h_bars drops the still-forming bucket."""
+    if fallback_calendar_days is None:
+        fallback_calendar_days = FOUR_HOUR_FETCH_CALENDAR_DAYS
+    now = now.astimezone(timezone.utc)
+    if latest_4h_bar_end is not None:
+        start = latest_4h_bar_end
+        if getattr(start, "tzinfo", None) is None:
+            start = start.replace(tzinfo=timezone.utc)
+        start = start.astimezone(timezone.utc)
+    else:
+        start = now - timedelta(days=int(fallback_calendar_days))
+    return start, now
 
 
 def build_incremental_preflight(*, requested_symbol_count: int,
@@ -824,6 +872,103 @@ def build_incremental_preflight(*, requested_symbol_count: int,
     }
 
 
+def build_incremental_preflight_v2(*, requested_symbol_count: int,
+                                   normalized_symbols: List[str], duplicates_removed: int,
+                                   latest_daily_by_symbol: Dict[str, Optional[date]],
+                                   latest_4h_end_by_symbol: Dict[str, Optional[datetime]],
+                                   latest_4h_session_by_symbol: Dict[str, Optional[date]],
+                                   target_session: Optional[date],
+                                   depth_ready_by_symbol: Dict[str, bool],
+                                   cooldown: Dict[str, Any], max_batch: int,
+                                   provider_rate_limit_per_minute: int,
+                                   now: datetime) -> Dict[str, Any]:
+    """Read-only daily+4H incremental preflight (provider-free, no mutation).
+    Reports THREE separate axes per symbol — history_depth_ready (passed through
+    UNCHANGED from readiness v2), daily freshness, and 4H freshness — plus the
+    exact missing daily sessions and the bounded 4H fetch window. Estimates one
+    provider request per stale axis per symbol (daily and/or 4H)."""
+    per_symbol: List[Dict[str, Any]] = []
+    need_refresh: List[str] = []
+    unverifiable: List[str] = []
+    total_missing_daily = 0
+    provider_requests = 0
+    for sym in normalized_symbols:
+        latest_daily = latest_daily_by_symbol.get(sym)
+        latest_4h_end = latest_4h_end_by_symbol.get(sym)
+        latest_4h_session = latest_4h_session_by_symbol.get(sym)
+        daily_state = classify_incremental_symbol_state(latest_daily, target_session)
+        fourh_state = classify_incremental_4h_state(latest_4h_session, target_session)
+        daily_missing = (missing_trading_sessions(latest_daily, target_session)
+                         if daily_state == STATE_INCREMENTAL_REFRESH_NEEDED else [])
+        daily_needs = daily_state == STATE_INCREMENTAL_REFRESH_NEEDED
+        fourh_needs = fourh_state == STATE_INCREMENTAL_REFRESH_NEEDED
+        fourh_from, fourh_to = (incremental_4h_fetch_window(latest_4h_bar_end=latest_4h_end, now=now)
+                                if fourh_needs else (None, None))
+        reqs = (1 if daily_needs else 0) + (1 if fourh_needs else 0)
+        provider_requests += reqs
+        total_missing_daily += len(daily_missing)
+        per_symbol.append({
+            "symbol": sym,
+            "history_depth_ready": bool(depth_ready_by_symbol.get(sym, False)),
+            "daily": {
+                "latest_local_session": latest_daily.isoformat() if latest_daily else None,
+                "target_session": target_session.isoformat() if target_session else None,
+                "state": daily_state, "missing_session_count": len(daily_missing),
+                "first_missing_session": daily_missing[0].isoformat() if daily_missing else None,
+                "last_missing_session": daily_missing[-1].isoformat() if daily_missing else None,
+            },
+            "four_hour": {
+                "latest_local_4h_bar_end": latest_4h_end.isoformat() if latest_4h_end else None,
+                "latest_local_4h_session": latest_4h_session.isoformat() if latest_4h_session else None,
+                "target_session": target_session.isoformat() if target_session else None,
+                "state": fourh_state,
+                "refresh_needed": fourh_needs,
+                "fetch_window_start": fourh_from.isoformat() if fourh_from else None,
+                "fetch_window_end": fourh_to.isoformat() if fourh_to else None,
+            },
+            "provider_requests_estimate": reqs,
+        })
+        if daily_state == STATE_INCREMENTAL_UNVERIFIABLE or fourh_state == STATE_INCREMENTAL_UNVERIFIABLE:
+            unverifiable.append(sym)
+        elif daily_needs or fourh_needs:
+            need_refresh.append(sym)
+
+    overall_state = (
+        STATE_INCREMENTAL_STALE if need_refresh
+        else STATE_INCREMENTAL_UNVERIFIABLE if unverifiable
+        else STATE_INCREMENTAL_CURRENT
+    )
+    allowed = bool(cooldown.get("execution_allowed_by_cooldown"))
+    batch = need_refresh[: max(1, int(max_batch))]
+    reasons: List[str] = []
+    if not need_refresh:
+        reasons.append("no_symbols_require_refresh")
+    elif not allowed:
+        reasons.append("provider_cooldown_active")
+    return {
+        "contract_version": INCREMENTAL_PREFLIGHT_CONTRACT_VERSION_V2,
+        "mode": MODE_INCREMENTAL,
+        "requested_symbol_count": int(requested_symbol_count),
+        "normalized_symbol_count": len(normalized_symbols),
+        "duplicates_removed": int(duplicates_removed),
+        "target_completed_session": target_session.isoformat() if target_session else None,
+        "symbols": per_symbol,
+        "symbols_requiring_refresh": need_refresh,
+        "symbols_unverifiable": unverifiable,
+        "state": overall_state,
+        "total_missing_daily_session_count": total_missing_daily,
+        "estimated_provider_requests": provider_requests,
+        "configured_provider_rate_limit_per_minute": int(provider_rate_limit_per_minute),
+        "next_batch": {"available": bool(batch) and allowed, "symbols": batch, "symbol_count": len(batch)},
+        "execution_allowed_by_cooldown": allowed,
+        "cooldown_remaining_seconds": cooldown.get("cooldown_remaining_seconds"),
+        "next_execution_not_before": cooldown.get("next_execution_not_before"),
+        "unavailable_reasons": reasons,
+        "provider_called": False,
+        "provider_constructed": False,
+    }
+
+
 __all__ = [
     "EXECUTE_CONTRACT_VERSION", "PREFLIGHT_V2_CONTRACT_VERSION",
     "PREFLIGHT_V3_CONTRACT_VERSION", "EXECUTE_RESULT_CONTRACT_VERSION",
@@ -841,10 +986,13 @@ __all__ = [
     "FOUR_HOUR_FETCH_CALENDAR_DAYS",
     "INCREMENTAL_REFRESH_CONTRACT_VERSION", "INCREMENTAL_PREFLIGHT_CONTRACT_VERSION",
     "INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION", "MODE_INCREMENTAL",
+    "INCREMENTAL_REFRESH_CONTRACT_VERSION_V2", "INCREMENTAL_PREFLIGHT_CONTRACT_VERSION_V2",
+    "INCREMENTAL_EXECUTE_RESULT_CONTRACT_VERSION_V2", "INCREMENTAL_REFRESH_CONTRACT_VERSIONS",
     "STATE_HISTORY_DEPTH_READY", "STATE_INCREMENTAL_CURRENT", "STATE_INCREMENTAL_STALE",
     "STATE_INCREMENTAL_REFRESH_NEEDED", "STATE_INCREMENTAL_UNVERIFIABLE",
     "missing_trading_sessions", "classify_incremental_symbol_state",
-    "incremental_refresh_identity", "build_incremental_preflight",
+    "classify_incremental_4h_state", "incremental_4h_fetch_window",
+    "incremental_refresh_identity", "build_incremental_preflight", "build_incremental_preflight_v2",
 ]
 
 # Bounded fetch window for a symbol's 4H warmup (mirrors the shadow runner's

@@ -603,3 +603,178 @@ class TestOutcomePreflightTransition:
             finally:
                 await o.close(); await w.close()
         asyncio.run(drive())
+
+
+# =========================================================================== #
+# v2: daily + 4H incremental refresh
+# =========================================================================== #
+from zoneinfo import ZoneInfo as _ZoneInfo  # noqa: E402
+from tests.support.fake_provider import FakeProvider, make_ready_4h  # noqa: E402
+
+V2 = "history_incremental_refresh.v2"
+
+
+async def _seed_4h(conn, symbol, ends, *, provider="massive"):
+    """Seed completed 4H bars (bar_end in `ends`, all UTC) via the DB owner."""
+    for e in ends:
+        e = e.astimezone(timezone.utc)
+        start = e - timedelta(hours=4)
+        sess = e.astimezone(_ZoneInfo("America/New_York")).date()
+        await conn.execute(
+            "INSERT INTO market_bars_4h(symbol,bar_start,bar_end,session_date,open,high,low,close,"
+            "volume,is_completed,is_regular_session,provider,provider_adjustment,content_fingerprint) "
+            "VALUES ($1,$2,$3,$4,1,2,0.5,1.5,100,true,false,$5,'split_dividend_adjusted',$6) "
+            "ON CONFLICT (symbol,bar_start,provider,provider_adjustment) DO NOTHING",
+            symbol, start, e, sess, provider, "fp" + e.isoformat())
+
+
+async def _count_4h(conn, symbol):
+    return await conn.fetchval(
+        "SELECT COUNT(*) FROM market_bars_4h WHERE symbol=$1 AND is_completed", symbol)
+
+
+async def _latest_4h_session(conn, symbol):
+    le = await conn.fetchval(
+        "SELECT MAX(bar_end) FROM market_bars_4h WHERE symbol=$1 AND is_completed", symbol)
+    return le.astimezone(_ZoneInfo("America/New_York")).date() if le else None
+
+
+def _v2_body(symbol, target, latest_daily, latest_4h):
+    return {"contract_version": V2, "symbol": symbol,
+            "target_completed_session": target.isoformat(),
+            "latest_local_session": latest_daily.isoformat() if latest_daily else None,
+            "latest_local_4h_session": latest_4h.isoformat() if latest_4h else None}
+
+
+class TestIncrementalV2FourHour:
+    def test_v2_preflight_reports_daily_current_4h_stale(self, pg, monkeypatch):
+        async def drive():
+            now = datetime.now(timezone.utc)
+            target = (now - timedelta(days=3)).date()
+            o = await _conn(pg["owner"]); c = await _conn(pg["warmer"])
+            try:
+                await _seed_bars(c, "AAA", [target])                      # daily current
+                await _seed_4h(o, "AAA", [now - timedelta(days=15)])      # 4H stale
+                _patch_target(monkeypatch, target)
+                pf = await _incremental_pf(c, symbols="AAA", contract_version=V2)
+                assert pf["contract_version"] == "history_incremental_refresh_preflight.v2"
+                assert pf["provider_called"] is False
+                row = pf["symbols"][0]
+                assert row["daily"]["state"] == "incremental_current"
+                assert row["four_hour"]["state"] == "incremental_refresh_needed"
+                assert row["four_hour"]["refresh_needed"] is True
+                assert row["four_hour"]["fetch_window_start"] is not None
+                assert pf["estimated_provider_requests"] == 1  # only 4H
+            finally:
+                await o.close(); await c.close()
+        asyncio.run(drive())
+
+    def test_v2_execute_4h_only_no_daily_call_then_current(self, pg, monkeypatch):
+        prov = FakeProvider(intraday={"AAA": make_ready_4h("AAA", now=datetime.now(timezone.utc), bars=14)})
+        _inject(monkeypatch, prov)
+
+        async def drive():
+            now = datetime.now(timezone.utc)
+            target = (now - timedelta(days=3)).date()
+            o = await _conn(pg["owner"]); c = await _conn(pg["warmer"])
+            try:
+                await _seed_bars(c, "AAA", [target])
+                stale_end = now - timedelta(days=15)
+                await _seed_4h(o, "AAA", [stale_end])
+                before = await _count_4h(o, "AAA")
+                _patch_target(monkeypatch, target)
+                stale_sess = stale_end.astimezone(_ZoneInfo("America/New_York")).date()
+                res = await _incremental_execute(c, _v2_body("AAA", target, target, stale_sess))
+                assert res["status"] == "executed", res
+                assert res["contract_version"] == "history_incremental_refresh_result.v2"
+                # exactly ONE provider request (4H); daily was current -> no daily call
+                assert res["provider_request_count"] == 1
+                assert [x["method"] for x in prov.calls] == ["get_intraday_history"]
+                assert res["four_hour"]["inserted"] >= 11
+                assert res["daily"]["inserted"] == 0
+                after = await _count_4h(o, "AAA")
+                assert after >= before + 11
+                # 4H now current (latest session >= target)
+                assert (await _latest_4h_session(o, "AAA")) >= target
+                # no future/incomplete bars persisted
+                fut = await o.fetchval(
+                    "SELECT COUNT(*) FROM market_bars_4h WHERE symbol='AAA' AND bar_end > $1", now)
+                assert fut == 0
+                # refresh created NO outcomes
+                assert await o.fetchval("SELECT COUNT(*) FROM strategy_shadow_pair_outcomes") == 0
+            finally:
+                await o.close(); await c.close()
+        asyncio.run(drive())
+
+    def test_v2_replay_no_duplicate_4h(self, pg, monkeypatch):
+        prov = FakeProvider(intraday={"AAA": make_ready_4h("AAA", now=datetime.now(timezone.utc), bars=14)})
+        _inject(monkeypatch, prov)
+
+        async def drive():
+            now = datetime.now(timezone.utc)
+            target = (now - timedelta(days=3)).date()
+            o = await _conn(pg["owner"]); c = await _conn(pg["warmer"])
+            try:
+                await _seed_bars(c, "AAA", [target])
+                stale_end = now - timedelta(days=15)
+                await _seed_4h(o, "AAA", [stale_end])
+                _patch_target(monkeypatch, target)
+                stale_sess = stale_end.astimezone(_ZoneInfo("America/New_York")).date()
+                body = _v2_body("AAA", target, target, stale_sess)
+                r1 = await _incremental_execute(c, body)
+                assert r1["status"] == "executed"
+                n1 = await _count_4h(o, "AAA")
+                calls1 = prov.call_count()
+                r2 = await _incremental_execute(c, body)  # exact replay
+                assert r2["status"] == "already_applied", r2
+                assert prov.call_count() == calls1  # no new provider work
+                n2 = await _count_4h(o, "AAA")
+                assert n2 == n1  # zero duplicate 4H rows
+            finally:
+                await o.close(); await c.close()
+        asyncio.run(drive())
+
+    def test_v2_no_op_when_both_current(self, pg, monkeypatch):
+        prov = FakeProvider(intraday={"AAA": make_ready_4h("AAA", now=datetime.now(timezone.utc), bars=14)})
+        _inject(monkeypatch, prov)
+
+        async def drive():
+            now = datetime.now(timezone.utc)
+            target = (now - timedelta(days=3)).date()
+            o = await _conn(pg["owner"]); c = await _conn(pg["warmer"])
+            try:
+                await _seed_bars(c, "AAA", [target])
+                fresh_end = now - timedelta(hours=5)                  # 4H current
+                await _seed_4h(o, "AAA", [fresh_end])
+                _patch_target(monkeypatch, target)
+                fresh_sess = fresh_end.astimezone(_ZoneInfo("America/New_York")).date()
+                res = await _incremental_execute(c, _v2_body("AAA", target, target, fresh_sess))
+                assert res["status"] == "no-op" and res["reason"] == "incremental_current"
+                assert res["provider_request_count"] == 0
+                assert prov.call_count() == 0
+            finally:
+                await o.close(); await c.close()
+        asyncio.run(drive())
+
+    def test_v1_execute_ignores_4h(self, pg, monkeypatch):
+        # back-compat: a v1 request only advances daily and never touches 4H.
+        prov = _fake_provider_with_bars("AAA", {})
+        _inject(monkeypatch, prov)
+
+        async def drive():
+            now = datetime.now(timezone.utc)
+            target = (now - timedelta(days=3)).date()
+            o = await _conn(pg["owner"]); c = await _conn(pg["warmer"])
+            try:
+                await _seed_bars(c, "AAA", [target])
+                await _seed_4h(o, "AAA", [now - timedelta(days=15)])  # stale 4H present
+                _patch_target(monkeypatch, target)
+                before = await _count_4h(o, "AAA")
+                # v1 body: daily current -> no-op (4H staleness invisible to v1)
+                res = await _incremental_execute(c, _exec_body("AAA", target, target))
+                assert res["contract_version"] == "history_incremental_refresh_result.v1"
+                assert res["status"] == "no-op"
+                assert await _count_4h(o, "AAA") == before  # 4H untouched by v1
+            finally:
+                await o.close(); await c.close()
+        asyncio.run(drive())
