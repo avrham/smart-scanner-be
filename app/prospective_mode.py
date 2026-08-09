@@ -25,6 +25,7 @@ PROSPECTIVE_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/api/admin/prospective/access-check",
     "/api/admin/prospective/preflight",
     "/api/admin/prospective/audit",
+    "/api/admin/prospective/evidence-dashboard",
     "/api/admin/prospective/outcomes/preflight",
     # generic job-management listing (read-only)
     "/api/admin/jobs",

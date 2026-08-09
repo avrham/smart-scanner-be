@@ -3815,6 +3815,108 @@ async def prospective_audit(
     }
 
 
+@router.get("/prospective/evidence-dashboard")
+async def prospective_evidence_dashboard(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db)):
+    """prospective_evidence_dashboard.v1 — read-only aggregated evidence payload
+    for the NEXT UI tranche (no UI here). Composes the existing per-campaign
+    audit (reused, not re-derived) with per-campaign horizon coverage and a
+    bounded operational-state block. NEVER exposes credentials/DSNs/roles or raw
+    evidence blobs; provider-free; no mutation."""
+    _require_prospective_mode()
+    from datetime import datetime, timezone
+    from app.prospective_session import resolve_latest_completed_session
+    from app.jobs import daily_pipeline as DP
+    now = datetime.now(timezone.utc)
+
+    regs = await db.fetch(
+        "SELECT id, campaign_run_id, snapshot_session_date, status, universe_id, universe_hash "
+        "FROM prospective_campaign_registrations ORDER BY snapshot_session_date")
+    campaigns = []
+    agg = {"campaigns": 0, "pairs": 0, "evaluations": 0, "outcome_rows": 0, "horizon_observations": 0}
+    horizons = ("ret_1d", "ret_3d", "ret_5d", "ret_10d", "ret_20d")
+    for r in regs:
+        audit = await prospective_audit(_="dashboard", db=db, registration_id=str(r["id"]))
+        cov = {"n": 0, "fb": None}
+        status_dist = {}
+        if r["campaign_run_id"]:
+            row = await db.fetchrow(
+                "SELECT COUNT(*) n, MAX(available_forward_bars) fb, "
+                "COUNT(ret_1d) c1, COUNT(ret_3d) c3, COUNT(ret_5d) c5, "
+                "COUNT(ret_10d) c10, COUNT(ret_20d) c20 "
+                "FROM strategy_shadow_pair_outcomes o JOIN strategy_shadow_run_pairs rp "
+                "ON rp.pair_id=o.pair_id WHERE rp.run_id=$1", r["campaign_run_id"])
+            cov = {"n": int(row["n"] or 0), "fb": row["fb"],
+                   "ret_1d": int(row["c1"] or 0), "ret_3d": int(row["c3"] or 0),
+                   "ret_5d": int(row["c5"] or 0), "ret_10d": int(row["c10"] or 0),
+                   "ret_20d": int(row["c20"] or 0)}
+            sd = await db.fetch(
+                "SELECT o.outcome_status, COUNT(*) c FROM strategy_shadow_pair_outcomes o "
+                "JOIN strategy_shadow_run_pairs rp ON rp.pair_id=o.pair_id "
+                "WHERE rp.run_id=$1 GROUP BY 1", r["campaign_run_id"])
+            status_dist = {row2["outcome_status"]: int(row2["c"]) for row2 in sd}
+            agg["horizon_observations"] += sum(cov[h] for h in horizons)
+        campaigns.append({
+            "registration_id": str(r["id"]),
+            "snapshot_session": r["snapshot_session_date"].isoformat(),
+            "campaign_completion_state": audit["campaign_completion_state"],
+            "pair_count": audit["pair_count"],
+            "candidate_evaluation_count": audit["candidate_evaluation_count"],
+            "control_evaluation_count": audit["control_evaluation_count"],
+            "candidate_decision_counts": audit["candidate_decision_counts"],
+            "control_decision_counts": audit["control_decision_counts"],
+            "candidate_setup_present_count": audit["candidate_setup_present_count"],
+            "candidate_trigger_confirmed_count": audit["candidate_trigger_confirmed_count"],
+            "candidate_pre_rollout_entry_count": audit["candidate_pre_rollout_entry_count"],
+            "control_signal_count": audit["control_signal_count"],
+            "outcome_status_distribution": status_dist,
+            "horizon_coverage": cov,
+        })
+        agg["campaigns"] += 1
+        agg["pairs"] += audit["pair_count"]
+        agg["evaluations"] += audit["candidate_evaluation_count"] + audit["control_evaluation_count"]
+        agg["outcome_rows"] += cov["n"]
+
+    # bounded operational state (no DSNs / passwords / role internals)
+    workers = await db.fetch(
+        "SELECT worker_type, status, deployed_git_sha, "
+        "(NOW()-last_heartbeat_at) < interval '180 seconds' AS fresh "
+        "FROM job_workers WHERE (NOW()-last_heartbeat_at) < interval '900 seconds' "
+        "ORDER BY worker_type")
+    sched = await db.fetchrow(
+        "SELECT schedule_code, enabled, paused, timezone, market_close_delay_minutes, next_run_at "
+        "FROM job_schedules WHERE schedule_code='SMART-SCANNER-DAILY-PIPELINE'")
+    occ = await DP.latest_pipeline_occurrence(db)
+    occ_view = DP.build_status_view(occ) if occ else None
+
+    return {
+        "contract_version": "prospective_evidence_dashboard.v1",
+        "provider_called": False,
+        "generated_at": now.isoformat(),
+        "latest_completed_session": str(resolve_latest_completed_session(now)),
+        "universe": {
+            "universe_id": str(regs[0]["universe_id"]) if regs else None,
+            "universe_hash": regs[0]["universe_hash"] if regs else None,
+            "symbol_count": settings.HISTORY_WARMUP_MAX_UNIVERSE_SYMBOLS if not regs else None,
+        },
+        "campaign_count": len(campaigns),
+        "latest_campaign": campaigns[-1] if campaigns else None,
+        "campaigns": campaigns,
+        "aggregate": agg,
+        "operational": {
+            "workers": [{"worker_type": w["worker_type"], "status": w["status"],
+                         "deployed_git_sha": w["deployed_git_sha"], "fresh": bool(w["fresh"])}
+                        for w in workers],
+            "schedule": ({"schedule_code": sched["schedule_code"], "enabled": sched["enabled"],
+                          "paused": sched["paused"], "timezone": sched["timezone"],
+                          "market_close_delay_minutes": sched["market_close_delay_minutes"],
+                          "next_run_at": sched["next_run_at"].isoformat() if sched["next_run_at"] else None}
+                         if sched else None),
+            "latest_pipeline_occurrence": occ_view,
+        },
+    }
+
+
 @router.post("/prospective/jobs")
 async def prospective_enqueue_jobs(
     response: Response, _: str = Depends(get_worker_token),
