@@ -73,10 +73,15 @@ async def evaluate_prospective_symbol(payload: Dict[str, Any]) -> Dict[str, Any]
         try:
             reg = await _load_and_validate_registration(conn, p)
             await _validate_symbol_membership(conn, reg, p)
-            await PS.assert_no_outcomes(conn)
+            # Recognise an already-evaluated symbol FIRST (idempotent replay),
+            # so a prior campaign whose outcomes were later matured still
+            # reconciles cleanly. The run-scoped guard then only protects a
+            # genuinely fresh evaluation (the campaign's own pairs must carry no
+            # outcomes); OTHER campaigns' matured outcomes are expected.
             existing = await _existing_symbol_result(conn, reg, p)
             if existing is not None:
                 return {"ok": True, "reconciled": True, "result": existing}
+            await PS.assert_no_outcomes_for_run(conn, reg["campaign_run_id"])
         finally:
             await release_db_connection(conn)
 

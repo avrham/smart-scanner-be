@@ -83,7 +83,6 @@ async def enqueue_prospective_campaign(conn: asyncpg.Connection, *, registration
     symbols: List[str] = universe["symbols"]
     if not symbols:
         raise TerminalJobError("empty_universe", "frozen universe has no symbols")
-    await PS.assert_no_outcomes(conn)
 
     exec_id = _execution_identity(reg)
     job_key = ident.job_idempotency_key(
@@ -97,6 +96,11 @@ async def enqueue_prospective_campaign(conn: asyncpg.Connection, *, registration
         counts = await _job_counts(conn, existing["id"])
         status = "already_applied" if reg["status"] == "completed" else "already_queued"
         return _response(status, existing, reg, counts)
+
+    # Run-scoped integrity guard for a genuinely NEW campaign only (a replay of
+    # an already-enqueued/completed campaign returned above). Prior campaigns'
+    # matured outcomes on the shared isolated DB are expected and never block.
+    await PS.assert_no_outcomes_for_run(conn, reg["campaign_run_id"])
 
     async with conn.transaction():
         # (Re)initialize the campaign marker on the registration. Generate the

@@ -34,6 +34,15 @@ import asyncpg
 from app.jobs import identity as ident
 
 PIPELINE_CONTRACT_VERSION = "smart_scanner_daily_pipeline.v1"
+# v2 separates PIPELINE-level completion from OUTCOME-level maturity: the
+# outcome stage matures ALL eligible prior campaigns (bounded sweep) and records
+# the CURRENT campaign's maturity truthfully (deferred when it has no completed
+# forward session yet) instead of blocking the whole occurrence on the current
+# campaign's own — chronologically impossible — same-day maturation. v1
+# occurrence history is never rewritten; a v2 occurrence has a DISTINCT
+# idempotency identity (contract version participates in the key).
+PIPELINE_CONTRACT_VERSION_V2 = "smart_scanner_daily_pipeline.v2"
+PIPELINE_CONTRACT_VERSIONS = (PIPELINE_CONTRACT_VERSION, PIPELINE_CONTRACT_VERSION_V2)
 PIPELINE_JOB_TYPE = "smart_scanner_daily_pipeline"
 PIPELINE_QUEUE = "daily_pipeline"
 
@@ -79,9 +88,11 @@ def pipeline_occurrence_identity(*, schedule_code: str, schedule_version: int,
 
 
 def _initial_result_summary(*, resolved_session_date: str, frozen_universe_hash: str,
-                            universe_id: str) -> Dict[str, Any]:
-    return {
-        "contract_version": PIPELINE_CONTRACT_VERSION,
+                            universe_id: str,
+                            pipeline_contract_version: str = PIPELINE_CONTRACT_VERSION
+                            ) -> Dict[str, Any]:
+    summary = {
+        "contract_version": pipeline_contract_version,
         "resolved_session_date": resolved_session_date,
         "frozen_universe_hash": frozen_universe_hash,
         "universe_id": universe_id,
@@ -91,6 +102,13 @@ def _initial_result_summary(*, resolved_session_date: str, frozen_universe_hash:
         "campaign_job_id": None,
         "outcome_job_id": None,
     }
+    if pipeline_contract_version == PIPELINE_CONTRACT_VERSION_V2:
+        # v2 top-level bookkeeping: the current campaign's truthful maturity and
+        # the bounded prior-campaign maturation sweep are tracked separately from
+        # (and never conflated with) pipeline-stage completion.
+        summary["current_campaign_maturity"] = None
+        summary["prior_maturation"] = None
+    return summary
 
 
 def _load_summary(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -108,23 +126,30 @@ def _load_summary(row: Dict[str, Any]) -> Dict[str, Any]:
 async def ensure_pipeline_occurrence(
         conn: asyncpg.Connection, *, schedule_code: str, schedule_version: int,
         resolved_session_date: str, frozen_universe_hash: str, universe_id: str,
-        requested_by: str = "daily_pipeline_operator") -> Dict[str, Any]:
+        requested_by: str = "daily_pipeline_operator",
+        pipeline_contract_version: str = PIPELINE_CONTRACT_VERSION) -> Dict[str, Any]:
     """Idempotently create-or-fetch the occurrence for this exact
-    (session, universe) pair. Never creates a second occurrence for the same
-    identity, even under concurrent callers (UNIQUE idempotency_key)."""
+    (session, universe, contract-version) tuple. Never creates a second
+    occurrence for the same identity, even under concurrent callers (UNIQUE
+    idempotency_key). A v2 occurrence has a distinct key from a v1 one for the
+    same (session, universe), so v1 history is never rewritten."""
+    if pipeline_contract_version not in PIPELINE_CONTRACT_VERSIONS:
+        raise ValueError(f"unknown pipeline contract version {pipeline_contract_version!r}")
     key = pipeline_occurrence_identity(
         schedule_code=schedule_code, schedule_version=schedule_version,
         resolved_session_date=resolved_session_date,
-        frozen_universe_hash=frozen_universe_hash)
+        frozen_universe_hash=frozen_universe_hash,
+        pipeline_contract_version=pipeline_contract_version)
     summary = _initial_result_summary(
         resolved_session_date=resolved_session_date,
-        frozen_universe_hash=frozen_universe_hash, universe_id=universe_id)
+        frozen_universe_hash=frozen_universe_hash, universe_id=universe_id,
+        pipeline_contract_version=pipeline_contract_version)
     row = await conn.fetchrow(
         "INSERT INTO job_runs (job_type, job_contract_version, queue_name, idempotency_key,"
         " status, requested_by, result_summary) "
         "VALUES ($1,$2,$3,$4,'running',$5,$6::jsonb) "
         "ON CONFLICT (idempotency_key) DO NOTHING RETURNING *",
-        PIPELINE_JOB_TYPE, PIPELINE_CONTRACT_VERSION, PIPELINE_QUEUE, key,
+        PIPELINE_JOB_TYPE, pipeline_contract_version, PIPELINE_QUEUE, key,
         requested_by, json.dumps(summary))
     if row is None:
         row = await conn.fetchrow("SELECT * FROM job_runs WHERE idempotency_key=$1", key)
@@ -192,7 +217,8 @@ async def record_stage_result(conn: asyncpg.Connection, occurrence_id: str, *,
         finished = "NOW()"
     # STAGE_STATE_IN_PROGRESS / BLOCKED / RETRYABLE_FAILURE: stay on this
     # stage, job status stays 'running' — a later call resumes it.
-    for key in ("campaign_registration_id", "campaign_job_id", "outcome_job_id"):
+    for key in ("campaign_registration_id", "campaign_job_id", "outcome_job_id",
+                "current_campaign_maturity", "prior_maturation"):
         if key in result:
             summary[key] = result[key]
     payload = json.dumps(summary)
@@ -227,8 +253,8 @@ def build_status_view(occurrence: Dict[str, Any]) -> Dict[str, Any]:
         "campaign_job_id": summary.get("campaign_job_id"),
         "outcome_job_id": summary.get("outcome_job_id"),
     }
-    return {
-        "contract_version": PIPELINE_CONTRACT_VERSION,
+    view = {
+        "contract_version": summary.get("contract_version", PIPELINE_CONTRACT_VERSION),
         "occurrence_id": str(occurrence["id"]),
         "resolved_session_date": summary.get("resolved_session_date"),
         "universe_hash": summary.get("frozen_universe_hash"),
@@ -246,10 +272,16 @@ def build_status_view(occurrence: Dict[str, Any]) -> Dict[str, Any]:
         "started_at": occurrence["created_at"].isoformat() if occurrence.get("created_at") else None,
         "completed_at": occurrence["finished_at"].isoformat() if occurrence.get("finished_at") else None,
     }
+    if summary.get("contract_version") == PIPELINE_CONTRACT_VERSION_V2:
+        # v2 surfaces the two separated concepts distinctly from stage state.
+        view["current_campaign_maturity"] = summary.get("current_campaign_maturity")
+        view["prior_maturation"] = summary.get("prior_maturation")
+    return view
 
 
 __all__ = [
-    "PIPELINE_CONTRACT_VERSION", "PIPELINE_JOB_TYPE", "PIPELINE_QUEUE",
+    "PIPELINE_CONTRACT_VERSION", "PIPELINE_CONTRACT_VERSION_V2", "PIPELINE_CONTRACT_VERSIONS",
+    "PIPELINE_JOB_TYPE", "PIPELINE_QUEUE",
     "STAGE_HISTORY_REFRESH", "STAGE_PROSPECTIVE_CAMPAIGN", "STAGE_OUTCOME_MATURATION",
     "STAGE_AUDIT_REPORT", "STAGE_DONE", "STAGE_ORDER",
     "STAGE_STATE_PENDING", "STAGE_STATE_IN_PROGRESS", "STAGE_STATE_COMPLETED",

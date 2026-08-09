@@ -6,7 +6,7 @@ so the worker classifies failures correctly. No strategy math here.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import asyncpg
 
@@ -58,8 +58,12 @@ async def load_frozen_universe(conn: asyncpg.Connection, universe_id: Any) -> Di
 
 
 async def assert_no_outcomes(conn: asyncpg.Connection) -> int:
-    """This pipeline creates NO forward outcomes. Any pre-existing outcome row is
-    a data-integrity hard stop (never expected on the isolated DB)."""
+    """DEPRECATED (global variant). The prospective evaluation pipeline creates NO
+    forward outcomes, but the dedicated outcome-maturation worker legitimately
+    writes outcomes for OTHER (prior) campaigns onto the SAME isolated DB once a
+    repeatable daily pipeline runs. A global count therefore false-blocks every
+    campaign after the first maturation. Retained only for callers that predate
+    the run-scoped guard; new callers must use ``assert_no_outcomes_for_run``."""
     n = await conn.fetchval("SELECT count(*)::int FROM strategy_shadow_pair_outcomes")
     if int(n or 0) != 0:
         raise TerminalJobError("unexpected_outcomes_present",
@@ -67,7 +71,27 @@ async def assert_no_outcomes(conn: asyncpg.Connection) -> int:
     return 0
 
 
+async def assert_no_outcomes_for_run(conn: asyncpg.Connection,
+                                     campaign_run_id: Optional[Any]) -> int:
+    """Run-scoped integrity guard: a campaign's OWN pairs must carry no forward
+    outcomes at (fresh) creation/execution time. Outcomes belonging to OTHER
+    campaigns — e.g. prior campaigns matured by the outcome worker on the shared
+    isolated DB — are EXPECTED and never a problem. A ``None`` run means the
+    campaign has not executed yet (no pairs exist), so there is nothing to check.
+    """
+    if campaign_run_id is None:
+        return 0
+    n = await conn.fetchval(
+        "SELECT count(*)::int FROM strategy_shadow_pair_outcomes o "
+        "JOIN strategy_shadow_run_pairs rp ON rp.pair_id = o.pair_id "
+        "WHERE rp.run_id = $1", campaign_run_id)
+    if int(n or 0) != 0:
+        raise TerminalJobError("unexpected_outcomes_present",
+                               f"outcome rows exist for campaign run: {int(n or 0)}")
+    return 0
+
+
 __all__ = [
     "candidate_identity_string", "control_identity_string",
-    "load_frozen_universe", "assert_no_outcomes",
+    "load_frozen_universe", "assert_no_outcomes", "assert_no_outcomes_for_run",
 ]

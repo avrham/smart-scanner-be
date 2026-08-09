@@ -3817,22 +3817,158 @@ async def prospective_outcome_enqueue_jobs(
     return result
 
 
-@router.post("/daily-pipeline/advance")
-async def daily_pipeline_advance(
-    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
-    body: Any = Body(...)):
-    """smart_scanner_daily_pipeline.v1 — ONE bounded advance of the durable
-    daily-pipeline occurrence for ``universe_id``. Resolves the latest
-    completed session itself (never accepts a client-supplied date), then
-    performs (at most) the CURRENT stage's bounded unit of work and persists
-    the result via app.jobs.daily_pipeline.record_stage_result. Idempotent:
-    a stage already completed elsewhere is recognized as such, never redone;
-    a stage still in flight (e.g. a campaign job still processing tasks) is
-    reported in_progress with no new writes. NEVER calls a provider. The
-    history_refresh stage is READ-CHECKED here (local daily_bars freshness
-    only) — the actual incremental refresh runs on the history-warmup app;
-    this endpoint reports it blocked, with the exact operator command, until
-    that has been run."""
+async def _v2_outcome_maturation_stage(db, occ, occurrence_id, universe, now):
+    """daily_pipeline v2 outcome_maturation: matures ALL eligible campaigns
+    (bounded prior sweep + the current one if it happens to be eligible) and
+    records the CURRENT campaign's maturity TRUTHFULLY (deferred when it has no
+    completed forward session yet — never a fabricated success, never a
+    whole-occurrence blocker). Real data problems (terminal failures, forward
+    history absent where expected) BLOCK with an explicit reason code. NEVER
+    calls a provider; outcome writes are local-history-only via the dedicated
+    outcome worker."""
+    from app.jobs import daily_pipeline as DP
+    from app.jobs import daily_pipeline_maturation as DM
+    from app.jobs.contracts import JobError
+    from app.jobs.prospective_outcome_enqueue import (
+        build_outcome_maturity_preflight, enqueue_outcome_maturation)
+    from app.prospective_session import resolve_latest_completed_session
+
+    summary = DP.pipeline_summary(occ)
+    # (a) never mature until the campaign job that produced the pairs is terminal.
+    campaign_job_id = summary.get("campaign_job_id")
+    if campaign_job_id:
+        job = await db.fetchrow("SELECT status FROM job_runs WHERE id=$1", campaign_job_id)
+        if job is not None and job["status"] not in ("succeeded", "failed", "cancelled"):
+            return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_OUTCOME_MATURATION,
+                result={"state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "campaign_job"})
+    reg_id = summary.get("campaign_registration_id")
+    if not reg_id:
+        return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_OUTCOME_MATURATION,
+            result={"state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "missing_campaign_registration_id"})
+    reg_row = await db.fetchrow(
+        "SELECT registration_identity, snapshot_session_date FROM "
+        "prospective_campaign_registrations WHERE id=$1", reg_id)
+    if reg_row is None:
+        return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_OUTCOME_MATURATION,
+            result={"state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "unknown_registration"})
+    reg_identity = reg_row["registration_identity"]
+    exp = settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE
+    target = str(resolve_latest_completed_session(now))
+
+    # (b) current campaign maturity — truthful; may be deferred (NOT a failure).
+    try:
+        cur_pf = await build_outcome_maturity_preflight(
+            db, registration_id=str(reg_id), registration_identity=reg_identity)
+    except JobError as e:
+        return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_OUTCOME_MATURATION,
+            result={"state": DP.STAGE_STATE_TERMINAL_FAILURE, "safe_error_code": e.safe_error_code})
+    current = DM.classify_current_campaign_maturity(
+        preflight=cur_pf, snapshot_session=str(reg_row["snapshot_session_date"]),
+        target_session=target)
+    if current["status"] == DM.CURRENT_UNVERIFIABLE:
+        return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_OUTCOME_MATURATION,
+            result={"state": DP.STAGE_STATE_BLOCKED, "reason": current["reason"],
+                    "current_campaign_maturity": current})
+
+    # (c) bounded prior-campaign discovery (same experiment + frozen universe).
+    plan = await DM.select_eligible_prior_registrations(
+        db, experiment_code=exp, universe_id=universe["universe_id"],
+        universe_hash=universe["universe_hash"], current_registration_id=str(reg_id),
+        target_session=target)
+
+    # (d) maturation targets: eligible priors + the current campaign iff it is
+    # itself maturable this round (normally it is not — session-N has 0 forward).
+    targets = [{"registration_id": e["registration_id"],
+                "registration_identity": e["registration_identity"], "role": "prior"}
+               for e in plan["eligible"]]
+    if current["status"] == DM.CURRENT_MATURING:
+        targets.append({"registration_id": str(reg_id),
+                        "registration_identity": reg_identity, "role": "current"})
+
+    # (e) enqueue/recognize each round idempotently; a round is terminal when its
+    # job succeeded/failed/cancelled or there was no eligible work.
+    jobs = []
+    all_terminal = True
+    for t in targets:
+        try:
+            enq = await enqueue_outcome_maturation(
+                db, registration_id=t["registration_id"],
+                registration_identity=t["registration_identity"],
+                requested_by="daily_pipeline_v2")
+        except JobError as e:
+            all_terminal = False
+            jobs.append({"registration_id": t["registration_id"], "role": t["role"],
+                         "job_id": None, "enqueue_status": "error", "safe_error_code": e.safe_error_code})
+            continue
+        jid = enq.get("job_id")
+        jstatus = enq.get("job_status")
+        if jid:
+            jr = await db.fetchrow("SELECT status FROM job_runs WHERE id=$1", jid)
+            jstatus = jr["status"] if jr else jstatus
+        terminal = (enq.get("status") == "no_eligible_work") or (
+            jstatus in ("succeeded", "failed", "cancelled"))
+        if not terminal:
+            all_terminal = False
+        jobs.append({"registration_id": t["registration_id"], "role": t["role"],
+                     "job_id": jid, "enqueue_status": enq.get("status"), "job_status": jstatus})
+
+    prior_block = {
+        "contract_version": DM.PRIOR_DISCOVERY_CONTRACT,
+        "candidate_count": plan["candidate_count"], "eligible_count": plan["eligible_count"],
+        "max_lookback_sessions": plan["max_lookback_sessions"],
+        "max_lookback_days": plan["max_lookback_days"],
+        "eligible": plan["eligible"], "jobs": jobs,
+    }
+    state = DP.STAGE_STATE_COMPLETED if all_terminal else DP.STAGE_STATE_IN_PROGRESS
+    result = {"state": state, "current_campaign_maturity": current, "prior_maturation": prior_block}
+    if not all_terminal:
+        result["waiting_on"] = "outcome_jobs"
+    return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_OUTCOME_MATURATION, result=result)
+
+
+async def _v2_audit_report_stage(db, occ, occurrence_id):
+    """daily_pipeline v2 audit_report: audit the CURRENT campaign and, separately,
+    report every PRIOR campaign whose maturation round succeeded during this
+    occurrence. Completes the occurrence — a deferred current campaign is a
+    truthful longitudinal state, not a pipeline failure."""
+    from app.jobs import daily_pipeline as DP
+    summary = DP.pipeline_summary(occ)
+    reg_id = summary.get("campaign_registration_id")
+    if not reg_id:
+        return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_AUDIT_REPORT,
+            result={"state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "missing_campaign_registration_id"})
+    audit = await prospective_audit(_="daily_pipeline_v2", db=db, registration_id=reg_id)
+    prior = summary.get("prior_maturation") or {}
+    prior_audits = []
+    for j in (prior.get("jobs") or []):
+        if j.get("role") == "prior" and j.get("job_status") == "succeeded":
+            pa = await prospective_audit(_="daily_pipeline_v2", db=db, registration_id=j["registration_id"])
+            prior_audits.append({"registration_id": j["registration_id"],
+                                 "pair_count": pa["pair_count"], "outcome_count": pa["outcome_count"]})
+    cur_maturity = summary.get("current_campaign_maturity") or {}
+    return await DP.record_stage_result(db, occurrence_id, stage=DP.STAGE_AUDIT_REPORT, result={
+        "state": DP.STAGE_STATE_COMPLETED,
+        "pair_count": audit["pair_count"], "outcome_count": audit["outcome_count"],
+        "campaign_completion_state": audit["campaign_completion_state"],
+        "current_campaign_maturity_status": cur_maturity.get("status"),
+        "prior_campaigns_newly_audited": prior_audits,
+        "prior_campaigns_audited_count": len(prior_audits)})
+
+
+async def advance_daily_pipeline_service(db: asyncpg.Connection, *, body: Any):
+    """INTERNAL orchestration service — no HTTP, no worker token. ONE bounded
+    advance of the durable daily-pipeline occurrence for ``universe_id`` (v1 or
+    v2, selected by ``body['contract_version']``). Resolves the latest completed
+    session itself (never a client-supplied date), performs at most the current
+    stage's bounded unit of work, and persists via
+    app.jobs.daily_pipeline.record_stage_result. Idempotent; NEVER calls a
+    provider.
+
+    Operational-auth architecture: the automated/recurring path calls THIS
+    function DIRECTLY against the DB with an appropriately-privileged role — it
+    never requires a human-held WORKER_TOKEN and never makes a self-HTTP call
+    between Fly apps. The thin ``daily_pipeline_advance`` route below is only an
+    operator/control-plane wrapper that adds the worker-token gate."""
     _require_prospective_mode()
     import uuid as _uuid
     from datetime import datetime, timezone
@@ -3841,8 +3977,9 @@ async def daily_pipeline_advance(
     from app.jobs.prospective_enqueue import enqueue_prospective_campaign
     from app.jobs.prospective_outcome_enqueue import build_outcome_maturity_preflight, enqueue_outcome_maturation
     from app.prospective_session import resolve_latest_completed_session
-    if not isinstance(body, dict) or body.get("contract_version") != DP.PIPELINE_CONTRACT_VERSION:
+    if not isinstance(body, dict) or body.get("contract_version") not in DP.PIPELINE_CONTRACT_VERSIONS:
         raise HTTPException(status_code=422, detail={"error": "bad_contract_version"})
+    pcv = body["contract_version"]
     universe_id = body.get("universe_id")
     if not universe_id:
         raise HTTPException(status_code=422, detail={"error": "universe_id_required"})
@@ -3856,7 +3993,7 @@ async def daily_pipeline_advance(
     occ = await DP.ensure_pipeline_occurrence(
         db, schedule_code=schedule_code, schedule_version=schedule_version,
         resolved_session_date=resolved_session_date, frozen_universe_hash=universe["universe_hash"],
-        universe_id=universe["universe_id"])
+        universe_id=universe["universe_id"], pipeline_contract_version=pcv)
     stage = DP.current_stage(occ)
     occurrence_id = str(occ["id"])
 
@@ -3913,6 +4050,10 @@ async def daily_pipeline_advance(
                     "state": DP.STAGE_STATE_IN_PROGRESS,
                     "campaign_registration_id": registration_id,
                     "campaign_job_id": enq.get("job_id")})
+
+    elif stage == DP.STAGE_OUTCOME_MATURATION and pcv == DP.PIPELINE_CONTRACT_VERSION_V2:
+        occ = await _v2_outcome_maturation_stage(db, occ, occurrence_id, universe, now)
+        return DP.build_status_view(occ)
 
     elif stage == DP.STAGE_OUTCOME_MATURATION:
         summary = DP.pipeline_summary(occ)
@@ -4003,6 +4144,10 @@ async def daily_pipeline_advance(
             "eligible_pair_count": int(enq.get("total_task_count") or 0),
             **({} if job_done else {"waiting_on": "outcome_job"})})
 
+    elif stage == DP.STAGE_AUDIT_REPORT and pcv == DP.PIPELINE_CONTRACT_VERSION_V2:
+        occ = await _v2_audit_report_stage(db, occ, occurrence_id)
+        return DP.build_status_view(occ)
+
     elif stage == DP.STAGE_AUDIT_REPORT:
         summary = DP.pipeline_summary(occ)
         reg_id = summary.get("campaign_registration_id")
@@ -4017,6 +4162,17 @@ async def daily_pipeline_advance(
                 "campaign_completion_state": audit["campaign_completion_state"]})
 
     return DP.build_status_view(occ)
+
+
+@router.post("/daily-pipeline/advance")
+async def daily_pipeline_advance(
+    _: str = Depends(get_worker_token), db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...)):
+    """Operator/control-plane HTTP wrapper (worker-token gated) around
+    ``advance_daily_pipeline_service``. The automated/recurring pipeline does NOT
+    use this route — it calls the service function directly against the DB, so
+    automation never depends on a human-held WORKER_TOKEN or self-HTTP."""
+    return await advance_daily_pipeline_service(db, body=body)
 
 
 # --------------------------------------------------------------------------- #
