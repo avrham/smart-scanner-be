@@ -104,6 +104,16 @@ def _install_default_handlers() -> None:
         max_attempts=getattr(settings, "JOB_MAX_ATTEMPTS_DEFAULT", 3),
         production_enabled=True,
     ))
+    from app.jobs.handlers import daily_pipeline_driver as _dpd
+    from app.jobs import daily_pipeline as _dp
+    register(HandlerSpec(
+        task_type=_dp.DAILY_PIPELINE_ADVANCE_TASK,
+        queue_name=_dp.DAILY_PIPELINE_DRIVER_QUEUE,
+        child_callable=_dpd.run_daily_pipeline_advance_task,
+        probe_fn=_dpd.probe_daily_pipeline_advance_durable_output,
+        max_attempts=_dp.DAILY_PIPELINE_DRIVER_MAX_ATTEMPTS,
+        production_enabled=True,
+    ))
     # A safe, synthetic test handler for controlled retry/crash tests. NEVER
     # selectable unless JOB_ALLOW_TEST_HANDLERS=true; performs no strategy math
     # and touches no real campaign data.

@@ -19,6 +19,7 @@ as those handlers adopt the queue (documented in the runbook).
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -185,28 +186,78 @@ async def _tick_as_leader(conn: asyncpg.Connection, *, worker_id: str,
     return {"leader": True, "enqueued": enqueued, "due": len(due)}
 
 
+def _pipeline_driver_spec(schedule: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the durable-driver task spec for a daily-pipeline schedule whose
+    payload_template carries the frozen ``universe_id`` (and optional hash), else
+    None. Without a configured universe the scheduler stays backward-compatible:
+    it materialises only the inert parent marker (no driver task), exactly as
+    before this handler existed."""
+    from app.jobs import daily_pipeline as DP
+    if schedule.get("job_type") != DP.PIPELINE_JOB_TYPE:
+        return None
+    tmpl = schedule.get("payload_template") or {}
+    if isinstance(tmpl, str):
+        try:
+            tmpl = json.loads(tmpl)
+        except (ValueError, TypeError):
+            tmpl = {}
+    universe_id = tmpl.get("universe_id")
+    if not universe_id:
+        return None
+    return {
+        "task_type": DP.DAILY_PIPELINE_ADVANCE_TASK,
+        "queue": DP.DAILY_PIPELINE_DRIVER_QUEUE,
+        "max_attempts": int(DP.DAILY_PIPELINE_DRIVER_MAX_ATTEMPTS),
+        "payload": {
+            "universe_id": str(universe_id),
+            "universe_hash": tmpl.get("universe_hash"),
+            "pipeline_contract_version": tmpl.get("contract_version") or DP.PIPELINE_CONTRACT_VERSION_V2,
+        },
+    }
+
+
 async def _create_scheduled_job(conn: asyncpg.Connection, schedule: Dict[str, Any],
                                 occurrence: datetime) -> Optional[str]:
-    """Create ONE parent job per occurrence (idempotent via the occurrence key).
-    Task creation per job_type is wired per handler as handlers adopt the queue;
-    this foundation creates the durable parent job + a scheduled event."""
+    """Create ONE parent occurrence per fire (idempotent via the occurrence key)
+    AND — for a daily-pipeline schedule configured with a frozen universe — ONE
+    durable driver task (smart_scanner_daily_pipeline_advance.v1) on the driver
+    queue so a pipeline-driver worker advances it automatically. Both are
+    idempotent: a duplicate scheduler fire for the same occurrence creates
+    neither a second parent nor a second driver task."""
     key = ident.schedule_occurrence_idempotency_key(
         schedule_code=schedule["schedule_code"],
         schedule_version=int(schedule["schedule_version"]),
         occurrence_iso=occurrence.isoformat())
+    driver = _pipeline_driver_spec(schedule)
+    marker_queue = (driver["queue"] if driver is not None
+                    else (schedule.get("queue_name") or C.PROSPECTIVE_QUEUE))
     row = await conn.fetchrow(
         "INSERT INTO job_runs (job_type, job_contract_version, queue_name, idempotency_key,"
         " status, schedule_id, requested_by) "
         "VALUES ($1,$2,$3,$4,'queued',$5,'scheduler') "
         "ON CONFLICT (idempotency_key) DO NOTHING RETURNING id",
         schedule["job_type"], schedule["job_contract_version"],
-        schedule.get("queue_name") or C.PROSPECTIVE_QUEUE, key, schedule["id"])
+        marker_queue, key, schedule["id"])
     if row is None:
         return None  # duplicate occurrence — never enqueued twice
     await Q.record_event(conn, job_id=row["id"], event_type="job_scheduled",
                          safe_message=schedule["schedule_code"],
                          metadata={"occurrence": occurrence.isoformat(),
                                    "schedule_id": str(schedule["id"])})
+    if driver is not None:
+        task_payload = {**driver["payload"],
+                        "schedule_code": schedule["schedule_code"],
+                        "schedule_version": int(schedule["schedule_version"]),
+                        "occurrence_scheduled_at": occurrence.isoformat()}
+        await conn.execute(
+            "INSERT INTO job_tasks (job_id, queue_name, task_type, task_contract_version,"
+            " task_key, ordinal, payload, payload_hash, idempotency_key, status, priority,"
+            " max_attempts) "
+            "VALUES ($1,$2,$3,$3,'driver',0,$4::jsonb,$5,$6,'queued',100,$7) "
+            "ON CONFLICT DO NOTHING",
+            row["id"], driver["queue"], driver["task_type"], json.dumps(task_payload),
+            ident.payload_hash(task_payload), "dpadv:" + key, driver["max_attempts"])
+        await Q.recompute_job_counters(conn, row["id"])
     return str(row["id"])
 
 

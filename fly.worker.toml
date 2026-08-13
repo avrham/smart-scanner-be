@@ -31,7 +31,10 @@ primary_region = 'fra'
   JOB_WORKER_TYPE = 'prospective'
   JOB_WORKER_QUEUES = 'prospective'
   JOB_WORKER_CONCURRENCY = '1'
-  JOB_SCHEDULER_ENABLED = 'true'
+  # Scheduler leader lives ONLY on the pipeline-driver worker (whose role can
+  # materialise the daily-pipeline occurrence + driver task); this evaluation
+  # worker never becomes leader, so it can never fail to create that occurrence.
+  JOB_SCHEDULER_ENABLED = 'false'
   JOB_ALLOW_TEST_HANDLERS = 'false'
   REQUIRE_WORKER_TOKEN = 'true'
   # Non-HTTP worker: token is never used for auth (no inbound endpoints); present

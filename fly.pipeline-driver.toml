@@ -1,0 +1,60 @@
+# fly.pipeline-driver.toml — smart-scanner-be-pipeline-driver-staging
+#
+# DEDICATED NON-HTTP daily-pipeline DRIVER worker. Runs `python -m app.jobs.worker`
+# continuously (NO http_service / NO TCP service -> no Fly Proxy, no
+# autostart/autostop). It is the SOLE scheduler leader (JOB_SCHEDULER_ENABLED)
+# because only its DB role (smart_scanner_pipeline_driver) can materialise a
+# daily-pipeline occurrence + its driver task on the 'daily_pipeline_driver'
+# queue; the evaluation/outcome workers run with the scheduler OFF. It then
+# claims the smart_scanner_daily_pipeline_advance.v1 task (concurrency 1) from the
+# ISOLATED Fly Postgres via the least-privilege driver role
+# (JOB_WORKER_DATABASE_URL, a SECRET) and invokes the EXISTING
+# advance_daily_pipeline_service (never duplicating the state machine). NO
+# provider credential and NO shared Supabase credential are installed. Git SHA is
+# supplied at deploy via --build-arg APP_GIT_SHA.
+
+app = 'smart-scanner-be-pipeline-driver-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_ENVIRONMENT = 'pipeline-driver-staging'
+  # PROSPECTIVE mode so advance_daily_pipeline_service's _require_prospective_mode
+  # gate passes; every OTHER mode flag is false.
+  PROSPECTIVE_CAMPAIGN_ONLY_MODE = 'true'
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  HISTORY_WARMUP_ONLY_MODE = 'false'
+  ENABLE_SCHEDULER = 'false'                # the legacy HTTP scheduler stays off
+  JOB_WORKER_ENABLED = 'true'
+  JOB_WORKER_TYPE = 'pipeline_driver'
+  JOB_WORKER_QUEUES = 'daily_pipeline_driver'
+  JOB_WORKER_CONCURRENCY = '1'
+  JOB_SCHEDULER_ENABLED = 'true'            # SOLE durable-queue scheduler leader
+  JOB_ALLOW_TEST_HANDLERS = 'false'
+  REQUIRE_WORKER_TOKEN = 'true'
+  # Non-HTTP worker: token never used for auth; present only to satisfy the
+  # required Settings field at boot (mirrors the sibling worker apps). NOT a
+  # secret; carries no privilege.
+  WORKER_TOKEN = 'unused-placeholder-non-http-worker'
+  MARKET_DATA_PROVIDER = 'massive'          # name only; NO key installed
+  LOG_FORMAT = 'json'
+  JOB_WORKER_EXPECTED_DB_ROLE = 'smart_scanner_pipeline_driver'
+  # The frozen universe the driver advances (also carried in the schedule
+  # payload_template; here as a boot-time cross-check aid, no secret).
+  PROSPECTIVE_ALLOWED_EXPERIMENT_CODE = 'wyckoff_v2_vs_baseline'
+
+# No [http_service] and no [[services]] — no exposed port, never started/stopped
+# by inbound traffic, runs continuously.
+[processes]
+  worker = 'python -m app.jobs.worker'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512
+  processes = ['worker']

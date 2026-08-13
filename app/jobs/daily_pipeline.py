@@ -45,6 +45,20 @@ PIPELINE_CONTRACT_VERSION_V2 = "smart_scanner_daily_pipeline.v2"
 PIPELINE_CONTRACT_VERSIONS = (PIPELINE_CONTRACT_VERSION, PIPELINE_CONTRACT_VERSION_V2)
 PIPELINE_JOB_TYPE = "smart_scanner_daily_pipeline"
 PIPELINE_QUEUE = "daily_pipeline"
+# The durable driver that makes scheduler -> occurrence -> advance fully
+# automatic. The scheduler materialises ONE driver TASK (this task type, on this
+# queue) per fired occurrence; a dedicated pipeline-driver worker claims it and
+# calls advance_daily_pipeline_service repeatedly (bounded progress, defer while
+# async child work runs) until the occurrence is terminal. The driver never
+# duplicates the state machine — it only invokes the existing service.
+DAILY_PIPELINE_ADVANCE_TASK = "smart_scanner_daily_pipeline_advance.v1"
+DAILY_PIPELINE_DRIVER_QUEUE = "daily_pipeline_driver"
+# job_tasks caps max_attempts at 10 (migration 018 CHECK). The driver does NOT
+# rely on many retries to span a slow campaign — it WAITS INTERNALLY (sleep+poll,
+# lease auto-renewed) up to DAILY_PIPELINE_DRIVER_MAX_WAIT_SECONDS within one
+# claim; the attempts are a safety valve for a genuinely transient failure or a
+# wait that exceeds that ceiling.
+DAILY_PIPELINE_DRIVER_MAX_ATTEMPTS = 10
 
 STAGE_HISTORY_REFRESH = "history_refresh"
 STAGE_PROSPECTIVE_CAMPAIGN = "prospective_campaign"
@@ -282,6 +296,7 @@ def build_status_view(occurrence: Dict[str, Any]) -> Dict[str, Any]:
 __all__ = [
     "PIPELINE_CONTRACT_VERSION", "PIPELINE_CONTRACT_VERSION_V2", "PIPELINE_CONTRACT_VERSIONS",
     "PIPELINE_JOB_TYPE", "PIPELINE_QUEUE",
+    "DAILY_PIPELINE_ADVANCE_TASK", "DAILY_PIPELINE_DRIVER_QUEUE", "DAILY_PIPELINE_DRIVER_MAX_ATTEMPTS",
     "STAGE_HISTORY_REFRESH", "STAGE_PROSPECTIVE_CAMPAIGN", "STAGE_OUTCOME_MATURATION",
     "STAGE_AUDIT_REPORT", "STAGE_DONE", "STAGE_ORDER",
     "STAGE_STATE_PENDING", "STAGE_STATE_IN_PROGRESS", "STAGE_STATE_COMPLETED",

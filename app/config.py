@@ -239,6 +239,14 @@ class Settings(BaseSettings):
     # attempt 2 -> 300, then terminal. Deterministic (jitter only under a test
     # hook) so crash-recovery tests are reproducible.
     JOB_RETRY_BACKOFF_SECONDS: List[int] = [60, 300]
+    # Daily-pipeline driver: within ONE claim it advances the occurrence and, when
+    # a stage is waiting on asynchronous durable work (a running campaign/outcome
+    # job, a history cooldown), it sleeps DAILY_PIPELINE_DRIVER_POLL_SECONDS and
+    # re-checks — up to DAILY_PIPELINE_DRIVER_MAX_WAIT_SECONDS (the worker renews
+    # the task lease throughout). Beyond that ceiling it defers (one retry). Tests
+    # set the ceiling to 0 so a single advance either finishes or defers at once.
+    DAILY_PIPELINE_DRIVER_MAX_WAIT_SECONDS: int = 10800   # 3h (a slow 25-symbol eval)
+    DAILY_PIPELINE_DRIVER_POLL_SECONDS: int = 30
     # A worker whose last heartbeat is older than this is considered stale/dead
     # (its leased/running tasks become eligible for lease-expiry reconciliation).
     JOB_WORKER_STALE_SECONDS: int = 90
