@@ -62,8 +62,18 @@ flyctl secrets set -a "$DRIVER_APP" \
 ```
 
 `JOB_WORKER_DATABASE_URL` must be the **driver role** DSN — never the
-prospective-runner or history-warmer role. `JOB_WORKER_EXPECTED_DB_ROLE` in the
-toml makes the worker refuse to boot on any other `current_user`.
+prospective-runner or history-warmer role.
+
+> **Identity is not self-enforced at boot.** `JOB_WORKER_EXPECTED_DB_ROLE`
+> (`smart_scanner_pipeline_driver` in the toml) is a **declared/configured
+> expectation only** — as of this implementation it is **not** wired to a
+> worker boot-time hard gate, so the worker will **not** refuse to start if the
+> DSN connects as a different `current_user`. The authoritative identity gate is
+> the explicit live verification in §3d + the role/RLS verifier SQL (§1):
+> `SELECT current_user`, the elevated-role-flag checks, the visible-queue check,
+> the forbidden-write probe, and `verify_pipeline_driver.sql`. Treat those as
+> the source of truth; do not rely on `JOB_WORKER_EXPECTED_DB_ROLE` to stop a
+> misconfigured DSN.
 
 ---
 
@@ -84,13 +94,107 @@ flyctl deploy -a smart-scanner-be-prospective-worker-staging \
 flyctl deploy -a smart-scanner-be-prospective-outcome-worker-staging \
   -c fly.prospective-outcome-worker.toml --build-arg APP_GIT_SHA="$GITSHA"
 
-# 3c. Confirm the driver booted on the RIGHT role and is leader (no fly ssh needed):
-flyctl logs -a "$DRIVER_APP" --no-tail | grep -E "current_user|scheduler.*leader|role" | tail
+# 3c. Confirm the driver machine is up (no fly ssh needed):
+flyctl status -a "$DRIVER_APP"
 ```
 
-Expected: driver logs show `current_user = smart_scanner_pipeline_driver` and
-"acquired scheduler leadership"; the other two apps log that the scheduler is
-disabled.
+Expected: one machine `started` (process group `worker`), no crash loop. The
+worker registers a `worker registered` log line on boot; there is **no**
+`current_user`/"acquired leadership" boot assertion to grep for — identity and
+leadership are verified explicitly in §3d and §3e, not inferred from logs.
+
+---
+
+## 3d. Driver DB identity + queue-isolation verification (authoritative)
+
+This is the real identity gate (see the §2 note). Run it after §3 and before
+the readiness gate.
+
+**Role-specific connection — as the driver role itself** (via `flyctl proxy` if
+`<pg-host>` is not directly reachable):
+
+```bash
+# optional: flyctl proxy 15432:5432 -a "$PG_APP"   # then point DRIVER_DSN host at 127.0.0.1:15432
+psql "$DRIVER_DSN"
+```
+
+At the driver-role prompt:
+
+```sql
+SELECT current_user;
+SELECT DISTINCT queue_name FROM job_tasks ORDER BY 1;
+-- forbidden-write probe: the driver must NOT be able to write market bars
+INSERT INTO daily_bars(symbol,trading_date,open,high,low,close,volume)
+  VALUES ('__RLS_PROBE__', DATE '2000-01-03', 1,1,1,1,1);
+```
+
+Expected:
+
+```
+ current_user  ->  smart_scanner_pipeline_driver
+ queue_name    ->  ONLY a subset of:
+                   daily_pipeline_driver / daily_pipeline / prospective / prospective_outcomes
+ INSERT        ->  ERROR:  permission denied for table daily_bars
+```
+
+**STOP CONDITIONS** — abort (and roll back per Rollback) if any hold:
+- `current_user` ≠ `smart_scanner_pipeline_driver`;
+- **any** visible `queue_name` outside the four listed queues;
+- the `daily_bars` INSERT **succeeds** (least-privilege is broken).
+
+**Admin-side worker identity/heartbeat** — separate admin/owner connection
+(`$ADMIN_DSN`), kept apart from the role-specific checks above:
+
+```sql
+SELECT worker_type, deployed_git_sha, status, last_heartbeat_at
+FROM   job_workers
+WHERE  worker_type = 'pipeline_driver'
+ORDER  BY last_heartbeat_at DESC;
+```
+
+Expected: exactly one row, `worker_type = pipeline_driver`, `deployed_git_sha`
+equals `$GITSHA`, `status` in `idle`/`busy`, and `last_heartbeat_at` fresh
+(within the last ~minute). **STOP CONDITION:** wrong/stale SHA, no row, or a
+stale heartbeat → the deployed driver is not the build you verified.
+
+---
+
+## 3e. Scheduler-leader verification
+
+The scheduler leader tick runs **inside** the driver worker and acquires a
+Postgres advisory lock **per tick, releasing it at the end of each tick**.
+Because the lock is transient, a `pg_locks` snapshot is **not** a reliable proof
+of leadership and must **not** be used as the gate. Verify by configuration +
+liveness instead.
+
+**Configuration — exactly one app schedules** (`NORMAL TERMINAL`):
+
+```bash
+for A in "$DRIVER_APP" \
+         smart-scanner-be-prospective-worker-staging \
+         smart-scanner-be-prospective-outcome-worker-staging; do
+  echo "== $A =="; flyctl config env -a "$A" 2>/dev/null | grep JOB_SCHEDULER_ENABLED
+done
+```
+
+Expected:
+- driver app (`$DRIVER_APP`) → `JOB_SCHEDULER_ENABLED = true`;
+- prospective **evaluation** worker (`smart-scanner-be-prospective-worker-staging`) → `false`;
+- prospective **outcome** worker (`smart-scanner-be-prospective-outcome-worker-staging`) → `false`.
+
+**Liveness — one fresh `pipeline_driver` heartbeat** (`$ADMIN_DSN`):
+
+```sql
+SELECT worker_type, status, last_heartbeat_at
+FROM   job_workers WHERE worker_type = 'pipeline_driver';
+```
+
+Expected: exactly one heartbeating `pipeline_driver` worker (the process that
+runs the leader tick).
+
+**STOP CONDITION:** more than one app with `JOB_SCHEDULER_ENABLED=true` (two
+leaders can contend), or no fresh `pipeline_driver` heartbeat → fix the
+tomls/redeploy before proceeding.
 
 ---
 
@@ -103,11 +207,12 @@ enable the recurring schedule unless every line passes.
 |---|------|-------|
 | 1 | Driver role correct | §1 verifier exited 0. |
 | 2 | Driver worker healthy | `flyctl status -a "$DRIVER_APP"` → 1 machine `started`, no crash loop. |
-| 3 | Sole scheduler leader | driver logs show leadership; eval+outcome logs show scheduler disabled. |
-| 4 | Frozen universe ready | the production universe is `frozen` with a stable `universe_hash`. |
-| 5 | Daily + 4H fresh | every universe symbol has `daily_bars` through the latest completed session and completed `market_bars_4h` (no stale symbols → history_refresh completes, not blocks). |
-| 6 | 3 green campaigns | `SELECT count(*) FROM prospective_campaign_registrations WHERE status='completed'` ≥ 3 (incl. `9470418d`, see recovery evidence doc). |
-| 7 | Live auto-advance proof | §4a below drove a throwaway occurrence to `succeeded` end-to-end. |
+| 3 | Driver identity + isolation | §3d green: `current_user = smart_scanner_pipeline_driver`, only the four allowed queues visible, `daily_bars` INSERT denied, fresh `pipeline_driver` row on `$GITSHA`. |
+| 4 | Sole scheduler leader | §3e green: only `$DRIVER_APP` has `JOB_SCHEDULER_ENABLED=true`; both prospective workers `false`; exactly one fresh `pipeline_driver` heartbeat. |
+| 5 | Frozen universe ready | the production universe is `frozen` with a stable `universe_hash`. |
+| 6 | Daily + 4H fresh | every universe symbol has `daily_bars` through the latest completed session and completed `market_bars_4h` (no stale symbols → history_refresh completes, not blocks). |
+| 7 | 3 green campaigns | `SELECT count(*) FROM prospective_campaign_registrations WHERE status='completed'` ≥ 3 (incl. `9470418d`, see recovery evidence doc). |
+| 8 | Live auto-advance proof | §4a below drove a throwaway occurrence to `succeeded` **and** §4a's machine-driven attestation passed. |
 
 ### 4a. Live auto-advance proof (throwaway schedule — proves the loop before arming production)
 
@@ -143,16 +248,62 @@ WHERE  task_type='smart_scanner_daily_pipeline_advance.v1';
 
 The driver will `history_refresh → campaign` (enqueues `prospective` eval
 tasks; eval worker processes them) then, on a later claim, `outcome → audit →
-succeeded`. When the driver task reads `succeeded`, tear down the proof:
+succeeded`.
+
+**Machine-driven attestation — prove the DRIVER advanced it, not an operator.**
+Before tearing the proof down, confirm the advance came from the durable worker
+(not a human `POST /daily-pipeline/advance` and not `fly ssh`). Admin/owner
+connection (`$ADMIN_DSN`):
+
+```sql
+-- (a) the durable advance task exists and was claimed/advanced by a pipeline_driver worker
+SELECT t.task_type, t.status, t.attempt_count, w.worker_type, w.deployed_git_sha
+FROM   job_tasks t
+LEFT   JOIN job_workers w
+       ON w.current_task_id = t.id OR w.worker_type = 'pipeline_driver'
+WHERE  t.task_type = 'smart_scanner_daily_pipeline_advance.v1';
+
+-- (b) scheduler-origin + stage progress recorded against the proof occurrence
+SELECT e.event_type, e.safe_message, e.created_at
+FROM   job_events e
+JOIN   job_runs r ON r.id = e.job_id
+JOIN   job_schedules s ON s.id = r.schedule_id
+WHERE  s.schedule_code = 'PROOF-DAILY-PIPELINE'
+ORDER  BY e.created_at;
+```
+
+Expected:
+- (a) the `smart_scanner_daily_pipeline_advance.v1` task is present and its work
+  is attributable to a `worker_type = pipeline_driver` worker deployed at
+  `$GITSHA` — no operator claimed or advanced it;
+- (b) the occurrence shows a `job_scheduled` event with
+  `safe_message = PROOF-DAILY-PIPELINE` (scheduler origin), followed by stage
+  progress — i.e. the state machine advanced under the worker, not a manual call.
+
+Optional log corroboration (`NORMAL TERMINAL`):
+
+```bash
+flyctl logs -a "$DRIVER_APP" --no-tail \
+  | grep -E "smart_scanner_daily_pipeline_advance|worker registered" | tail
+```
+
+**Operator attestation:** for this proof occurrence you issued **no**
+`POST /api/admin/daily-pipeline/advance` and **no** `flyctl ssh` — advancement
+came solely from the durable pipeline-driver worker.
+
+When the driver task reads `succeeded` and the attestation above holds, tear
+down the proof:
 
 ```sql
 DELETE FROM job_schedules WHERE schedule_code='PROOF-DAILY-PIPELINE';
--- (the proof occurrence job_runs/job_tasks are terminal & harmless; leave for audit)
+-- (the proof occurrence job_runs/job_tasks are terminal & harmless; leave for audit.
+--  the driver role holds no DELETE, so run this teardown on the admin connection.)
 ```
 
-If the proof does not reach `succeeded`, STOP and diagnose via
-`flyctl logs -a "$DRIVER_APP"` and the occurrence `stage_states` — do **not**
-enable production.
+If the proof does not reach `succeeded`, or the machine-driven attestation fails
+(the advance is attributable to a manual call rather than the pipeline_driver
+worker), STOP and diagnose via `flyctl logs -a "$DRIVER_APP"` and the occurrence
+`stage_states` — do **not** enable production.
 
 ---
 
