@@ -1,11 +1,29 @@
 # Daily-Pipeline Driver — Deploy, Readiness Gate & Enable Runbook
 
-Operator runbook for the **durable daily-pipeline driver** (commit `7fcea64`):
+Operator runbook for the **durable daily-pipeline driver**:
 scheduler → occurrence → `smart_scanner_daily_pipeline_advance.v1` → durable
 worker → `advance_daily_pipeline_service` → history refresh → campaign →
 outcome (current deferred / prior sweep) → audit → occurrence **succeeded**,
 fully automatic with **no HTTP self-call, no `fly ssh`, no operator-held
 `WORKER_TOKEN`**.
+
+> **Updated after the first live proof.** The initial live proof FAILED and
+> exposed two backend defects, now fixed:
+> - **History refresh is now AUTOMATIC (Root Cause A).** When the frozen
+>   universe's daily/4H history is stale, the driver enqueues (or recognizes)
+>   ONE durable `history_incremental_refresh` child job; a dedicated
+>   **history-refresh worker** — the only automated component besides the
+>   history-warmup HTTP app that holds the Massive credential — runs the
+>   provider-backed refresh per symbol. The pipeline WAITS on that child
+>   (stage `in_progress` / `waiting_on: history_refresh_job`, **not** BLOCKED),
+>   re-checks readiness, then advances. There is **no** manual
+>   `POST /history-warmup/incremental/execute` step in the automated path.
+>   This adds a **new deployment step (§1b + §3f)**: the history-refresh worker.
+> - **Driver retry budget matches its `max_attempts` (Root Cause B).** The
+>   driver task now carries its own backoff schedule so it can defer
+>   (`occurrence_in_progress`) across its full 10-attempt budget instead of
+>   terminally failing at attempt 3 (the global 2-entry backoff list cap).
+>   Existing task types keep their bounded two-retry default.
 
 All steps below require access the automation does not hold and must be run by
 the operator. Run them **in order**; do not enable the recurring schedule until
@@ -16,7 +34,8 @@ Prereq once per shell:
 ```bash
 flyctl auth login                       # interactive; browser
 export DRIVER_APP=smart-scanner-be-pipeline-driver-staging
-export GITSHA=$(git rev-parse HEAD)     # 7fcea64… (driver commit)
+export HREFRESH_APP=smart-scanner-be-history-refresh-worker-staging
+export GITSHA=$(git rev-parse HEAD)     # the current driver + history-refresh commit
 ```
 
 ---
@@ -48,6 +67,34 @@ for the next step — this is the ONLY place the password is used:
 
 ```bash
 export DRIVER_DSN="postgresql://smart_scanner_pipeline_driver:${DRIVER_DB_PASSWORD}@<pg-host>:5432/${DBNAME}?sslmode=require"
+```
+
+---
+
+## 1b. Grant the history-refresh worker its durable-queue access (Root Cause A)
+
+The history-refresh worker REUSES the existing least-privilege
+`smart_scanner_history_warmer` role (it already writes daily/4H bars +
+`history_warmup_runs` and pairs with the Massive credential). It only LACKS
+job-queue access; add it, queue-scoped to `history_incremental_refresh` (idempotent):
+
+```bash
+psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -f ops/sql/create_history_refresh_worker_grants.sql
+```
+
+Expected tail: `history-refresh worker grants configured.` This grants the
+warmer role SELECT/INSERT/UPDATE on `job_runs`/`job_tasks` **RLS-scoped to the
+one queue** (it can never claim a prospective/outcome/driver task) plus
+attempts/events/workers; NO `job_schedules`/`job_dependencies`, NO `DELETE`.
+The driver's own RLS scope already includes `history_incremental_refresh` (it
+enqueues + reads the child job) via `create_pipeline_driver_rls_policies.sql`.
+
+Build the warmer DSN for the worker secret (§3f) — the warmer password is the
+one set when `create_shadow_history_warmer.sql` was applied; never printed:
+
+```bash
+read -rs WARMER_DB_PASSWORD; echo; echo "captured ${#WARMER_DB_PASSWORD} chars"
+export WARMER_DSN="postgresql://smart_scanner_history_warmer:${WARMER_DB_PASSWORD}@<pg-host>:5432/${DBNAME}?sslmode=require"
 ```
 
 ---
@@ -159,6 +206,45 @@ stale heartbeat → the deployed driver is not the build you verified.
 
 ---
 
+## 3f. Deploy the history-refresh worker (Root Cause A)
+
+The driver enqueues history refresh but never runs a provider — this worker
+does, and it is the ONLY new component that carries the Massive credential.
+
+```bash
+flyctl apps create "$HREFRESH_APP" --org <org>            # skip if it exists
+flyctl secrets set -a "$HREFRESH_APP" \
+  JOB_WORKER_DATABASE_URL="$WARMER_DSN" \
+  MASSIVE_API_KEY="$MASSIVE_API_KEY"                       # values never printed
+flyctl deploy -a "$HREFRESH_APP" -c fly.history-refresh-worker.toml \
+  --build-arg APP_GIT_SHA="$GITSHA"
+flyctl status -a "$HREFRESH_APP"
+```
+
+Verify identity + queue isolation exactly as in §3d but for this worker
+(connect as `smart_scanner_history_warmer`):
+
+```sql
+SELECT current_user;                                        -- smart_scanner_history_warmer
+SELECT DISTINCT queue_name FROM job_tasks ORDER BY 1;       -- only history_incremental_refresh visible
+```
+
+Admin-side (`$ADMIN_DSN`): a fresh `history_refresh` worker heartbeat on `$GITSHA`:
+
+```sql
+SELECT worker_type, deployed_git_sha, status, last_heartbeat_at
+FROM   job_workers WHERE worker_type = 'history_refresh';
+```
+
+**STOP CONDITIONS:** `current_user` ≠ `smart_scanner_history_warmer`; any
+visible `queue_name` other than `history_incremental_refresh`; missing
+`MASSIVE_API_KEY` secret (the worker cannot refresh); or no fresh heartbeat.
+The Massive key must be present on THIS app and the history-warmup HTTP app
+ONLY — never on the driver / prospective / outcome apps (confirm with
+`flyctl secrets list` on each).
+
+---
+
 ## 3e. Scheduler-leader verification
 
 The scheduler leader tick runs **inside** the driver worker and acquires a
@@ -209,10 +295,11 @@ enable the recurring schedule unless every line passes.
 | 2 | Driver worker healthy | `flyctl status -a "$DRIVER_APP"` → 1 machine `started`, no crash loop. |
 | 3 | Driver identity + isolation | §3d green: `current_user = smart_scanner_pipeline_driver`, only the four allowed queues visible, `daily_bars` INSERT denied, fresh `pipeline_driver` row on `$GITSHA`. |
 | 4 | Sole scheduler leader | §3e green: only `$DRIVER_APP` has `JOB_SCHEDULER_ENABLED=true`; both prospective workers `false`; exactly one fresh `pipeline_driver` heartbeat. |
-| 5 | Frozen universe ready | the production universe is `frozen` with a stable `universe_hash`. |
-| 6 | Daily + 4H fresh | every universe symbol has `daily_bars` through the latest completed session and completed `market_bars_4h` (no stale symbols → history_refresh completes, not blocks). |
-| 7 | 3 green campaigns | `SELECT count(*) FROM prospective_campaign_registrations WHERE status='completed'` ≥ 3 (incl. `9470418d`, see recovery evidence doc). |
-| 8 | Live auto-advance proof | §4a below drove a throwaway occurrence to `succeeded` **and** §4a's machine-driven attestation passed. |
+| 5 | History-refresh worker healthy | §3f green: `flyctl status -a "$HREFRESH_APP"` → 1 machine `started`; `current_user = smart_scanner_history_warmer`; only `history_incremental_refresh` queue visible; fresh `history_refresh` heartbeat on `$GITSHA`; `MASSIVE_API_KEY` present on this app + history-warmup ONLY. |
+| 6 | Frozen universe ready | the production universe is `frozen` with a stable `universe_hash`. |
+| 7 | Provider reachable for refresh | the history-refresh worker can reach Massive (the driver itself needs no provider). History does **not** need to be pre-fresh: if stale, the driver auto-enqueues a refresh child and waits. A `history_incremental_refresh` job that lands `failed` (e.g. provider auth) is the truthful blocker to fix here. |
+| 8 | 3 green campaigns | `SELECT count(*) FROM prospective_campaign_registrations WHERE status='completed'` ≥ 3 (incl. `9470418d`, see recovery evidence doc). |
+| 9 | Live auto-advance proof | §4a below drove a throwaway occurrence to `succeeded` **and** §4a's machine-driven attestation passed. |
 
 ### 4a. Live auto-advance proof (throwaway schedule — proves the loop before arming production)
 

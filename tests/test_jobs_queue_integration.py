@@ -226,6 +226,131 @@ async def _seed_synthetic_job(conn, *, n_tasks, queue="test", task_type="synthet
     return job_id
 
 
+async def _seed_one_task(conn, *, max_attempts, queue, task_type="synthetic_test_task.v1"):
+    """Seed a job with ONE task and an explicit max_attempts (the default
+    _seed_synthetic_job hardcodes 3). Returns (job_id, task_id)."""
+    job_id = await conn.fetchval(
+        "INSERT INTO job_runs (job_type,job_contract_version,queue_name,idempotency_key,status,"
+        "total_task_count,queued_task_count) VALUES ('synthetic','synthetic.v1',$1,$2,'queued',1,1) "
+        "RETURNING id", queue, f"job:{uuid.uuid4()}")
+    payload = {"mode": "succeed"}
+    task_id = await conn.fetchval(
+        "INSERT INTO job_tasks (job_id,queue_name,task_type,task_contract_version,task_key,ordinal,"
+        "payload,payload_hash,idempotency_key,status,max_attempts) "
+        "VALUES ($1,$2,$3,$3,'t0',0,$4::jsonb,$5,$6,'queued',$7) RETURNING id",
+        job_id, queue, task_type, json.dumps(payload),
+        ident.payload_hash(payload), f"task:{uuid.uuid4()}", int(max_attempts))
+    await Q.recompute_job_counters(conn, job_id)
+    return job_id, task_id
+
+
+async def _fail_once(conn, *, task_id, queue, attempt, schedule, error_class=C.ERR_RETRYABLE):
+    """Claim the (available) task and settle ONE failed attempt exactly as
+    worker._finalize_failure does: retryable classes get a schedule-derived
+    backoff (None once the schedule is exhausted); terminal classes get None."""
+    await conn.execute("UPDATE job_tasks SET available_at=NOW() WHERE id=$1", task_id)
+    t = await Q.claim_next_task(conn, queue_name=queue, worker_id="w1", lease_seconds=900)
+    assert t is not None and str(t["id"]) == str(task_id)
+    assert int(t["attempt_count"]) == attempt          # claim increments the counter
+    backoff = C.backoff_seconds(attempt, schedule=schedule) if error_class == C.ERR_RETRYABLE else None
+    await Q.settle_task_failure(conn, task_id=task_id, worker_id="w1", safe_error_code="e",
+                               error_class=error_class, backoff_seconds_value=backoff)
+    return await conn.fetchrow("SELECT status, attempt_count FROM job_tasks WHERE id=$1", task_id)
+
+
+# =================== per-handler retry policy (Root Cause B) ================
+class TestRetryPolicy:
+    """The generic worker caps retries by the backoff SCHEDULE, not only by
+    max_attempts. The live driver (max_attempts=10) failed on attempt 3 because
+    the global schedule [60,300] exhausts there. These prove: a handler with its
+    own schedule uses its full budget; existing handlers keep the two-retry
+    default; occurrence_in_progress stays retryable; terminal fails at once; and
+    max_attempts is still a hard ceiling."""
+
+    def test_driver_schedule_uses_full_attempt_budget(self, pg):
+        """Root Cause B fix: a task carrying the DRIVER schedule (len 9,
+        max_attempts 10) stays retryable through attempt 9 and only fails at
+        attempt 10 — the exact scenario that terminally failed live at 3."""
+        from app.config import settings
+        driver_sched = list(settings.DAILY_PIPELINE_DRIVER_BACKOFF_SECONDS)
+
+        async def go():
+            q = _uq()
+            conn = await asyncpg.connect(pg["su_dsn"])
+            try:
+                job, tid = await _seed_one_task(conn, max_attempts=10, queue=q)
+                # attempts 1..9 stay retryable (occurrence_in_progress deferring)
+                for attempt in range(1, 10):
+                    r = await _fail_once(conn, task_id=tid, queue=q, attempt=attempt,
+                                         schedule=driver_sched, error_class=C.ERR_RETRYABLE)
+                    assert r["status"] == "retryable", (attempt, dict(r))
+                    assert r["attempt_count"] == attempt
+                # attempt 10 (== max_attempts) is the hard terminal ceiling
+                r = await _fail_once(conn, task_id=tid, queue=q, attempt=10,
+                                     schedule=driver_sched, error_class=C.ERR_RETRYABLE)
+                assert r["status"] == "failed" and r["attempt_count"] == 10
+                j = await conn.fetchrow("SELECT status FROM job_runs WHERE id=$1", job)
+                assert j["status"] == "failed"
+            finally:
+                await conn.close()
+        _run(go())
+
+    def test_existing_handlers_keep_two_retry_default(self, pg):
+        """A task with NO per-handler schedule (global [60,300], max_attempts 3)
+        must still terminate at attempt 3 — no accidental 10-retry widening."""
+        from app.config import settings
+        global_sched = list(settings.JOB_RETRY_BACKOFF_SECONDS)
+
+        async def go():
+            q = _uq()
+            conn = await asyncpg.connect(pg["su_dsn"])
+            try:
+                job, tid = await _seed_one_task(conn, max_attempts=3, queue=q)
+                r1 = await _fail_once(conn, task_id=tid, queue=q, attempt=1, schedule=global_sched)
+                r2 = await _fail_once(conn, task_id=tid, queue=q, attempt=2, schedule=global_sched)
+                r3 = await _fail_once(conn, task_id=tid, queue=q, attempt=3, schedule=global_sched)
+                assert r1["status"] == "retryable" and r2["status"] == "retryable"
+                assert r3["status"] == "failed" and r3["attempt_count"] == 3
+            finally:
+                await conn.close()
+        _run(go())
+
+    def test_terminal_error_fails_immediately_regardless_of_budget(self, pg):
+        """A terminal error fails on the FIRST attempt even with a 10-attempt
+        budget and a long schedule."""
+        async def go():
+            q = _uq()
+            conn = await asyncpg.connect(pg["su_dsn"])
+            try:
+                job, tid = await _seed_one_task(conn, max_attempts=10, queue=q)
+                r = await _fail_once(conn, task_id=tid, queue=q, attempt=1,
+                                     schedule=[60] * 9, error_class=C.ERR_TERMINAL)
+                assert r["status"] == "failed" and r["attempt_count"] == 1
+            finally:
+                await conn.close()
+        _run(go())
+
+    def test_max_attempts_is_hard_ceiling_even_when_backoff_remains(self, pg):
+        """max_attempts wins even when the schedule STILL has a backoff to give:
+        max_attempts=3 with a length-5 schedule terminates at attempt 3, not 5.
+        Proves the ceiling is not solely a function of schedule length."""
+        async def go():
+            q = _uq()
+            conn = await asyncpg.connect(pg["su_dsn"])
+            try:
+                long_sched = [10, 10, 10, 10, 10]   # backoff defined well past attempt 3
+                job, tid = await _seed_one_task(conn, max_attempts=3, queue=q)
+                r1 = await _fail_once(conn, task_id=tid, queue=q, attempt=1, schedule=long_sched)
+                r2 = await _fail_once(conn, task_id=tid, queue=q, attempt=2, schedule=long_sched)
+                assert r1["status"] == "retryable" and r2["status"] == "retryable"
+                # attempt 3: backoff_seconds(3, long)=10 (NOT None) yet still terminal
+                r3 = await _fail_once(conn, task_id=tid, queue=q, attempt=3, schedule=long_sched)
+                assert r3["status"] == "failed" and r3["attempt_count"] == 3
+            finally:
+                await conn.close()
+        _run(go())
+
+
 # ============================ queue mechanics ==============================
 class TestQueueMechanics:
     def test_migration_018_tables_and_template_present(self, pg):

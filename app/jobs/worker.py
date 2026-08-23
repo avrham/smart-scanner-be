@@ -318,7 +318,15 @@ class JobWorker:
             if completed is not None:  # already durably complete → succeed
                 await Q.reconcile_task_to_succeeded(conn, task_id=task_id, result_summary=completed)
                 return
-        backoff = C.backoff_seconds(attempt, schedule=list(settings.JOB_RETRY_BACKOFF_SECONDS)) \
+        # Retry backoff schedule: a handler MAY declare its own (so a task type
+        # with max_attempts > len(global)+1 can actually use its budget); else
+        # fall back to the GLOBAL schedule (unchanged bounded two-retry default).
+        # `attempt` is the just-completed attempt number; backoff_seconds returns
+        # None once the schedule is exhausted → settle_task_failure then routes
+        # the task terminal. max_attempts remains an independent hard ceiling.
+        schedule = list(spec.retry_backoff_schedule) if spec.retry_backoff_schedule \
+            else list(settings.JOB_RETRY_BACKOFF_SECONDS)
+        backoff = C.backoff_seconds(attempt, schedule=schedule) \
             if error_class == C.ERR_RETRYABLE else None
         await Q.settle_task_failure(
             conn, task_id=task_id, worker_id=self.worker_id, safe_error_code=safe_code,

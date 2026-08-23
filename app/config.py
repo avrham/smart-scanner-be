@@ -247,6 +247,16 @@ class Settings(BaseSettings):
     # set the ceiling to 0 so a single advance either finishes or defers at once.
     DAILY_PIPELINE_DRIVER_MAX_WAIT_SECONDS: int = 10800   # 3h (a slow 25-symbol eval)
     DAILY_PIPELINE_DRIVER_POLL_SECONDS: int = 30
+    # Per-handler retry backoff for the driver task (see registry HandlerSpec.
+    # retry_backoff_schedule). The GLOBAL JOB_RETRY_BACKOFF_SECONDS list has only
+    # two entries, which caps ANY task at 3 attempts regardless of max_attempts;
+    # the driver legitimately DEFERS ("occurrence_in_progress") many times while
+    # the pipeline's async children (history refresh, campaign, outcomes) run, so
+    # it needs a schedule long enough to use its max_attempts=10 budget. Length 9
+    # → 10 attempts total (the 10th failure is always terminal). Modest, bounded
+    # waits between defers (the internal-wait loop already absorbs up to ~3h per
+    # claim); this is NOT infinite retry — attempt 10 is a hard ceiling.
+    DAILY_PIPELINE_DRIVER_BACKOFF_SECONDS: List[int] = [60, 120, 300, 300, 600, 600, 900, 900, 1800]
     # A worker whose last heartbeat is older than this is considered stale/dead
     # (its leased/running tasks become eligible for lease-expiry reconciliation).
     JOB_WORKER_STALE_SECONDS: int = 90

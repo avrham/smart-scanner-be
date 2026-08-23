@@ -21,7 +21,7 @@ live-enabled now.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.config import settings
 from app.jobs import contracts as C
@@ -40,6 +40,16 @@ class HandlerSpec:
     probe_fn: Optional[Callable[..., Awaitable[Optional[Dict[str, Any]]]]]
     #: default per-task attempt budget.
     max_attempts: int = 3
+    #: OPTIONAL per-handler retry backoff schedule (seconds before each retry).
+    #: ``schedule[k-1]`` is the delay after the k-th failed attempt; a handler
+    #: with ``max_attempts=N`` that wants to actually use all N attempts must
+    #: supply a schedule of length ``N-1`` (the N-th failure is always terminal).
+    #: When None, the worker falls back to the GLOBAL
+    #: ``settings.JOB_RETRY_BACKOFF_SECONDS`` (default [60, 300] → 3 attempts),
+    #: preserving the existing bounded two-retry behaviour for every handler that
+    #: does not opt in. See app.jobs.worker._finalize_failure and
+    #: app.jobs.contracts.backoff_seconds.
+    retry_backoff_schedule: Optional[List[int]] = None
     #: whether this handler may be selected in a normal (non-test) deployment.
     production_enabled: bool = False
     is_test_handler: bool = False
@@ -104,6 +114,17 @@ def _install_default_handlers() -> None:
         max_attempts=getattr(settings, "JOB_MAX_ATTEMPTS_DEFAULT", 3),
         production_enabled=True,
     ))
+    from app.jobs.handlers import history_refresh_worker as _hrw
+    from app.jobs import history_refresh as _hr
+    register(HandlerSpec(
+        task_type=_hr.HISTORY_REFRESH_TASK,
+        queue_name=_hr.HISTORY_REFRESH_QUEUE,
+        child_callable=_hrw.run_history_incremental_refresh_task,
+        probe_fn=_hrw.probe_history_refresh_durable_output,
+        max_attempts=_hr.HISTORY_REFRESH_MAX_ATTEMPTS,
+        # no per-handler schedule → global bounded two-retry (rate-limit friendly).
+        production_enabled=True,
+    ))
     from app.jobs.handlers import daily_pipeline_driver as _dpd
     from app.jobs import daily_pipeline as _dp
     register(HandlerSpec(
@@ -112,6 +133,10 @@ def _install_default_handlers() -> None:
         child_callable=_dpd.run_daily_pipeline_advance_task,
         probe_fn=_dpd.probe_daily_pipeline_advance_durable_output,
         max_attempts=_dp.DAILY_PIPELINE_DRIVER_MAX_ATTEMPTS,
+        # Own backoff schedule so the driver can actually use its 10-attempt
+        # budget across repeated occurrence_in_progress defers (the global
+        # 2-entry list would cap it at 3, which is exactly the live failure).
+        retry_backoff_schedule=list(settings.DAILY_PIPELINE_DRIVER_BACKOFF_SECONDS),
         production_enabled=True,
     ))
     # A safe, synthetic test handler for controlled retry/crash tests. NEVER

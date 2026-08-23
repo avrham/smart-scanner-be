@@ -47,7 +47,7 @@ $fn$ LANGUAGE plpgsql;
 DO $$
 DECLARE
   driver constant text := 'smart_scanner_pipeline_driver';
-  queues constant text := '(''daily_pipeline_driver'',''daily_pipeline'',''prospective'',''prospective_outcomes'')';
+  queues constant text := '(''daily_pipeline_driver'',''daily_pipeline'',''prospective'',''prospective_outcomes'',''history_incremental_refresh'')';
   t text;
   full_row_rels constant text[] := ARRAY[
     'public.job_task_attempts', 'public.job_events', 'public.job_workers'];

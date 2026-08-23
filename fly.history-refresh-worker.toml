@@ -1,0 +1,66 @@
+# fly.history-refresh-worker.toml — smart-scanner-be-history-refresh-worker-staging
+#
+# DEDICATED NON-HTTP durable worker for history_incremental_refresh_symbol.v1.
+# Runs `python -m app.jobs.worker` continuously (NO http_service / NO TCP service
+# -> no Fly Proxy, no autostart/autostop). It claims ONLY queue_name=
+# 'history_incremental_refresh' tasks (concurrency 1 — the history-warmup
+# advisory lock allows one execution at a time anyway) and runs the provider-
+# backed history_incremental_refresh_execute_service per symbol.
+#
+# This is the ONLY automated component (besides the history-warmup HTTP app and
+# the maintenance app) that carries the Massive credential (MASSIVE_API_KEY, a
+# SECRET). The pipeline-driver / prospective / outcome apps deliberately do NOT.
+# It connects via the least-privilege smart_scanner_history_warmer role
+# (JOB_WORKER_DATABASE_URL, a SECRET) — which already owns daily_bars /
+# market_bars_4h / history_warmup_runs writes and, via
+# create_history_refresh_worker_grants.sql, queue-scoped job_runs/job_tasks
+# access to 'history_incremental_refresh' ONLY (it can never claim a prospective,
+# outcome, or driver task). Git SHA supplied at deploy via --build-arg APP_GIT_SHA.
+
+app = 'smart-scanner-be-history-refresh-worker-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_ENVIRONMENT = 'history-refresh-worker-staging'
+  # Not an HTTP-mode app — every HTTP-mode flag is false. In particular
+  # HISTORY_WARMUP_ONLY_MODE stays false: the worker calls the refresh SERVICE
+  # directly (not the mode-gated HTTP route).
+  PROSPECTIVE_CAMPAIGN_ONLY_MODE = 'false'
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  HISTORY_WARMUP_ONLY_MODE = 'false'
+  # The legacy in-process HTTP scheduler MUST be off: the refresh service refuses
+  # (409 scheduler_enabled) when ENABLE_SCHEDULER is true.
+  ENABLE_SCHEDULER = 'false'
+  JOB_WORKER_ENABLED = 'true'
+  JOB_WORKER_TYPE = 'history_refresh'
+  JOB_WORKER_QUEUES = 'history_incremental_refresh'
+  JOB_WORKER_CONCURRENCY = '1'
+  # Scheduler leader lives ONLY on the pipeline-driver worker; this worker never
+  # becomes leader.
+  JOB_SCHEDULER_ENABLED = 'false'
+  JOB_ALLOW_TEST_HANDLERS = 'false'
+  REQUIRE_WORKER_TOKEN = 'true'
+  # Non-HTTP worker: token never used for auth; present only to satisfy the
+  # required Settings field at boot. NOT a secret; carries no privilege.
+  WORKER_TOKEN = 'unused-placeholder-non-http-worker'
+  # Provider NAME here; the MASSIVE_API_KEY value is a SECRET (fly secrets set).
+  MARKET_DATA_PROVIDER = 'massive'
+  LOG_FORMAT = 'json'
+  JOB_WORKER_EXPECTED_DB_ROLE = 'smart_scanner_history_warmer'
+
+# No [http_service] and no [[services]] — no exposed port, never started/stopped
+# by inbound traffic, runs continuously.
+[processes]
+  worker = 'python -m app.jobs.worker'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512
+  processes = ['worker']

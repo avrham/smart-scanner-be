@@ -128,6 +128,32 @@ def pipeline_occurrence_identity(*, schedule_code: str, schedule_version: int,
     })
 
 
+def history_refresh_job_idempotency_key(*, universe_hash: str, resolved_session_date: str,
+                                        contract_version: str) -> str:
+    """One history-refresh job per (frozen universe, resolved completed session,
+    refresh contract). A repeated daily-pipeline advance for the same session +
+    universe recognizes the SAME job — never a duplicate provider batch."""
+    return _sha256("hrj", {
+        "universe_hash": str(universe_hash),
+        "resolved_session_date": str(resolved_session_date),
+        "contract_version": contract_version,
+    })
+
+
+def history_refresh_task_idempotency_key(*, universe_hash: str, resolved_session_date: str,
+                                         symbol: str, contract_version: str) -> str:
+    """One history-refresh task per (universe, resolved session, symbol,
+    contract). Stable for the occurrence so a re-enqueue never duplicates a
+    symbol's task; the provider-level idempotency (history_warmup_runs identity)
+    additionally prevents a duplicate provider request."""
+    return _sha256("hrt", {
+        "universe_hash": str(universe_hash),
+        "resolved_session_date": str(resolved_session_date),
+        "symbol": str(symbol),
+        "contract_version": contract_version,
+    })
+
+
 __all__ = [
     "payload_hash",
     "job_idempotency_key",
@@ -136,4 +162,6 @@ __all__ = [
     "prospective_outcome_task_idempotency_key",
     "schedule_occurrence_idempotency_key",
     "pipeline_occurrence_identity",
+    "history_refresh_job_idempotency_key",
+    "history_refresh_task_idempotency_key",
 ]

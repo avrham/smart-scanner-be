@@ -2998,22 +2998,26 @@ async def history_warmup_incremental_preflight(
     return preflight
 
 
-@router.post("/history-warmup/incremental/execute")
-async def history_warmup_incremental_execute(
-    _: str = Depends(get_worker_token),
-    db: asyncpg.Connection = Depends(get_db),
-    body: Any = Body(...),
-):
-    """The bounded incremental-refresh mutation route
-    (`history_incremental_refresh.v1`). ONE symbol per call (matches the
-    existing single-symbol-per-execute granularity); server independently
-    recomputes the target session + per-symbol gap; advisory-locked (SAME
-    lock as initial warmup — only one history-warmup execution of ANY kind
-    runs at a time on this Machine); idempotent by deterministic
-    (symbol, latest_local_session, target_completed_session) identity;
-    provider obtained via the existing abstraction only after all gates pass
-    and called OUTSIDE any open transaction."""
-    _require_history_warmup_mode()
+async def history_incremental_refresh_execute_service(db, *, body, now=None):
+    """INTERNAL bounded incremental-refresh service (no HTTP, no worker token, no
+    mode gate). ONE symbol per call (matches the single-symbol-per-execute
+    granularity); server independently recomputes the target session + per-symbol
+    gap; advisory-locked (SAME lock as initial warmup — only one history-warmup
+    execution of ANY kind runs at a time on this Machine); idempotent by
+    deterministic (symbol, latest_local_session, target_completed_session)
+    identity; provider obtained via the existing abstraction only after all gates
+    pass and called OUTSIDE any open transaction.
+
+    Operational-auth architecture: the automated path (the durable
+    history-refresh worker in ``app.jobs.handlers.history_refresh_worker``) calls
+    THIS function DIRECTLY against the DB as the least-privilege
+    ``smart_scanner_history_warmer`` role — the ONLY component besides the
+    history-warmup HTTP app that carries the provider credential. It never makes a
+    self-HTTP call and never needs a human WORKER_TOKEN. The thin
+    ``history_warmup_incremental_execute`` route below is only the operator/
+    control-plane wrapper that adds the worker-token + warmup-mode gates. It still
+    raises ``HTTPException`` (409 = transient/defer, 4xx = terminal) so both
+    callers share one classification; the worker maps those to retry/terminal."""
     import json as _json
     import uuid as _uuid
     from datetime import date, datetime, timezone
@@ -3034,7 +3038,7 @@ async def history_warmup_incremental_execute(
     if settings.ENABLE_SCHEDULER:
         raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
     lease_seconds = max(1, int(settings.HISTORY_WARMUP_EXECUTION_LEASE_SECONDS))
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
 
     if not isinstance(body, dict):
         raise HTTPException(status_code=422, detail="request body must be a JSON object")
@@ -3282,6 +3286,21 @@ async def history_warmup_incremental_execute(
         return result
     finally:
         await db.fetchval("SELECT pg_advisory_unlock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
+
+
+@router.post("/history-warmup/incremental/execute")
+async def history_warmup_incremental_execute(
+    _: str = Depends(get_worker_token),
+    db: asyncpg.Connection = Depends(get_db),
+    body: Any = Body(...),
+):
+    """Operator/control-plane HTTP wrapper (worker-token + warmup-mode gated)
+    around ``history_incremental_refresh_execute_service``. The automated
+    daily-pipeline path does NOT use this route — the durable history-refresh
+    worker calls the service directly, so automation never depends on a
+    human-held WORKER_TOKEN or a self-HTTP call between Fly apps."""
+    _require_history_warmup_mode()
+    return await history_incremental_refresh_execute_service(db, body=body)
 
 
 # --------------------------------------------------------------------------- #
@@ -4195,21 +4214,66 @@ async def advance_daily_pipeline_service(db: asyncpg.Connection, *, body: Any):
     occurrence_id = str(occ["id"])
 
     if stage == DP.STAGE_HISTORY_REFRESH:
-        rows = await db.fetch(
-            "SELECT symbol, MAX(trading_date) AS latest FROM daily_bars WHERE symbol = ANY($1) GROUP BY symbol",
-            universe["symbols"])
-        latest_by_symbol = {r["symbol"]: r["latest"] for r in rows}
-        target = resolve_latest_completed_session(now)
-        stale = sorted(s for s in universe["symbols"]
-                       if latest_by_symbol.get(s) is None or latest_by_symbol[s] < target)
-        if not stale:
+        # AUTOMATIC history refresh: the driver never calls a provider. When the
+        # frozen universe's daily+4H history is stale it enqueues (or recognizes)
+        # ONE durable refresh job whose per-symbol tasks are executed by the
+        # dedicated history-refresh worker (the only automated component with the
+        # provider credential). The stage WAITS (in_progress) while that child
+        # job runs, re-checks readiness, and advances — no operator HTTP call.
+        from app.jobs import history_refresh as HR
+        summary = DP.pipeline_summary(occ)
+        history_job_id = summary.get("history_job_id")
+        # Recompute readiness the SAME way the campaign stage gates on it
+        # (daily + 4H, per symbol). Once every symbol is both-ready the stage is
+        # done regardless of child-job bookkeeping — this also resolves the
+        # "child job succeeded and the universe is now current" case cleanly.
+        readiness = await _prospective_readiness(db, universe, now=now)
+        both_ready = int(readiness.get("both_ready_count") or 0)
+        total = len(universe["symbols"])
+        if both_ready == total:
             occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-                "state": DP.STAGE_STATE_COMPLETED, "symbols_checked": len(universe["symbols"])})
+                "state": DP.STAGE_STATE_COMPLETED, "symbols_checked": total,
+                "history_job_id": history_job_id})
+        elif history_job_id:
+            # Resume the recognized child job (idempotent across restarts).
+            jstatus = await HR.history_refresh_job_status(db, history_job_id)
+            if jstatus == "succeeded":
+                # Provider work finished yet the universe is STILL not current →
+                # the provider genuinely lacks the data to reach the target. This
+                # is a real DATA-intervention condition (not normal waiting), so
+                # BLOCKED is the truthful state.
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_BLOCKED, "reason": "history_incomplete_after_refresh",
+                    "history_job_id": history_job_id, "not_ready_count": total - both_ready,
+                    "operator_action": "inspect the history_incremental_refresh job + provider "
+                                       "coverage for the not-ready symbols"})
+            elif jstatus in ("failed", "cancelled"):
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "history_refresh_job_failed",
+                    "history_job_id": history_job_id})
+            else:
+                # queued / running / retryable → normal async work in flight; WAIT.
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "history_refresh_job",
+                    "history_job_id": history_job_id, "not_ready_count": total - both_ready})
         else:
+            # Stale and no child job yet → enqueue ONE bounded refresh job for the
+            # frozen universe + resolved session (idempotent; the driver only
+            # enqueues — provider work runs in the history-refresh worker).
+            try:
+                enq = await HR.enqueue_history_incremental_refresh(
+                    db, universe_id=universe["universe_id"], universe_hash=universe["universe_hash"],
+                    symbols=universe["symbols"], resolved_session_date=resolved_session_date,
+                    contract_version=HR.HISTORY_REFRESH_CONTRACT_VERSION_V2,
+                    requested_by="daily_pipeline")
+            except JobError as e:
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_TERMINAL_FAILURE, "safe_error_code": e.safe_error_code})
+                return DP.build_status_view(occ)
             occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-                "state": DP.STAGE_STATE_BLOCKED, "stale_symbol_count": len(stale),
-                "operator_action": "POST /api/admin/history-warmup/incremental/execute "
-                                   "per stale symbol on smart-scanner-be-history-warmup-staging"})
+                "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "history_refresh_job",
+                "history_job_id": enq.get("job_id"), "history_refresh_status": enq.get("status"),
+                "not_ready_count": total - both_ready})
 
     elif stage == DP.STAGE_PROSPECTIVE_CAMPAIGN:
         exp = settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE
