@@ -73,9 +73,19 @@ it holds **no** `DELETE` anywhere, AND — new — that the qscope RLS policy on
 non-converged live upgrade is caught here rather than at the next live proof).
 If any assertion fails, STOP.
 
-> Ordering matters: run §1 → §1b → verifier and confirm green **before** §3/§3f.
-> Deploying the driver against a stale four-queue policy would make the driver's
-> history-refresh enqueue silently RLS-fail at the next live proof.
+> **Pre-deploy DB gate order (all green BEFORE §3/§3f deploy any worker):**
+> 1. `create_pipeline_driver.sql` (create/update the driver role)
+> 2. `create_pipeline_driver_rls_policies.sql` (convergent driver RLS)
+> 3. `create_history_refresh_worker_grants.sql` (§1b — warmer queue grants/RLS)
+> 4. `verify_pipeline_driver.sql` (driver role + effective five-queue scope)
+> 5. `verify_history_refresh_worker.sql` (warmer combined contract + effective scope)
+> → ONLY THEN deploy the driver (§3) and the history-refresh worker (§3f).
+>
+> Deploying against a stale/non-converged policy would make the driver's
+> history-refresh enqueue (or the warmer's claim) silently RLS-fail at the next
+> live proof. The production schedule stays disabled and `PROOF-DAILY-PIPELINE`
+> stays paused throughout; the failed-proof rows are audit evidence — never
+> modified or deleted.
 
 Build the driver DSN (role `smart_scanner_pipeline_driver`, the password above)
 for the next step — this is the ONLY place the password is used:
@@ -101,8 +111,23 @@ Expected tail: `history-refresh worker grants configured.` This grants the
 warmer role SELECT/INSERT/UPDATE on `job_runs`/`job_tasks` **RLS-scoped to the
 one queue** (it can never claim a prospective/outcome/driver task) plus
 attempts/events/workers; NO `job_schedules`/`job_dependencies`, NO `DELETE`.
-The driver's own RLS scope already includes `history_incremental_refresh` (it
+The qscope policy is **convergent** (DROP+CREATE), same as the driver's. The
+driver's own RLS scope already includes `history_incremental_refresh` (it
 enqueues + reads the child job) via `create_pipeline_driver_rls_policies.sql`.
+
+Then verify the combined warmer contract (role safety + effective queue scope +
+required queue-plane privileges + intact history-warmup data-plane + forbidden
+strategy/campaign writes) — MUST exit 0:
+
+```bash
+psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -f ops/sql/verify_history_refresh_worker.sql
+```
+
+`verify_history_refresh_worker.sql` asserts the `smart_scanner_history_warmer`
+qscope on `job_runs`/`job_tasks` permits **exactly** `history_incremental_refresh`
+(effective RLS, not just grants) — so a stale/wrong predicate FAILS here — while
+confirming the existing history-warmup data-plane writes remain intact and
+strategy/campaign writes stay forbidden. If any assertion fails, STOP.
 
 Build the warmer DSN for the worker secret (§3f) — the warmer password is the
 one set when `create_shadow_history_warmer.sql` was applied; never printed:
