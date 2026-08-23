@@ -122,7 +122,9 @@ def _install_default_handlers() -> None:
         child_callable=_hrw.run_history_incremental_refresh_task,
         probe_fn=_hrw.probe_history_refresh_durable_output,
         max_attempts=_hr.HISTORY_REFRESH_MAX_ATTEMPTS,
-        # no per-handler schedule → global bounded two-retry (rate-limit friendly).
+        # No per-handler schedule → global bounded two-retry, reserved for GENUINE
+        # provider errors. The shared history-warmup cooldown/lock 409 is absorbed
+        # by a bounded in-task wait in the handler, not by these queue attempts.
         production_enabled=True,
     ))
     from app.jobs.handlers import daily_pipeline_driver as _dpd

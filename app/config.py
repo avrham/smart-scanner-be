@@ -257,6 +257,18 @@ class Settings(BaseSettings):
     # waits between defers (the internal-wait loop already absorbs up to ~3h per
     # claim); this is NOT infinite retry — attempt 10 is a hard ceiling.
     DAILY_PIPELINE_DRIVER_BACKOFF_SECONDS: List[int] = [60, 120, 300, 300, 600, 600, 900, 900, 1800]
+    # History-refresh task: the history-warmup service enforces a SHARED execution
+    # cooldown / advisory lock, so a serially-claimed symbol often gets a KNOWN
+    # transient 409 while the window from the previous symbol is still active. The
+    # handler absorbs that 409 with a BOUNDED in-task wait (sleep the
+    # server-indicated Retry-After + a small margin, recompute state, retry within
+    # the SAME claim) instead of burning a queue-level attempt. MAX_WAIT caps the
+    # total in-task wait (covers the resolved cooldown interval + lease); POLL is
+    # the fallback when a lock 409 carries no numeric hint. This is bounded — it
+    # never spins, and defers to a queue retry once the ceiling is reached.
+    HISTORY_REFRESH_TASK_MAX_WAIT_SECONDS: int = 1800   # 30m ceiling per claim
+    HISTORY_REFRESH_TASK_COOLDOWN_MARGIN_SECONDS: int = 3
+    HISTORY_REFRESH_TASK_POLL_SECONDS: int = 5
     # A worker whose last heartbeat is older than this is considered stale/dead
     # (its leased/running tasks become eligible for lease-expiry reconciliation).
     JOB_WORKER_STALE_SECONDS: int = 90

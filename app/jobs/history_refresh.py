@@ -36,8 +36,12 @@ HISTORY_REFRESH_JOB_TYPE = "history_incremental_refresh"
 HISTORY_REFRESH_QUEUE = "history_incremental_refresh"
 HISTORY_REFRESH_TASK = "history_incremental_refresh_symbol.v1"
 HISTORY_REFRESH_JOB_CONTRACT = "history_incremental_refresh_job.v1"
-# Per-symbol provider refresh: a rate-limit / transient provider error is
-# retryable; keep the bounded global two-retry budget (default schedule).
+# Per-symbol provider refresh keeps the bounded global two-retry budget (default
+# schedule) for GENUINE provider errors (e.g. a 429 rate-limit). It is NOT relied
+# on for the shared history-warmup execution cooldown / lock: that KNOWN transient
+# 409 is absorbed by a bounded in-task wait in history_refresh_worker (see
+# HISTORY_REFRESH_TASK_MAX_WAIT_SECONDS), so a 25-symbol job never exhausts these
+# attempts just because symbols wake into the same cooldown window.
 HISTORY_REFRESH_MAX_ATTEMPTS = int(getattr(settings, "JOB_MAX_ATTEMPTS_DEFAULT", 3))
 
 # the refresh contract the worker runs (daily + 4H in one bounded unit)
