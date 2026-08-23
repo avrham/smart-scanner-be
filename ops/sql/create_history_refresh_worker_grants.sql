@@ -58,26 +58,25 @@ DECLARE
     'public.job_task_attempts', 'public.job_events', 'public.job_workers'];
 BEGIN
   -- job_runs / job_tasks are queue-scoped (the actual privilege boundary).
+  -- CONVERGENT DROP+CREATE (same rationale as the pipeline-driver RLS): re-running
+  -- after a future predicate change upgrades the live policy rather than leaving
+  -- a stale CREATE-if-missing definition in place.
   IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid='public.job_runs'::regclass AND relrowsecurity) THEN
     EXECUTE 'ALTER TABLE public.job_runs ENABLE ROW LEVEL SECURITY';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid='public.job_runs'::regclass
-                 AND polname=warmer||'_qscope') THEN
-    EXECUTE format(
-      'CREATE POLICY %I ON public.job_runs AS PERMISSIVE FOR ALL TO %I '
-      'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
-      warmer||'_qscope', warmer, q, q);
-  END IF;
+  EXECUTE format('DROP POLICY IF EXISTS %I ON public.job_runs', warmer||'_qscope');
+  EXECUTE format(
+    'CREATE POLICY %I ON public.job_runs AS PERMISSIVE FOR ALL TO %I '
+    'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
+    warmer||'_qscope', warmer, q, q);
   IF NOT EXISTS (SELECT 1 FROM pg_class WHERE oid='public.job_tasks'::regclass AND relrowsecurity) THEN
     EXECUTE 'ALTER TABLE public.job_tasks ENABLE ROW LEVEL SECURITY';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid='public.job_tasks'::regclass
-                 AND polname=warmer||'_qscope') THEN
-    EXECUTE format(
-      'CREATE POLICY %I ON public.job_tasks AS PERMISSIVE FOR ALL TO %I '
-      'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
-      warmer||'_qscope', warmer, q, q);
-  END IF;
+  EXECUTE format('DROP POLICY IF EXISTS %I ON public.job_tasks', warmer||'_qscope');
+  EXECUTE format(
+    'CREATE POLICY %I ON public.job_tasks AS PERMISSIVE FOR ALL TO %I '
+    'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
+    warmer||'_qscope', warmer, q, q);
 
   -- attempts/events/workers: full-row (only ever created for a task the worker
   -- already legitimately claimed on the scoped queue).

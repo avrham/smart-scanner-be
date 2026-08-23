@@ -43,16 +43,23 @@ export GITSHA=$(git rev-parse HEAD)     # the current driver + history-refresh c
 ## 1. Provision the least-privilege driver DB role (idempotent)
 
 Against the **isolated staging Fly Postgres admin** connection (`$ADMIN_DSN`)
-and target database (`$DBNAME`, e.g. `warmup`):
+and target database (`$DBNAME`, e.g. `warmup`). Apply ALL of these DB steps —
+driver role, **driver RLS upgrade**, **history-refresh worker grants** (§1b),
+and the **strengthened verifier** — BEFORE deploying either worker (§3, §3f).
+The RLS script is **convergent** (DROP+CREATE of the queue-scoped policy), so a
+live DB carrying the older four-queue predicate is upgraded to the five-queue
+set that now includes `history_incremental_refresh` — a plain re-run would
+otherwise leave the driver RLS-blocked from the new history queue.
 
 ```bash
 psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 \
   -v pipeline_driver_password="$DRIVER_DB_PASSWORD" -v db_name="$DBNAME" \
   -f ops/sql/create_pipeline_driver.sql
 
+# CONVERGENT: upgrades an existing (e.g. four-queue) qscope policy in place.
 psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -f ops/sql/create_pipeline_driver_rls_policies.sql
 
-# MUST print all assertions OK and exit 0:
+# MUST print all assertions OK and exit 0 — now includes EFFECTIVE queue-scope:
 psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -f ops/sql/verify_pipeline_driver.sql
 ```
 
@@ -60,7 +67,15 @@ psql "$ADMIN_DSN" -v ON_ERROR_STOP=1 -f ops/sql/verify_pipeline_driver.sql
 (`NOSUPERUSER/NOCREATEDB/NOCREATEROLE/NOREPLICATION/NOBYPASSRLS/NOINHERIT`), it
 has **no** write on bars/runs/pairs/evaluations/outcomes, it **has** the
 required writes (registrations, `job_runs.UPDATE`, `job_tasks.INSERT+UPDATE`),
-and it holds **no** `DELETE` anywhere. If any assertion fails, STOP.
+it holds **no** `DELETE` anywhere, AND — new — that the qscope RLS policy on
+`job_runs`/`job_tasks` permits **exactly** the five queues incl
+`history_incremental_refresh` (it FAILS on a stale four-queue predicate, so a
+non-converged live upgrade is caught here rather than at the next live proof).
+If any assertion fails, STOP.
+
+> Ordering matters: run §1 → §1b → verifier and confirm green **before** §3/§3f.
+> Deploying the driver against a stale four-queue policy would make the driver's
+> history-refresh enqueue silently RLS-fail at the next live proof.
 
 Build the driver DSN (role `smart_scanner_pipeline_driver`, the password above)
 for the next step — this is the ONLY place the password is used:

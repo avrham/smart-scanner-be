@@ -45,4 +45,55 @@ BEGIN
 END
 $$;
 
+-- ---------------------------------------------------------------------------
+-- EFFECTIVE queue-scope verification (not just grants). Proves the qscope RLS
+-- policy on job_runs AND job_tasks permits EXACTLY the intended five queues —
+-- including history_incremental_refresh — so a stale/old predicate (e.g. the
+-- previous four-queue definition that a CREATE-if-missing upgrade would leave
+-- behind) FAILS here instead of silently passing. Asserted from the policy
+-- definition (deterministic; no SET ROLE, no probe rows).
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+  driver   constant text := 'smart_scanner_pipeline_driver';
+  expected constant text := 'daily_pipeline,daily_pipeline_driver,'
+                            'history_incremental_refresh,prospective,prospective_outcomes';
+  rel text;
+  polcount int;
+  applies boolean;
+  using_set text;
+  check_set text;
+BEGIN
+  FOREACH rel IN ARRAY ARRAY['job_runs','job_tasks'] LOOP
+    SELECT count(*) INTO polcount FROM pg_policies
+      WHERE schemaname='public' AND tablename=rel AND policyname=driver||'_qscope';
+    IF polcount = 0 THEN
+      RAISE EXCEPTION 'qscope policy missing on public.% (expected %)', rel, driver||'_qscope';
+    END IF;
+    SELECT (driver = ANY(roles)) INTO applies FROM pg_policies
+      WHERE schemaname='public' AND tablename=rel AND policyname=driver||'_qscope';
+    IF applies IS NOT TRUE THEN
+      RAISE EXCEPTION 'qscope policy on public.% does not apply to role %', rel, driver;
+    END IF;
+    -- distinct + sorted queue literals in the USING (qual) expression
+    SELECT string_agg(q, ',' ORDER BY q) INTO using_set FROM (
+      SELECT DISTINCT (regexp_matches(qual, '''([^'']+)''', 'g'))[1] AS q
+      FROM pg_policies WHERE schemaname='public' AND tablename=rel AND policyname=driver||'_qscope') s;
+    IF using_set IS DISTINCT FROM expected THEN
+      RAISE EXCEPTION 'qscope USING on public.% allows [%] but must allow exactly [%]',
+        rel, using_set, expected;
+    END IF;
+    -- and the WITH CHECK (insert/update) expression must match the same set
+    SELECT string_agg(q, ',' ORDER BY q) INTO check_set FROM (
+      SELECT DISTINCT (regexp_matches(COALESCE(with_check, qual), '''([^'']+)''', 'g'))[1] AS q
+      FROM pg_policies WHERE schemaname='public' AND tablename=rel AND policyname=driver||'_qscope') s;
+    IF check_set IS DISTINCT FROM expected THEN
+      RAISE EXCEPTION 'qscope WITH CHECK on public.% allows [%] but must allow exactly [%]',
+        rel, check_set, expected;
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'pipeline-driver effective queue scope verified (exactly 5 queues incl history_incremental_refresh).';
+END
+$$;
+
 \echo 'pipeline-driver role verified.'

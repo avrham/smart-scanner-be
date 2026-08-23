@@ -2,18 +2,23 @@
 -- create_pipeline_driver_rls_policies.sql — RLS for smart_scanner_pipeline_driver
 --
 -- When RLS is enabled on a relation a grant alone is inert without a policy.
---   * job_runs/job_tasks are QUEUE-SCOPED to exactly the four queues the driver
+--   * job_runs/job_tasks are QUEUE-SCOPED to exactly the FIVE queues the driver
 --     legitimately touches: 'daily_pipeline_driver' (claim its own task),
 --     'daily_pipeline' (create/advance the occurrence), 'prospective' (enqueue
---     the campaign job) and 'prospective_outcomes' (enqueue the outcome job).
---     It is structurally unable to see/claim any OTHER queue's rows.
+--     the campaign job), 'prospective_outcomes' (enqueue the outcome job) and
+--     'history_incremental_refresh' (enqueue + read the durable history-refresh
+--     child job). It is structurally unable to see/claim any OTHER queue's rows.
 --   * job_task_attempts/job_events/job_workers/job_schedules/job_dependencies
 --     stay full-row (an attempt/event only ever exists for a task the driver
 --     already legitimately touched).
 --   * prospective_campaign_registrations: SELECT/INSERT/UPDATE (register +
 --     status), full-row.
 --   * the read relations get SELECT-only policies (advance reads them).
--- Idempotent; run after create_pipeline_driver.sql.
+-- Idempotent AND CONVERGENT: the queue-scoped qscope policies are DROP+CREATEd
+-- so re-running this on a live DB that already has an OLDER predicate (e.g. the
+-- previous four-queue definition) upgrades it to the exact current set — never a
+-- no-op CREATE-if-missing that would silently leave the stale predicate in place.
+-- Run after create_pipeline_driver.sql.
 -- =============================================================================
 
 \set ON_ERROR_STOP on
@@ -62,21 +67,20 @@ BEGIN
     RAISE EXCEPTION 'role % does not exist (run create_pipeline_driver.sql first)', driver;
   END IF;
 
-  -- queue-scoped job_runs/job_tasks (the actual privilege boundary)
-  IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = 'public.job_runs'::regclass
-                 AND polname = driver||'_qscope') THEN
-    EXECUTE format(
-      'CREATE POLICY %I ON public.job_runs AS PERMISSIVE FOR ALL TO %I '
-      'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
-      driver||'_qscope', driver, queues, queues);
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = 'public.job_tasks'::regclass
-                 AND polname = driver||'_qscope') THEN
-    EXECUTE format(
-      'CREATE POLICY %I ON public.job_tasks AS PERMISSIVE FOR ALL TO %I '
-      'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
-      driver||'_qscope', driver, queues, queues);
-  END IF;
+  -- queue-scoped job_runs/job_tasks (the actual privilege boundary). CONVERGENT:
+  -- DROP+CREATE so a live DB carrying an older (e.g. four-queue) predicate is
+  -- upgraded to the exact current set — a CREATE-if-missing would leave the
+  -- stale predicate and keep the driver RLS-blocked from a newly added queue.
+  EXECUTE format('DROP POLICY IF EXISTS %I ON public.job_runs', driver||'_qscope');
+  EXECUTE format(
+    'CREATE POLICY %I ON public.job_runs AS PERMISSIVE FOR ALL TO %I '
+    'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
+    driver||'_qscope', driver, queues, queues);
+  EXECUTE format('DROP POLICY IF EXISTS %I ON public.job_tasks', driver||'_qscope');
+  EXECUTE format(
+    'CREATE POLICY %I ON public.job_tasks AS PERMISSIVE FOR ALL TO %I '
+    'USING (queue_name IN %s) WITH CHECK (queue_name IN %s)',
+    driver||'_qscope', driver, queues, queues);
 
   FOREACH t IN ARRAY full_row_rels LOOP
     PERFORM pg_temp._ensure_policy(t, driver||'_select', driver, 'SELECT');
