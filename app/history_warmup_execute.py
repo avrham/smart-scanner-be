@@ -65,6 +65,27 @@ FORBIDDEN_REQUEST_FIELDS = (
     "run_id", "batch_index", "pending", "background", "run_in_background",
 )
 
+# ---- authoritative transient 409 reasons (history-warmup execution window) --- #
+# These are the ONLY 409 reasons that mean "the shared history-warmup execution
+# window is momentarily busy, try again shortly" — NOT a failure. Both the
+# producer (the incremental-refresh service raises them) and the consumer (the
+# durable history-refresh worker's in-task wait) import THIS single set so a new
+# reason can never drift out of the worker's allowlist again. The two cooldown
+# reasons are owned by app.maintenance_cooldown and re-exported here.
+from app.maintenance_cooldown import (  # noqa: E402
+    COOLDOWN_BLOCKING_REASON, COOLDOWN_UNDER_LOCK_REASON)
+
+HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON = "history_warmup_execution_in_progress"
+HISTORY_WARMUP_EXECUTION_LOCKED_REASON = "history_warmup_execution_locked"
+
+# The complete allowlist of transient (retry-shortly) history-warmup 409 reasons.
+HISTORY_WARMUP_TRANSIENT_409_REASONS = frozenset({
+    COOLDOWN_BLOCKING_REASON,                     # provider_cooldown_active
+    COOLDOWN_UNDER_LOCK_REASON,                   # provider_cooldown_activated_under_lock
+    HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON,  # another execution holds the lease
+    HISTORY_WARMUP_EXECUTION_LOCKED_REASON,       # advisory lock held concurrently
+})
+
 # ---- failure taxonomy ------------------------------------------------------ #
 RETRYABLE = "retryable"
 TERMINAL = "terminal"
@@ -976,6 +997,9 @@ __all__ = [
     "PROVIDER_ACTIVITY_NONE", "PROVIDER_ACTIVITY_STARTED", "PROVIDER_ACTIVITY_COMPLETED",
     "UNIVERSE_DRAFT", "UNIVERSE_FROZEN", "UNIVERSE_SUPERSEDED",
     "HISTORY_WARMUP_ADVISORY_LOCK_KEY", "FORBIDDEN_REQUEST_FIELDS",
+    "COOLDOWN_BLOCKING_REASON", "COOLDOWN_UNDER_LOCK_REASON",
+    "HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON", "HISTORY_WARMUP_EXECUTION_LOCKED_REASON",
+    "HISTORY_WARMUP_TRANSIENT_409_REASONS",
     "FAILURE_TAXONOMY", "RETRYABLE", "TERMINAL", "OPERATOR_ERROR",
     "error_class", "is_retryable", "map_provider_error", "HistoryWarmupPayloadError",
     "UniverseError", "normalize_universe_symbols", "compute_universe_hash",

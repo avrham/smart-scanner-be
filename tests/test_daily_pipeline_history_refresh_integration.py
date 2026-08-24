@@ -346,6 +346,20 @@ class TestDailyPipelineHistoryRefresh:
                     view = DP.build_status_view(occ)
                     assert view["terminal_failure_stage"] == DP.STAGE_HISTORY_REFRESH
                     assert view["occurrence_status"] == "failed"
+                    occ_id, upd_before = occ["id"], occ["updated_at"]
+                finally:
+                    await release_db_connection(conn)
+
+                # I: re-advancing an ALREADY-TERMINAL occurrence must NOT reopen or
+                # rewrite it (no successor minted onto a dead occurrence).
+                r2 = await drive_pipeline_advance(payload)
+                assert r2["ok"] is False and r2["error_class"] == C.ERR_TERMINAL
+                conn = await get_db_connection()
+                try:
+                    occ2 = await conn.fetchrow("SELECT * FROM job_runs WHERE id=$1", occ_id)
+                    assert occ2["status"] == "failed" and occ2["updated_at"] == upd_before
+                    v2 = DP.build_status_view(occ2)
+                    assert v2["terminal_failure_stage"] == DP.STAGE_HISTORY_REFRESH
                 finally:
                     await release_db_connection(conn)
             finally:
@@ -384,3 +398,138 @@ class TestDailyPipelineHistoryRefresh:
                 await conn.close()
 
         asyncio.run(go())
+
+    def test_running_occurrence_recovers_failed_history_child_via_successor(self, prospective, monkeypatch):
+        """A RUNNING occurrence whose history child fails with retry-exhausted
+        retryable work spawns ONE bounded successor, keeps its predecessor
+        evidence immutable, stays in_progress with the successor id + lineage,
+        and — once the successor completes — advances history_refresh → campaign."""
+        from app.config import settings
+        import app.routers.admin as admin
+        import app.prospective_session as psess
+        from app.jobs.handlers.daily_pipeline_driver import drive_pipeline_advance
+        from app.jobs.handlers.history_refresh_worker import execute_history_refresh_symbol
+
+        pg = prospective
+        _reset(pg)
+        uid, uhash = _seed_universe(pg)
+        _insert_pipeline_schedule(pg, uid, uhash)
+        fixed = datetime.now(timezone.utc).date() - timedelta(days=1)
+        monkeypatch.setattr(psess, "resolve_latest_completed_session", lambda now: fixed)
+        monkeypatch.setattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", True)
+        monkeypatch.setattr(settings, "ENABLE_SCHEDULER", False)
+        monkeypatch.setattr(settings, "DAILY_PIPELINE_DRIVER_MAX_WAIT_SECONDS", 0, raising=False)
+        monkeypatch.setattr(settings, "HISTORY_WARMUP_MIN_BATCH_INTERVAL_SECONDS", 0, raising=False)
+        owner_dsn = f"postgresql://postgres:postgres@127.0.0.1:{pg['hp']}/{DBNAME}"
+        monkeypatch.setattr(settings, "PROSPECTIVE_DATABASE_URL", owner_dsn)
+        provider = _provider_for(DRV_SYMS, fixed)
+        monkeypatch.setattr(admin, "_resolve_history_warmup_provider", lambda: provider)
+        _make_daily_stale(pg, cutoff=fixed - timedelta(days=8))
+
+        async def _process_history_tasks():
+            from app.workers.persistence import get_db_connection, release_db_connection
+            n = 0
+            while True:
+                conn = await get_db_connection()
+                try:
+                    t = await Q.claim_next_task(conn, queue_name=HR.HISTORY_REFRESH_QUEUE,
+                                                worker_id="hrw", lease_seconds=900)
+                finally:
+                    await release_db_connection(conn)
+                if t is None:
+                    break
+                p = json.loads(t["payload"]) if isinstance(t["payload"], str) else t["payload"]
+                res = await execute_history_refresh_symbol(p)
+                assert res["ok"] is True, res
+                conn = await get_db_connection()
+                try:
+                    await Q.complete_task_succeeded(conn, task_id=t["id"], worker_id="hrw",
+                                                    result_summary=res["result"])
+                finally:
+                    await release_db_connection(conn)
+                n += 1
+            return n
+
+        async def drive():
+            import app.deps as deps
+            from app.workers.persistence import get_db_connection, release_db_connection
+            await deps.init_db_pool()
+            try:
+                await SCHED.run_scheduler_tick(worker_id="drv", now=datetime.now(timezone.utc))
+                conn = await get_db_connection()
+                try:
+                    trow = await conn.fetchrow(
+                        "SELECT payload FROM job_tasks WHERE task_type=$1", DP.DAILY_PIPELINE_ADVANCE_TASK)
+                    payload = json.loads(trow["payload"]) if isinstance(trow["payload"], str) else trow["payload"]
+                finally:
+                    await release_db_connection(conn)
+
+                # advance #1 → generation-0 child enqueued
+                await drive_pipeline_advance(payload)
+                conn = await get_db_connection()
+                try:
+                    occ = await conn.fetchrow(
+                        "SELECT * FROM job_runs WHERE job_type=$1 AND queue_name=$2 "
+                        "AND result_summary IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+                        DP.PIPELINE_JOB_TYPE, DP.PIPELINE_QUEUE)
+                    gen0 = DP.build_status_view(occ)["history_job_id"]
+                    assert gen0
+                    # SIMULATE the live failure: every gen-0 task retry-exhausted retryable 409
+                    await conn.execute(
+                        "UPDATE job_tasks SET status='failed', error_class='retryable', "
+                        "safe_error_code='history_refresh_http_409', attempt_count=3, finished_at=NOW() "
+                        "WHERE job_id=$1", gen0)
+                    await Q.recompute_job_counters(conn, gen0)
+                    assert (await conn.fetchval("SELECT status FROM job_runs WHERE id=$1", gen0)) == "failed"
+                    pred_before = [dict(r) for r in await conn.fetch(
+                        "SELECT task_key, status, attempt_count, error_class FROM job_tasks "
+                        "WHERE job_id=$1 ORDER BY ordinal", gen0)]
+                finally:
+                    await release_db_connection(conn)
+
+                # advance #2 → running occurrence recovers: successor gen-1, in_progress
+                r2 = await drive_pipeline_advance(payload)
+                assert r2["ok"] is False and r2["safe_error_code"] == "occurrence_in_progress", r2
+                conn = await get_db_connection()
+                try:
+                    occ = await conn.fetchrow("SELECT * FROM job_runs WHERE id=$1", occ["id"])
+                    view = DP.build_status_view(occ)
+                    succ = view["history_job_id"]
+                    assert succ and succ != gen0
+                    assert view["stage_states"][DP.STAGE_HISTORY_REFRESH] == DP.STAGE_STATE_IN_PROGRESS
+                    # lineage persists at the occurrence level (survives the next wait tick)
+                    assert view["predecessor_history_job_id"] == gen0
+                    assert view["recovery_generation"] == 1
+                    # successor has the DISTINCT generation-1 job key
+                    assert (await conn.fetchval("SELECT idempotency_key FROM job_runs WHERE id=$1", succ)) == \
+                        HR._job_key(uhash, fixed.isoformat(), HR.HISTORY_REFRESH_CONTRACT_VERSION_V2, 1)
+                    # PREDECESSOR EVIDENCE IMMUTABLE
+                    assert (await conn.fetchval("SELECT status FROM job_runs WHERE id=$1", gen0)) == "failed"
+                    pred_after = [dict(r) for r in await conn.fetch(
+                        "SELECT task_key, status, attempt_count, error_class FROM job_tasks "
+                        "WHERE job_id=$1 ORDER BY ordinal", gen0)]
+                    assert pred_after == pred_before
+                finally:
+                    await release_db_connection(conn)
+
+                # run the successor's tasks (provider-backed) → history now current
+                assert await _process_history_tasks() == len(DRV_SYMS)
+
+                # advance #3 → readiness ready → history COMPLETED → campaign
+                await drive_pipeline_advance(payload)
+                conn = await get_db_connection()
+                try:
+                    occ = await conn.fetchrow("SELECT * FROM job_runs WHERE id=$1", occ["id"])
+                    view = DP.build_status_view(occ)
+                    assert view["stage_states"][DP.STAGE_HISTORY_REFRESH] == DP.STAGE_STATE_COMPLETED
+                    assert view["current_stage"] == DP.STAGE_PROSPECTIVE_CAMPAIGN
+                    # exactly ONE gen-0 and ONE gen-1 history job (no duplicates)
+                    assert await conn.fetchval(
+                        "SELECT COUNT(*) FROM job_runs WHERE job_type=$1", HR.HISTORY_REFRESH_JOB_TYPE) == 2
+                finally:
+                    await release_db_connection(conn)
+            finally:
+                import app.deps as _deps
+                await _deps.close_db_pool()
+
+        asyncio.run(drive())

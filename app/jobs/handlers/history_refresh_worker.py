@@ -25,18 +25,15 @@ import asyncpg
 
 from app.jobs import contracts as C
 from app.jobs import history_refresh as HR
-
-# The service's KNOWN transient 409 reasons: a shared history-warmup execution
-# cooldown / active-execution window / advisory lock. These are NOT failures —
-# the symbol will succeed once the shared window clears. They are absorbed by a
-# BOUNDED in-task wait (below), so they never consume the queue-level attempt
-# budget (which stays reserved for genuine provider errors). Any OTHER 409
-# (scheduler_enabled, stale_*_session, etc.) keeps its fail-closed classification.
-_COOLDOWN_409_REASONS = frozenset({
-    "provider_cooldown_active",              # maintenance_cooldown.COOLDOWN_BLOCKING_REASON
-    "history_warmup_execution_in_progress",  # another execution holds the lease
-    "history_warmup_execution_locked",       # advisory lock held by a concurrent execution
-})
+# AUTHORITATIVE transient-409 allowlist — imported from the SAME module the
+# incremental-refresh service raises them from, so a new/renamed reason can never
+# drift out of the worker's wait path again (this is exactly what let the live
+# provider_cooldown_activated_under_lock 409 fall through to a queue failure).
+# These are NOT failures: the shared history-warmup execution cooldown / active
+# window / advisory lock clears shortly, so they are absorbed by a BOUNDED in-task
+# wait (below) and never consume the queue-level attempt budget. Any OTHER 409
+# (scheduler_enabled, stale_*_session, …) keeps its fail-closed classification.
+from app.history_warmup_execute import HISTORY_WARMUP_TRANSIENT_409_REASONS as _COOLDOWN_409_REASONS
 
 # Indirections so tests can drive a deterministic virtual clock (no real sleep,
 # no wall-clock dependence) while production uses the monotonic clock + asyncio.

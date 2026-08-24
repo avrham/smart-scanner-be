@@ -3030,10 +3030,12 @@ async def history_incremental_refresh_execute_service(db, *, body, now=None):
         classify_incremental_4h_state, incremental_4h_fetch_window,
         normalize_4h_bars, upsert_4h_bars, STATE_INCREMENTAL_REFRESH_NEEDED,
         map_provider_error, PROVIDER_ACTIVITY_STARTED, PROVIDER_ACTIVITY_COMPLETED,
+        HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON, HISTORY_WARMUP_EXECUTION_LOCKED_REASON,
     )
     from zoneinfo import ZoneInfo
     from app.prospective_session import resolve_latest_completed_session
-    from app.maintenance_cooldown import COOLDOWN_BLOCKING_REASON, retry_after_seconds
+    from app.maintenance_cooldown import (
+        COOLDOWN_BLOCKING_REASON, COOLDOWN_UNDER_LOCK_REASON, retry_after_seconds)
     logger = logging.getLogger(__name__)
     if settings.ENABLE_SCHEDULER:
         raise HTTPException(status_code=409, detail={"error": "scheduler_enabled"})
@@ -3077,9 +3079,14 @@ async def history_incremental_refresh_execute_service(db, *, body, now=None):
         raise HTTPException(status_code=422, detail={"error": "invalid_latest_local_4h_session"})
     client_latest_4h = date.fromisoformat(latest_4h_str) if latest_4h_str else None
 
-    def _cooldown_409(cd):
+    def _cooldown_409(cd, *, reason=COOLDOWN_BLOCKING_REASON):
+        # `reason` distinguishes the pre-lock cooldown (COOLDOWN_BLOCKING_REASON)
+        # from the under-advisory-lock re-check (COOLDOWN_UNDER_LOCK_REASON), the
+        # same distinction the initial-warmup + maintenance routes make. Both are
+        # in the authoritative HISTORY_WARMUP_TRANSIENT_409_REASONS set the durable
+        # history-refresh worker waits on — never a queue-consuming failure.
         return HTTPException(status_code=409, detail={
-            "error": COOLDOWN_BLOCKING_REASON,
+            "error": reason,
             "detail": "provider request window not yet cleared — obtain a fresh "
                       "incremental preflight after the cooldown elapses",
             "cooldown_remaining_seconds": cd["cooldown_remaining_seconds"]},
@@ -3105,7 +3112,7 @@ async def history_incremental_refresh_execute_service(db, *, body, now=None):
         lease = prior["execution_lease_expires_at"]
         if lease is not None and lease > now:
             raise HTTPException(status_code=409, detail={
-                "error": "history_warmup_execution_in_progress", "run_id": str(prior["id"]),
+                "error": HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON, "run_id": str(prior["id"]),
                 "lease_expires_at": lease.isoformat()},
                 headers={"Retry-After": str(max(1, int((lease - now).total_seconds())))})
         # lease expired (abandoned) — reconcile-or-redrive happens under the lock below
@@ -3159,7 +3166,7 @@ async def history_incremental_refresh_execute_service(db, *, body, now=None):
     got_lock = await db.fetchval(
         "SELECT pg_try_advisory_lock($1)", HISTORY_WARMUP_ADVISORY_LOCK_KEY)
     if not got_lock:
-        raise HTTPException(status_code=409, detail={"error": "history_warmup_execution_locked"})
+        raise HTTPException(status_code=409, detail={"error": HISTORY_WARMUP_EXECUTION_LOCKED_REASON})
     try:
         again = await db.fetchrow(
             "SELECT id, status, execution_lease_expires_at FROM history_warmup_runs "
@@ -3173,10 +3180,12 @@ async def history_incremental_refresh_execute_service(db, *, body, now=None):
             lease = again["execution_lease_expires_at"]
             if lease is not None and lease > now:
                 raise HTTPException(status_code=409, detail={
-                    "error": "history_warmup_execution_in_progress", "run_id": str(again["id"])})
+                    "error": HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON, "run_id": str(again["id"])})
         cooldown2 = await _provider_cooldown(db, now=datetime.now(timezone.utc))
         if not cooldown2["execution_allowed_by_cooldown"]:
-            raise _cooldown_409(cooldown2)
+            # under the advisory lock: the SAME distinct reason the initial-warmup +
+            # maintenance routes raise (this is the exact reason the live proof hit).
+            raise _cooldown_409(cooldown2, reason=COOLDOWN_UNDER_LOCK_REASON)
 
         if again is None:
             run_id = str(_uuid.uuid4())
@@ -4210,6 +4219,14 @@ async def advance_daily_pipeline_service(db: asyncpg.Connection, *, body: Any):
         db, schedule_code=schedule_code, schedule_version=schedule_version,
         resolved_session_date=resolved_session_date, frozen_universe_hash=universe["universe_hash"],
         universe_id=universe["universe_id"], pipeline_contract_version=pcv)
+    # NEVER reopen/rewrite an already-terminal occurrence: a repeated advance for
+    # the SAME occurrence identity (schedule, session, universe, contract) that has
+    # already succeeded/failed returns its immutable status view. History recovery
+    # happens only for a still-RUNNING occurrence; a FRESH occurrence (distinct
+    # schedule identity/version) for the same universe/session gets its own row and
+    # can recognize/recover the failed LOGICAL history job independently.
+    if occ.get("status") in ("succeeded", "failed"):
+        return DP.build_status_view(occ)
     stage = DP.current_stage(occ)
     occurrence_id = str(occ["id"])
 
@@ -4234,32 +4251,28 @@ async def advance_daily_pipeline_service(db: asyncpg.Connection, *, body: Any):
             occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
                 "state": DP.STAGE_STATE_COMPLETED, "symbols_checked": total,
                 "history_job_id": history_job_id})
-        elif history_job_id:
-            # Resume the recognized child job (idempotent across restarts).
-            jstatus = await HR.history_refresh_job_status(db, history_job_id)
-            if jstatus == "succeeded":
-                # Provider work finished yet the universe is STILL not current →
-                # the provider genuinely lacks the data to reach the target. This
-                # is a real DATA-intervention condition (not normal waiting), so
-                # BLOCKED is the truthful state.
-                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-                    "state": DP.STAGE_STATE_BLOCKED, "reason": "history_incomplete_after_refresh",
-                    "history_job_id": history_job_id, "not_ready_count": total - both_ready,
-                    "operator_action": "inspect the history_incremental_refresh job + provider "
-                                       "coverage for the not-ready symbols"})
-            elif jstatus in ("failed", "cancelled"):
-                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-                    "state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "history_refresh_job_failed",
-                    "history_job_id": history_job_id})
-            else:
-                # queued / running / retryable → normal async work in flight; WAIT.
-                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-                    "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "history_refresh_job",
-                    "history_job_id": history_job_id, "not_ready_count": total - both_ready})
+        elif history_job_id and (await HR.history_refresh_job_status(db, history_job_id)) == "succeeded":
+            # Provider work finished yet the universe is STILL not current → the
+            # provider genuinely lacks the data to reach the target. This is a real
+            # DATA-intervention condition (not normal waiting), so BLOCKED is the
+            # truthful state.
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_BLOCKED, "reason": "history_incomplete_after_refresh",
+                "history_job_id": history_job_id, "not_ready_count": total - both_ready,
+                "operator_action": "inspect the history_incremental_refresh job + provider "
+                                   "coverage for the not-ready symbols"})
+        elif history_job_id and (await HR.history_refresh_job_status(db, history_job_id)) in (
+                "queued", "running", "retryable"):
+            # queued / running / retryable → normal async work in flight; WAIT.
+            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "history_refresh_job",
+                "history_job_id": history_job_id, "not_ready_count": total - both_ready})
         else:
-            # Stale and no child job yet → enqueue ONE bounded refresh job for the
-            # frozen universe + resolved session (idempotent; the driver only
-            # enqueues — provider work runs in the history-refresh worker).
+            # Stale and either NO child yet, or the current child FAILED. A single
+            # generation-aware call enqueues a fresh generation-0 job, or (when a
+            # prior logical history job is failed + retry-exhausted-retryable)
+            # creates/recognizes exactly ONE bounded recovery SUCCESSOR — never
+            # mutating the predecessor's job/task/attempt evidence.
             try:
                 enq = await HR.enqueue_history_incremental_refresh(
                     db, universe_id=universe["universe_id"], universe_hash=universe["universe_hash"],
@@ -4270,10 +4283,20 @@ async def advance_daily_pipeline_service(db: asyncpg.Connection, *, body: Any):
                 occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
                     "state": DP.STAGE_STATE_TERMINAL_FAILURE, "safe_error_code": e.safe_error_code})
                 return DP.build_status_view(occ)
-            occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
-                "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "history_refresh_job",
-                "history_job_id": enq.get("job_id"), "history_refresh_status": enq.get("status"),
-                "not_ready_count": total - both_ready})
+            if enq.get("recoverable") is False:
+                # not recoverable / recovery budget exhausted → fail closed.
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_TERMINAL_FAILURE, "reason": "history_refresh_job_failed",
+                    "history_job_id": enq.get("job_id"),
+                    "history_refresh_status": enq.get("status"),
+                    "recovery_generation": enq.get("recovery_generation")})
+            else:
+                occ = await DP.record_stage_result(db, occurrence_id, stage=stage, result={
+                    "state": DP.STAGE_STATE_IN_PROGRESS, "waiting_on": "history_refresh_job",
+                    "history_job_id": enq.get("job_id"), "history_refresh_status": enq.get("status"),
+                    "recovery_generation": enq.get("recovery_generation"),
+                    "predecessor_history_job_id": enq.get("predecessor_history_job_id"),
+                    "not_ready_count": total - both_ready})
 
     elif stage == DP.STAGE_PROSPECTIVE_CAMPAIGN:
         exp = settings.PROSPECTIVE_ALLOWED_EXPERIMENT_CODE

@@ -129,29 +129,41 @@ def pipeline_occurrence_identity(*, schedule_code: str, schedule_version: int,
 
 
 def history_refresh_job_idempotency_key(*, universe_hash: str, resolved_session_date: str,
-                                        contract_version: str) -> str:
+                                        contract_version: str, recovery_generation: int = 0) -> str:
     """One history-refresh job per (frozen universe, resolved completed session,
-    refresh contract). A repeated daily-pipeline advance for the same session +
-    universe recognizes the SAME job — never a duplicate provider batch."""
-    return _sha256("hrj", {
+    refresh contract, recovery generation). A repeated daily-pipeline advance for
+    the same session + universe recognizes the SAME job — never a duplicate
+    provider batch. ``recovery_generation`` distinguishes a bounded recovery
+    SUCCESSOR (generation >= 1) from the original job; generation 0 OMITS the
+    field so the key is byte-identical to the pre-recovery formula (the original
+    live job is recognized, never rewritten)."""
+    obj = {
         "universe_hash": str(universe_hash),
         "resolved_session_date": str(resolved_session_date),
         "contract_version": contract_version,
-    })
+    }
+    if int(recovery_generation):
+        obj["recovery_generation"] = int(recovery_generation)
+    return _sha256("hrj", obj)
 
 
 def history_refresh_task_idempotency_key(*, universe_hash: str, resolved_session_date: str,
-                                         symbol: str, contract_version: str) -> str:
-    """One history-refresh task per (universe, resolved session, symbol,
-    contract). Stable for the occurrence so a re-enqueue never duplicates a
-    symbol's task; the provider-level idempotency (history_warmup_runs identity)
-    additionally prevents a duplicate provider request."""
-    return _sha256("hrt", {
+                                         symbol: str, contract_version: str,
+                                         recovery_generation: int = 0) -> str:
+    """One history-refresh task per (universe, resolved session, symbol, contract,
+    recovery generation). Stable for the occurrence so a re-enqueue never
+    duplicates a symbol's task; a recovery SUCCESSOR (generation >= 1) mints a
+    DISTINCT key so it never collides with — or reopens — the predecessor's task.
+    Generation 0 omits the field (byte-identical to the pre-recovery formula)."""
+    obj = {
         "universe_hash": str(universe_hash),
         "resolved_session_date": str(resolved_session_date),
         "symbol": str(symbol),
         "contract_version": contract_version,
-    })
+    }
+    if int(recovery_generation):
+        obj["recovery_generation"] = int(recovery_generation)
+    return _sha256("hrt", obj)
 
 
 __all__ = [

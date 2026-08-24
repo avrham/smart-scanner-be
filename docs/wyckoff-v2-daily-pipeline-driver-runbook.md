@@ -490,3 +490,38 @@ session — same-session replay is idempotent).
   scheduler leader remains; nothing auto-advances. Re-arm by scaling back to 1.
 - No data mutation is required to roll back; the driver only enqueues and
   advances durable state.
+
+---
+
+## History-refresh live recovery semantics (evidence-preserving, no DB surgery)
+
+A `history_incremental_refresh` job can fail when its per-symbol tasks exhaust
+their bounded retry budget — most often on the shared history-warmup execution
+**cooldown / advisory-lock 409** (`provider_cooldown_active`,
+`provider_cooldown_activated_under_lock`, `history_warmup_execution_in_progress`,
+`history_warmup_execution_locked`). Two protections apply, in order:
+
+1. **In-task wait (first line):** the history-refresh worker recognizes those
+   KNOWN transient 409 reasons (via the single authoritative
+   `HISTORY_WARMUP_TRANSIENT_409_REASONS` set shared by producer and consumer)
+   and waits them out **within the same claim** (bounded by
+   `HISTORY_REFRESH_TASK_MAX_WAIT_SECONDS`), so they don't consume queue attempts.
+
+2. **Bounded durable successor (recovery):** if a history job nonetheless ends
+   `failed` with retry-exhausted **retryable** work, the pipeline automatically
+   creates **exactly ONE** recovery successor — a NEW durable job with a DISTINCT
+   generation-scoped identity (`recovery_generation=1`), covering ONLY the
+   symbols the predecessor did not complete, with predecessor lineage recorded on
+   the successor. The running occurrence swaps its `history_job_id` to the
+   successor and stays `in_progress`. Recovery is capped at ONE generation; a
+   failed successor fails the stage closed. Terminal/operator/cancelled failures
+   are never auto-recovered.
+
+**The predecessor job/task/attempt rows are immutable evidence** — recovery never
+resets `attempt_count`/status, never rewrites idempotency keys, never deletes
+rows, and never reopens an already-terminal pipeline occurrence. The failed live
+predecessor (history job `b4429c2a…`, occurrence `d5a56667…`) stays failed
+forever; the next proof uses a NEW throwaway schedule identity, whose fresh
+occurrence recognizes the failed logical history job and drives the bounded
+successor. **Do not** perform DB surgery (no `UPDATE … queued`, no `attempt_count`
+reset, no `max_attempts` change, no row deletes) as a recovery path.

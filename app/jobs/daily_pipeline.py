@@ -113,6 +113,8 @@ def _initial_result_summary(*, resolved_session_date: str, frozen_universe_hash:
         "current_stage": STAGE_ORDER[0],
         "stages": {s: {"state": STAGE_STATE_PENDING} for s in STAGE_ORDER},
         "history_job_id": None,
+        "predecessor_history_job_id": None,
+        "recovery_generation": None,
         "campaign_registration_id": None,
         "campaign_job_id": None,
         "outcome_job_id": None,
@@ -232,7 +234,8 @@ async def record_stage_result(conn: asyncpg.Connection, occurrence_id: str, *,
         finished = "NOW()"
     # STAGE_STATE_IN_PROGRESS / BLOCKED / RETRYABLE_FAILURE: stay on this
     # stage, job status stays 'running' — a later call resumes it.
-    for key in ("history_job_id", "campaign_registration_id", "campaign_job_id", "outcome_job_id",
+    for key in ("history_job_id", "predecessor_history_job_id", "recovery_generation",
+                "campaign_registration_id", "campaign_job_id", "outcome_job_id",
                 "current_campaign_maturity", "prior_maturation"):
         if key in result:
             summary[key] = result[key]
@@ -282,6 +285,8 @@ def build_status_view(occurrence: Dict[str, Any]) -> Dict[str, Any]:
         "retryable_failure_stage": retryable,
         "terminal_failure_stage": terminal,
         "history_job_id": summary.get("history_job_id"),
+        "predecessor_history_job_id": summary.get("predecessor_history_job_id"),
+        "recovery_generation": summary.get("recovery_generation"),
         "campaign_registration_id": summary.get("campaign_registration_id"),
         "campaign_job_id": active_job_ids["campaign_job_id"],
         "outcome_job_id": active_job_ids["outcome_job_id"],

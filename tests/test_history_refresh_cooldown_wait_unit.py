@@ -48,9 +48,9 @@ class _ScriptedService:
         return item
 
 
-def _cooldown_409(remaining=5, retry_after="5"):
+def _cooldown_409(remaining=5, retry_after="5", reason="provider_cooldown_active"):
     return HTTPException(status_code=409,
-                         detail={"error": "provider_cooldown_active",
+                         detail={"error": reason,
                                  "cooldown_remaining_seconds": remaining},
                          headers=({"Retry-After": retry_after} if retry_after is not None else None))
 
@@ -205,3 +205,38 @@ def test_F_history_handler_retry_budget_unchanged():
     spec = R.registered_task_types()[HR.HISTORY_REFRESH_TASK]
     assert spec.retry_backoff_schedule is None          # still global bounded two-retry
     assert spec.max_attempts == HR.HISTORY_REFRESH_MAX_ATTEMPTS == 3
+
+
+# --------------------------------------------------------------------------- #
+# Root cause #2 PART 1: the EXACT missing live reason is recognized (via the
+# authoritative constant) and waits in-task; producer/consumer cannot drift.
+# --------------------------------------------------------------------------- #
+def test_A2_under_lock_cooldown_reason_is_recognized_and_waits(wired):
+    from app.maintenance_cooldown import COOLDOWN_UNDER_LOCK_REASON
+    # this is the exact reason the live third attempts received
+    assert COOLDOWN_UNDER_LOCK_REASON == "provider_cooldown_activated_under_lock"
+    svc = wired["install"]([
+        _cooldown_409(remaining=6, retry_after="6", reason=COOLDOWN_UNDER_LOCK_REASON), _ok()])
+    res = _run(HRW.execute_history_refresh_symbol({"symbol": "ZZB"}))
+    assert res["ok"] is True and svc.calls == 2          # waited in-task, then succeeded
+    assert wired["sleeps"] == [6 + 3]                    # NOT a queue-level failure
+
+
+def test_B_no_reason_string_drift_producer_and_consumer_share_constants():
+    """The worker's allowlist IS the authoritative set exported from
+    history_warmup_execute, which re-exports the maintenance_cooldown reason
+    constants — so a producer reason can never drift out of the consumer set."""
+    from app.history_warmup_execute import (
+        HISTORY_WARMUP_TRANSIENT_409_REASONS, HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON,
+        HISTORY_WARMUP_EXECUTION_LOCKED_REASON)
+    from app.maintenance_cooldown import COOLDOWN_BLOCKING_REASON, COOLDOWN_UNDER_LOCK_REASON
+    # consumer uses the exact authoritative object (identity, not a copy)
+    assert HRW._COOLDOWN_409_REASONS is HISTORY_WARMUP_TRANSIENT_409_REASONS
+    # every authoritative reason is present via its constant (no literals)
+    assert HISTORY_WARMUP_TRANSIENT_409_REASONS == frozenset({
+        COOLDOWN_BLOCKING_REASON, COOLDOWN_UNDER_LOCK_REASON,
+        HISTORY_WARMUP_EXECUTION_IN_PROGRESS_REASON, HISTORY_WARMUP_EXECUTION_LOCKED_REASON})
+    # and the two cooldown reasons are the SAME objects the producer module owns
+    import app.history_warmup_execute as H
+    assert H.COOLDOWN_BLOCKING_REASON == COOLDOWN_BLOCKING_REASON
+    assert H.COOLDOWN_UNDER_LOCK_REASON == COOLDOWN_UNDER_LOCK_REASON
