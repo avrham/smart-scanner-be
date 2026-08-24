@@ -332,7 +332,15 @@ class TestIncrementalExecute:
         from datetime import timezone as _tz
         from app.prospective_session import resolve_latest_completed_session, is_trading_day
         today = datetime.now(_tz.utc).date()
+        # Pin the target to a trading day STRICTLY before today so `today` is a
+        # genuine still-forming bar BEYOND the target (deterministic at any time of
+        # day — once today's own session completes the real resolver returns today
+        # itself, which would collapse this test's "future bar beyond target"
+        # premise). Patch the resolver so the SERVICE agrees (no stale-target 409).
         real_target = resolve_latest_completed_session(datetime.now(_tz.utc))
+        while real_target >= today or not is_trading_day(real_target):
+            real_target -= timedelta(days=1)
+        _patch_target(monkeypatch, real_target)
         # the LAST trading day strictly before real_target; missing = [real_target]
         seed = real_target - timedelta(days=1)
         while not is_trading_day(seed):
