@@ -9,11 +9,11 @@ occurrence IDs, or interpreting raw internal enum combinations.
 
 Every route uses an exact static path (query params carry variable input, no
 path params) so each one can be listed verbatim in app.audit_mode's
-AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 8
-tables the SELECT-only audit_reader role is actually granted on
-(strategy_shadow_pairs/evaluations/run_pairs/runs, daily_bars, patterns,
-pattern_configs) plus the pure market-calendar resolver — no new grants
-required. Decision-support only: never exposes allow_enter=true semantics,
+AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 5
+relations the SELECT-only smart_scanner_product_reader role is granted on
+(strategy_shadow_runs/run_pairs/pairs/evaluations, daily_bars) plus the pure
+market-calendar resolver — see ops/sql/create_smart_scanner_product_reader.sql.
+Decision-support only: never exposes allow_enter=true semantics,
 never reinterprets pair-level outcomes as candidate/control-specific returns.
 """
 
@@ -49,6 +49,23 @@ def _as_json(value: Any) -> Any:
     return value
 
 
+# The session date is written at the telemetry ROOT by the shadow runner
+# (app/workers/shadow/runner.py sets telemetry["as_of_date"]); the
+# `telemetry.campaign` block is operator metadata merged in on top of it. The
+# durable-worker path therefore never nests as_of_date under `campaign`, so the
+# root value is the canonical source and the nested one is only a fallback for
+# any writer that supplies it explicitly.
+def _as_of_date_sql(alias: str = "") -> str:
+    col = f"{alias}." if alias else ""
+    return (
+        f"COALESCE({col}telemetry->'campaign'->>'as_of_date', "
+        f"{col}telemetry->>'as_of_date')"
+    )
+
+
+_AS_OF_DATE_SQL = _as_of_date_sql()
+
+
 async def _fetch_latest_campaign(db: asyncpg.Connection, *, session: Optional[str]) -> Optional[Dict[str, Any]]:
     """Latest strategy_shadow_runs row carrying a telemetry.campaign block —
     optionally pinned to one `session` (as_of_date). Only the granted
@@ -57,13 +74,13 @@ async def _fetch_latest_campaign(db: asyncpg.Connection, *, session: Optional[st
     params: List[Any] = []
     if session:
         params.append(session)
-        where += f" AND telemetry->'campaign'->>'as_of_date' = ${len(params)}"
+        where += f" AND {_AS_OF_DATE_SQL} = ${len(params)}"
     row = await db.fetchrow(
         f"""
         SELECT id, experiment_code, experiment_version, status, started_at,
                finished_at, error_code,
                telemetry->'campaign'->>'campaign_id' AS campaign_id,
-               telemetry->'campaign'->>'as_of_date' AS as_of_date,
+               {_AS_OF_DATE_SQL} AS as_of_date,
                requested_symbols
         FROM strategy_shadow_runs
         WHERE {where}
@@ -76,6 +93,37 @@ async def _fetch_latest_campaign(db: asyncpg.Connection, *, session: Optional[st
     d = dict(row)
     d["requested_symbols"] = _as_json(d["requested_symbols"]) or []
     return d
+
+
+async def _fetch_scan_universe(db: asyncpg.Connection, run_id: Any) -> List[str]:
+    """The symbols this scan actually covered, taken from its persisted pairs.
+
+    `strategy_shadow_runs.requested_symbols` is NOT a reliable universe: the
+    durable worker evaluates one symbol per job against a single shared
+    campaign run, so each job rewrites that column with its own single symbol
+    and the last writer wins. The run's `strategy_shadow_run_pairs` rows are
+    the authoritative membership, and they are exactly what `results` is built
+    from — so deriving the universe here keeps the two consistent by
+    construction.
+    """
+    rows = await db.fetch(
+        """
+        SELECT DISTINCT p.symbol
+        FROM strategy_shadow_run_pairs rp
+        JOIN strategy_shadow_pairs p ON p.id = rp.pair_id
+        WHERE rp.run_id = $1
+        ORDER BY p.symbol
+        """,
+        run_id,
+    )
+    return [r["symbol"] for r in rows]
+
+
+async def _resolve_universe(db: asyncpg.Connection, campaign: Dict[str, Any]) -> List[str]:
+    """Persisted pair membership, falling back to the requested list only when
+    the run has no pairs yet (a still-running or failed scan)."""
+    symbols = await _fetch_scan_universe(db, campaign["id"])
+    return symbols or list(campaign["requested_symbols"])
 
 
 async def _fetch_campaign_results(db: asyncpg.Connection, run_id: Any) -> List[Dict[str, Any]]:
@@ -142,10 +190,12 @@ async def scanner_overview(
 
     results: List[Dict[str, Any]] = []
     freshness = {"oldest_bar_date": None, "latest_bar_date": None}
+    universe_symbols: List[str] = []
     if campaign is not None:
         raw_results = await _fetch_campaign_results(db, campaign["id"])
         results = [sv.build_overview_row(r, scanner_state=scanner_state) for r in raw_results]
-        freshness = await _fetch_data_freshness(db, campaign["requested_symbols"])
+        universe_symbols = await _resolve_universe(db, campaign)
+        freshness = await _fetch_data_freshness(db, universe_symbols)
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -166,8 +216,8 @@ async def scanner_overview(
         ),
         "universe": (
             {
-                "symbol_count": len(campaign["requested_symbols"]),
-                "symbols": campaign["requested_symbols"],
+                "symbol_count": len(universe_symbols),
+                "symbols": universe_symbols,
             }
             if campaign is not None else None
         ),
@@ -200,7 +250,7 @@ async def scanner_symbol_detail(
     campaign = await _fetch_latest_campaign(db, session=session)
     if campaign is None:
         raise HTTPException(status_code=404, detail={"error": "no_campaign_available"})
-    if symbol not in campaign["requested_symbols"]:
+    if symbol not in await _resolve_universe(db, campaign):
         raise HTTPException(status_code=404, detail={"error": "unknown_symbol", "symbol": symbol})
 
     scanner_state = sv.classify_scanner_state(
@@ -307,13 +357,14 @@ async def scanner_scans(
     """Lightweight scan history — enough for a UI to let the user pick a
     previous completed scan; no analytics, no outcome/return data."""
     rows = await db.fetch(
-        """
-        SELECT id, status, started_at, finished_at,
-               telemetry->'campaign'->>'as_of_date' AS as_of_date,
-               telemetry->'pair_count' AS pair_count
-        FROM strategy_shadow_runs
-        WHERE telemetry->'campaign' IS NOT NULL
-        ORDER BY started_at DESC LIMIT $1
+        f"""
+        SELECT r.id, r.status, r.started_at, r.finished_at,
+               {_as_of_date_sql('r')} AS as_of_date,
+               (SELECT count(*) FROM strategy_shadow_run_pairs rp
+                 WHERE rp.run_id = r.id) AS pair_count
+        FROM strategy_shadow_runs r
+        WHERE r.telemetry->'campaign' IS NOT NULL
+        ORDER BY r.started_at DESC LIMIT $1
         """,
         limit,
     )

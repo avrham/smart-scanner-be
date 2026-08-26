@@ -177,7 +177,8 @@ class FakeConn:
     same pattern as tests/test_history_warmup.py's _WarmupConn."""
 
     def __init__(self, *, campaign_row=None, result_rows=None, freshness_row=None,
-                 symbol_row=None, daily_row=None, bar_rows=None, campaign_list_rows=None):
+                 symbol_row=None, daily_row=None, bar_rows=None, campaign_list_rows=None,
+                 universe_rows=None):
         self.campaign_row = campaign_row
         self.result_rows = result_rows or []
         self.freshness_row = freshness_row or {"oldest": None, "latest": None}
@@ -185,6 +186,10 @@ class FakeConn:
         self.daily_row = daily_row or {"n": 0, "oldest": None, "latest": None}
         self.bar_rows = bar_rows or []
         self.campaign_list_rows = campaign_list_rows or []
+        # Pair-derived universe (SELECT DISTINCT p.symbol ...). None = no pairs
+        # persisted, which is what makes the route fall back to requested_symbols.
+        self.universe_rows = universe_rows
+        self.freshness_symbols = None
 
     async def fetchrow(self, sql, *a):
         if "FROM strategy_shadow_runs" in sql:
@@ -192,17 +197,20 @@ class FakeConn:
         if "FROM daily_bars" in sql and "COUNT(*)::int AS n" in sql:
             return self.daily_row
         if "FROM daily_bars" in sql:
+            self.freshness_symbols = a[0] if a else None
             return self.freshness_row
         if "FROM strategy_shadow_run_pairs rp" in sql and "p.symbol = $2" in sql:
             return self.symbol_row
         return None
 
     async def fetch(self, sql, *a):
+        if "SELECT DISTINCT p.symbol" in sql:
+            return self.universe_rows or []
         if "FROM strategy_shadow_run_pairs rp" in sql and "candidate_verdict" in sql:
             return self.result_rows
         if "trading_date, open, high, low, close, volume" in sql:
             return self.bar_rows
-        if "telemetry->'pair_count'" in sql:
+        if "FROM strategy_shadow_runs r" in sql:
             return self.campaign_list_rows
         return []
 
@@ -421,6 +429,161 @@ class TestScansEndpoint:
         # never leaks raw internal fields
         assert "provider" not in body["scans"][0]
         assert "requested_symbols" not in body["scans"][0]
+
+
+# --------------------------------------------------------------------------- #
+# Regression: the persistence shape the DURABLE WORKER actually writes.
+#
+# app/workers/shadow/runner.py always writes the session at the telemetry ROOT
+# (`telemetry["as_of_date"]`) and merges `telemetry.campaign` on top as operator
+# metadata, and the durable worker runs ONE symbol per job against a single
+# shared campaign run — so that run's `requested_symbols` ends up holding only
+# the last job's single symbol while its `strategy_shadow_run_pairs` hold the
+# real universe. Reading `telemetry->'campaign'->>'as_of_date'` or trusting
+# `requested_symbols` therefore yields a null session and a 1-symbol universe
+# against real pipeline data.
+# --------------------------------------------------------------------------- #
+
+DURABLE_UNIVERSE = [
+    "AAPL", "AMD", "AMZN", "AVGO", "BAC", "CAT", "COST", "CRM", "CVX", "GE",
+    "GOOGL", "GS", "HD", "JNJ", "JPM", "LLY", "META", "MSFT", "NFLX", "NVDA",
+    "ORCL", "TSLA", "UNH", "WMT", "XOM",
+]
+
+
+class _RecordingConn(FakeConn):
+    """FakeConn that also records every SQL string it was asked to run."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.sql_seen = []
+
+    async def fetchrow(self, sql, *a):
+        self.sql_seen.append(sql)
+        return await super().fetchrow(sql, *a)
+
+    async def fetch(self, sql, *a):
+        self.sql_seen.append(sql)
+        return await super().fetch(sql, *a)
+
+
+def _durable_campaign(**over):
+    """A run row shaped the way the durable worker leaves it: campaign block
+    carrying per-symbol progress metadata, requested_symbols holding a single
+    symbol, and the real session date only at the telemetry root."""
+    row = dict(
+        id=RUN_ID, experiment_code="wyckoff_v2_vs_baseline", experiment_version=1,
+        status="completed", started_at=datetime(2026, 8, 26, 9, 12, tzinfo=timezone.utc),
+        finished_at=datetime(2026, 8, 26, 11, 23, tzinfo=timezone.utc), error_code=None,
+        campaign_id=str(uuid4()),
+        # what the COALESCE in the route resolves to for this shape
+        as_of_date="2026-08-25",
+        requested_symbols=json.dumps(["AAPL"]),
+    )
+    row.update(over)
+    return row
+
+
+def _universe_rows(symbols=None):
+    return [_row(symbol=s) for s in (symbols if symbols is not None else DURABLE_UNIVERSE)]
+
+
+class TestDurableWorkerPersistenceShape:
+    def test_as_of_date_sql_coalesces_nested_over_root(self):
+        sql = scanner_mod._as_of_date_sql()
+        assert "telemetry->'campaign'->>'as_of_date'" in sql
+        assert "telemetry->>'as_of_date'" in sql
+        assert sql.startswith("COALESCE(")
+
+    def test_as_of_date_sql_supports_a_table_alias(self):
+        sql = scanner_mod._as_of_date_sql("r")
+        assert "r.telemetry->'campaign'->>'as_of_date'" in sql
+        assert "r.telemetry->>'as_of_date'" in sql
+
+    def test_latest_campaign_query_reads_both_session_paths(self, client, monkeypatch):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                             lambda now: date(2026, 8, 25))
+        conn = _RecordingConn(campaign_row=None)
+        _use(conn)
+        client.get("/api/scanner/overview?session=2026-08-25")
+        run_sql = [s for s in conn.sql_seen if "FROM strategy_shadow_runs" in s]
+        assert run_sql, "the overview must query strategy_shadow_runs"
+        # both the projection and the session filter must use the coalesced path
+        assert run_sql[0].count("telemetry->>'as_of_date'") >= 2
+
+    def test_universe_comes_from_persisted_pairs_not_requested_symbols(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                             lambda now: date(2026, 8, 25))
+        _use(FakeConn(campaign_row=_durable_campaign(),
+                      universe_rows=_universe_rows(),
+                      freshness_row={"oldest": date(2025, 1, 2), "latest": date(2026, 8, 25)}))
+        body = client.get("/api/scanner/overview").json()
+        assert body["scanner_state"] == sv.SCANNER_STATE_FRESH
+        assert body["scan"]["session_date"] == "2026-08-25"
+        assert body["universe"]["symbol_count"] == 25
+        assert body["universe"]["symbols"] == DURABLE_UNIVERSE
+        # never the stale single-symbol requested_symbols value
+        assert body["universe"]["symbols"] != ["AAPL"]
+
+    def test_data_freshness_uses_the_pair_derived_universe(self, client, monkeypatch):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                             lambda now: date(2026, 8, 25))
+        conn = FakeConn(campaign_row=_durable_campaign(), universe_rows=_universe_rows())
+        _use(conn)
+        client.get("/api/scanner/overview")
+        assert conn.freshness_symbols == DURABLE_UNIVERSE
+
+    def test_universe_falls_back_to_requested_when_no_pairs_persisted(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                             lambda now: date(2026, 8, 25))
+        _use(FakeConn(campaign_row=_durable_campaign(status="running"),
+                      universe_rows=[]))
+        body = client.get("/api/scanner/overview").json()
+        assert body["scanner_state"] == sv.SCANNER_STATE_RUNNING
+        assert body["universe"]["symbols"] == ["AAPL"]
+
+    def test_symbol_detail_accepts_a_symbol_known_only_from_pairs(
+        self, client, monkeypatch
+    ):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                             lambda now: date(2026, 8, 25))
+        symbol_row = _row(
+            candidate_verdict="WATCH", candidate_score=0.7, candidate_reason="watch_setup_valid",
+            candidate_details=json.dumps(_CANDIDATE_DETAILS),
+            control_verdict="AVOID", control_score=0.2, control_reason="below sma",
+        )
+        _use(FakeConn(campaign_row=_durable_campaign(), universe_rows=_universe_rows(),
+                      symbol_row=symbol_row,
+                      daily_row={"n": 521, "oldest": date(2024, 8, 1), "latest": date(2026, 8, 25)}))
+        # TSLA is absent from requested_symbols (["AAPL"]) but present in the pairs
+        resp = client.get("/api/scanner/symbol?symbol=TSLA")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["symbol"] == "TSLA"
+        assert body["scan"]["session_date"] == "2026-08-25"
+        assert body["symbol_state"] == sv.SYMBOL_STATE_VALID_RESULT
+
+    def test_symbol_outside_the_pair_universe_is_still_404(self, client, monkeypatch):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                             lambda now: date(2026, 8, 25))
+        _use(FakeConn(campaign_row=_durable_campaign(), universe_rows=_universe_rows()))
+        resp = client.get("/api/scanner/symbol?symbol=ZZZZ")
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["error"] == "unknown_symbol"
+
+    def test_scan_list_counts_real_pairs_and_reads_root_session(self, client):
+        rows = [_row(id=RUN_ID, status="completed",
+                     started_at=datetime(2026, 8, 26, 9, 12, tzinfo=timezone.utc),
+                     finished_at=datetime(2026, 8, 26, 11, 23, tzinfo=timezone.utc),
+                     as_of_date="2026-08-25", pair_count=25)]
+        _use(FakeConn(campaign_list_rows=rows))
+        body = client.get("/api/scanner/scans").json()
+        assert body["scans"][0]["session_date"] == "2026-08-25"
+        assert body["scans"][0]["pair_count"] == 25
 
 
 # --------------------------------------------------------------------------- #

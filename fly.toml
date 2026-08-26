@@ -1,9 +1,16 @@
 # fly.toml — smart-scanner-be-staging
 #
-# REVISION-VERIFICATION STAGING ONLY. This app exists solely to boot an exact
-# committed revision and expose GET /version for revision proof. It runs NO
-# scheduler and NO background processing, uses NO production database and NO
-# live provider credentials. Safe to remove after verification.
+# READ-ONLY PRODUCT/AUDIT STAGING. This app boots an exact committed revision,
+# exposes GET /version for revision proof, and serves the read-only Smart
+# Scanner Product API (/api/scanner/overview|scans|symbol) that the UI consumes.
+# It runs NO scheduler, NO background processing and NO live provider
+# credentials, and it performs NO writes and NO migrations.
+#
+# Canonical read source: the isolated Fly Postgres holding the validated
+# scanner pipeline output (app `smart-scanner-history-warmup-db-staging`,
+# database `warmup`, region fra) — reached over the private 6PN network as the
+# least-privilege `smart_scanner_product_reader` role. The connection itself is
+# the AUDIT_DATABASE_URL SECRET and is never committed here.
 #
 # The Git SHA is intentionally NOT set here — it is supplied at deploy time via
 # --build-arg APP_GIT_SHA="$(git rev-parse HEAD)" so /version always reflects
@@ -31,7 +38,12 @@ primary_region = 'fra'
   # is NON-secret (just a role name). The actual connection (AUDIT_DATABASE_URL)
   # is a SECRET set later via `fly secrets set` — never in fly.toml. Until then,
   # audit mode fails closed (no fallback to any default database identity).
-  AUDIT_EXPECTED_DB_ROLE = 'smart_scanner_audit_reader'
+  #
+  # smart_scanner_product_reader holds SELECT on ONLY the 5 relations the three
+  # Product API routes read (see ops/sql/create_smart_scanner_product_reader.sql)
+  # — deliberately narrower than smart_scanner_audit_reader's 13, so the product
+  # surface cannot widen with the audit surface.
+  AUDIT_EXPECTED_DB_ROLE = 'smart_scanner_product_reader'
 
 [http_service]
   internal_port = 8000
