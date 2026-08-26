@@ -194,6 +194,8 @@ async def scanner_overview(
     if campaign is not None:
         raw_results = await _fetch_campaign_results(db, campaign["id"])
         results = [sv.build_overview_row(r, scanner_state=scanner_state) for r in raw_results]
+        # Server-side "inspect first" ordering, so every client agrees on it.
+        results.sort(key=sv.attention_sort_key)
         universe_symbols = await _resolve_universe(db, campaign)
         freshness = await _fetch_data_freshness(db, universe_symbols)
 
@@ -223,6 +225,7 @@ async def scanner_overview(
         ),
         "data_freshness": freshness,
         "results_summary": sv.summarize_results(results),
+        "attention_summary": sv.summarize_attention(results),
         "results": results,
         "strategy": {
             "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
@@ -314,10 +317,29 @@ async def scanner_symbol_detail(
         for b in reversed(bars)
     ]
 
+    evidence = sv.build_symbol_evidence(candidate_details)
     return {
         "contract_version": sv.SYMBOL_DETAIL_CONTRACT_VERSION,
         "symbol": symbol,
         "symbol_state": symbol_state,
+        "attention": sv.classify_attention(
+            has_candidate_result=has_candidate,
+            candidate_verdict=candidate_verdict,
+            setup_state=evidence["setup_state"] if evidence else None,
+            readiness_status=evidence["readiness_status"] if evidence else None,
+            control_verdict=control_verdict,
+        ),
+        "cross_arm": sv.classify_cross_arm(
+            candidate_verdict=candidate_verdict, control_verdict=control_verdict
+        ),
+        # Where the strategy stopped, in evaluation order, and everything that
+        # is not passed — the deterministic answer to "what would have to change".
+        "gate_progress": sv.build_gate_progress(
+            candidate_details, allow_enter=pc.CANDIDATE_ALLOW_ENTER
+        ),
+        "blockers": sv.build_blockers(
+            candidate_details, allow_enter=pc.CANDIDATE_ALLOW_ENTER
+        ),
         "scan": {
             "scan_id": str(campaign["id"]),
             "campaign_id": campaign["campaign_id"],
@@ -331,7 +353,9 @@ async def scanner_symbol_detail(
             "score": candidate_score,
             "reason": candidate_reason,
             "allow_enter": pc.CANDIDATE_ALLOW_ENTER,
-            "evidence": sv.build_symbol_evidence(candidate_details),
+            "structure_state": sv.structure_state(candidate_details),
+            "reason_code": sv.reason_code(candidate_details),
+            "evidence": evidence,
         },
         "control": {
             "strategy_code": pc.CONTROL_STRATEGY_CODE,

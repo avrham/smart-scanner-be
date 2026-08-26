@@ -432,6 +432,246 @@ class TestScansEndpoint:
 
 
 # --------------------------------------------------------------------------- #
+# Attention tiers, cross-arm relationship and gate progression.
+#
+# These encode the forensic finding (ops/analysis/scanner_signal_forensics.py)
+# that the fields the API used to lead with do not differentiate real symbols:
+# setup_present was True for 100/100 evaluations, and candidate_score is absent
+# for 75/100 with overlapping WATCH/AVOID ranges among the rest.
+# --------------------------------------------------------------------------- #
+
+def _details(setup_state="valid", structure="recognized", reason="watch_setup_valid",
+             readiness="ready", trigger_confirmed=False, trigger_state="missing",
+             waiting=("entry_reference_unavailable",)):
+    return {
+        "setup_state": setup_state,
+        "trigger_state": trigger_state,
+        "readiness": {"status": readiness},
+        "structure": {"state": structure},
+        "policy": {
+            "setup_state": setup_state,
+            "trigger_confirmed": trigger_confirmed,
+            "trigger_state": trigger_state,
+            "reason_code": reason,
+            "enter_eligible_without_rollout_gate": False,
+            "waiting_reasons": list(waiting),
+        },
+        "four_hour_trigger": {"state": trigger_state},
+    }
+
+
+class TestClassifyAttention:
+    def test_no_evaluation_is_not_ready(self):
+        assert sv.classify_attention(
+            has_candidate_result=False, candidate_verdict=None, setup_state=None,
+            readiness_status=None, control_verdict="AVOID",
+        ) == sv.ATTENTION_NOT_READY
+
+    def test_unready_inputs_are_not_ready_even_with_a_verdict(self):
+        assert sv.classify_attention(
+            has_candidate_result=True, candidate_verdict="AVOID",
+            setup_state="unknown", readiness_status="insufficient_history",
+            control_verdict="AVOID",
+        ) == sv.ATTENTION_NOT_READY
+
+    def test_candidate_signal_verdict_is_high_attention(self):
+        for verdict in ("WATCH", "ENTER"):
+            assert sv.classify_attention(
+                has_candidate_result=True, candidate_verdict=verdict,
+                setup_state="valid", readiness_status="ready",
+                control_verdict="AVOID",
+            ) == sv.ATTENTION_HIGH
+
+    def test_baseline_only_flag_is_developing(self):
+        assert sv.classify_attention(
+            has_candidate_result=True, candidate_verdict="AVOID",
+            setup_state="unknown", readiness_status="ready",
+            control_verdict="ENTER",
+        ) == sv.ATTENTION_DEVELOPING
+
+    def test_disagreement_outranks_an_invalid_structure(self):
+        # order of the branches is the definition: disagreement is checked first
+        assert sv.classify_attention(
+            has_candidate_result=True, candidate_verdict="AVOID",
+            setup_state="invalid", readiness_status="ready",
+            control_verdict="ENTER",
+        ) == sv.ATTENTION_DEVELOPING
+
+    def test_structure_read_and_rejected_is_low_attention(self):
+        assert sv.classify_attention(
+            has_candidate_result=True, candidate_verdict="AVOID",
+            setup_state="invalid", readiness_status="ready",
+            control_verdict="AVOID",
+        ) == sv.ATTENTION_LOW
+
+    def test_structure_unreadable_is_no_read_not_low(self):
+        # "no opinion" must never be presented as "negative opinion"
+        assert sv.classify_attention(
+            has_candidate_result=True, candidate_verdict="AVOID",
+            setup_state="unknown", readiness_status="ready",
+            control_verdict="AVOID",
+        ) == sv.ATTENTION_NO_READ
+
+    def test_every_tier_is_declared_and_ordered(self):
+        assert set(sv.ATTENTION_ORDER) == set(sv.ATTENTION_TIERS)
+        assert sv.ATTENTION_ORDER[sv.ATTENTION_HIGH] == 0
+        assert (sv.ATTENTION_ORDER[sv.ATTENTION_HIGH]
+                < sv.ATTENTION_ORDER[sv.ATTENTION_DEVELOPING]
+                < sv.ATTENTION_ORDER[sv.ATTENTION_LOW]
+                < sv.ATTENTION_ORDER[sv.ATTENTION_NO_READ]
+                < sv.ATTENTION_ORDER[sv.ATTENTION_NOT_READY])
+
+
+class TestClassifyCrossArm:
+    def test_both_flagged(self):
+        assert sv.classify_cross_arm(candidate_verdict="WATCH", control_verdict="ENTER") \
+            == sv.CROSS_ARM_BOTH_FLAGGED
+
+    def test_candidate_only(self):
+        assert sv.classify_cross_arm(candidate_verdict="WATCH", control_verdict="AVOID") \
+            == sv.CROSS_ARM_CANDIDATE_ONLY
+
+    def test_baseline_only(self):
+        assert sv.classify_cross_arm(candidate_verdict="AVOID", control_verdict="ENTER") \
+            == sv.CROSS_ARM_BASELINE_ONLY
+
+    def test_neither(self):
+        assert sv.classify_cross_arm(candidate_verdict="AVOID", control_verdict="AVOID") \
+            == sv.CROSS_ARM_NEITHER
+
+    def test_missing_arm_is_not_comparable(self):
+        assert sv.classify_cross_arm(candidate_verdict=None, control_verdict="AVOID") \
+            == sv.CROSS_ARM_NOT_COMPARABLE
+
+    def test_replaces_the_near_tautological_agreement_flag(self):
+        # the two arms share only AVOID, so verdict equality could only ever mean
+        # "both said AVOID" — cross_arm distinguishes the three other cases.
+        assert sv.classify_cross_arm(candidate_verdict="WATCH", control_verdict="AVOID") \
+            != sv.classify_cross_arm(candidate_verdict="AVOID", control_verdict="ENTER")
+
+
+class TestGateProgress:
+    def test_records_where_the_strategy_stopped(self):
+        gates = sv.build_gate_progress(_details(), allow_enter=False)
+        assert [g["gate"] for g in gates] == list(sv.GATE_ORDER)
+        by_gate = {g["gate"]: g for g in gates}
+        assert by_gate[sv.GATE_STRUCTURE]["status"] == sv.GATE_PASSED
+        assert by_gate[sv.GATE_SETUP]["status"] == sv.GATE_PASSED
+        assert by_gate[sv.GATE_TRIGGER]["status"] == sv.GATE_BLOCKED
+        assert by_gate[sv.GATE_TRIGGER]["code"] == "entry_reference_unavailable"
+        assert by_gate[sv.GATE_ROLLOUT]["status"] == sv.GATE_BLOCKED
+        assert by_gate[sv.GATE_ROLLOUT]["code"] == "enter_disabled_shadow_only"
+
+    def test_unreadable_structure_is_unknown_not_blocked(self):
+        gates = sv.build_gate_progress(
+            _details(setup_state="unknown", structure="unknown",
+                     reason="unknown_structure", waiting=()),
+            allow_enter=False)
+        by_gate = {g["gate"]: g for g in gates}
+        assert by_gate[sv.GATE_STRUCTURE]["status"] == sv.GATE_UNKNOWN
+        assert by_gate[sv.GATE_SETUP]["status"] == sv.GATE_UNKNOWN
+        assert by_gate[sv.GATE_STRUCTURE]["code"] == "unknown_structure"
+
+    def test_rejected_structure_is_blocked(self):
+        gates = sv.build_gate_progress(
+            _details(setup_state="invalid", structure="ambiguous",
+                     reason="ambiguous_structure", waiting=()),
+            allow_enter=False)
+        by_gate = {g["gate"]: g for g in gates}
+        assert by_gate[sv.GATE_STRUCTURE]["status"] == sv.GATE_BLOCKED
+        assert by_gate[sv.GATE_SETUP]["status"] == sv.GATE_BLOCKED
+
+    def test_no_evidence_yields_no_progress(self):
+        assert sv.build_gate_progress(None, allow_enter=False) is None
+        assert sv.build_blockers(None, allow_enter=False) == []
+
+    def test_blockers_are_the_unpassed_gates_in_order(self):
+        blockers = sv.build_blockers(_details(), allow_enter=False)
+        assert [b["gate"] for b in blockers] == [sv.GATE_TRIGGER, sv.GATE_ROLLOUT]
+
+
+class TestAttentionOrderingAndSummary:
+    def _row(self, symbol, attention, setup_state, score=None):
+        return {"symbol": symbol, "attention": attention,
+                "setup_state": setup_state, "candidate_score": score}
+
+    def test_orders_by_tier_then_structure_then_symbol(self):
+        rows = [
+            self._row("ZZZZ", sv.ATTENTION_NO_READ, "unknown"),
+            self._row("BBBB", sv.ATTENTION_HIGH, "valid"),
+            self._row("AAAA", sv.ATTENTION_HIGH, "valid"),
+            self._row("CCCC", sv.ATTENTION_DEVELOPING, "invalid"),
+            self._row("DDDD", sv.ATTENTION_NOT_READY, None),
+        ]
+        assert [r["symbol"] for r in sorted(rows, key=sv.attention_sort_key)] == [
+            "AAAA", "BBBB", "CCCC", "ZZZZ", "DDDD"]
+
+    def test_ordering_ignores_the_candidate_score(self):
+        # a high score must never lift a lower tier above a higher one
+        rows = [
+            self._row("LOWTIER", sv.ATTENTION_LOW, "invalid", score=0.99),
+            self._row("HIGHTIER", sv.ATTENTION_HIGH, "valid", score=0.01),
+        ]
+        assert [r["symbol"] for r in sorted(rows, key=sv.attention_sort_key)] == [
+            "HIGHTIER", "LOWTIER"]
+
+    def test_summary_counts_every_tier(self):
+        rows = [
+            self._row("A", sv.ATTENTION_HIGH, "valid"),
+            self._row("B", sv.ATTENTION_HIGH, "valid"),
+            self._row("C", sv.ATTENTION_NO_READ, "unknown"),
+        ]
+        summary = sv.summarize_attention(rows)
+        assert summary["total"] == 3
+        assert summary[sv.ATTENTION_HIGH] == 2
+        assert summary[sv.ATTENTION_NO_READ] == 1
+        assert summary[sv.ATTENTION_DEVELOPING] == 0
+        assert set(summary) == set(sv.ATTENTION_TIERS) | {"total"}
+
+
+class TestOverviewRowProductFields:
+    def test_exposes_the_structural_read_not_just_the_boolean(self):
+        row = {
+            "symbol": "AAPL", "candidate_verdict": "WATCH", "candidate_score": 0.43,
+            "candidate_details": _details(),
+            "control_verdict": "AVOID", "control_score": 0.0,
+        }
+        out = sv.build_overview_row(row, scanner_state=sv.SCANNER_STATE_FRESH)
+        assert out["attention"] == sv.ATTENTION_HIGH
+        assert out["setup_state"] == "valid"
+        assert out["structure_state"] == "recognized"
+        assert out["reason_code"] == "watch_setup_valid"
+        assert out["cross_arm"] == sv.CROSS_ARM_CANDIDATE_ONLY
+
+    def test_setup_present_is_retained_but_is_true_for_every_state(self):
+        # documents exactly why the UI must not lead with it
+        for state in ("valid", "invalid", "unknown"):
+            row = {"symbol": "X", "candidate_verdict": "AVOID", "candidate_score": None,
+                   "candidate_details": _details(setup_state=state),
+                   "control_verdict": "AVOID", "control_score": 0.0}
+            out = sv.build_overview_row(row, scanner_state=sv.SCANNER_STATE_FRESH)
+            assert out["setup_present"] is True
+            assert out["setup_state"] == state
+
+    def test_row_without_evaluation_is_not_ready(self):
+        row = {"symbol": "PLTR", "candidate_verdict": None, "candidate_score": None,
+               "candidate_details": None, "control_verdict": "AVOID", "control_score": 0.1}
+        out = sv.build_overview_row(row, scanner_state=sv.SCANNER_STATE_FRESH)
+        assert out["attention"] == sv.ATTENTION_NOT_READY
+        assert out["setup_state"] is None
+        assert out["cross_arm"] == sv.CROSS_ARM_NOT_COMPARABLE
+
+    def test_stale_scan_keeps_the_attention_tier_informative(self):
+        # symbol_state collapses to `stale`, attention must NOT
+        row = {"symbol": "AAPL", "candidate_verdict": "WATCH", "candidate_score": 0.43,
+               "candidate_details": _details(),
+               "control_verdict": "AVOID", "control_score": 0.0}
+        out = sv.build_overview_row(row, scanner_state=sv.SCANNER_STATE_STALE)
+        assert out["symbol_state"] == sv.SYMBOL_STATE_STALE
+        assert out["attention"] == sv.ATTENTION_HIGH
+
+
+# --------------------------------------------------------------------------- #
 # Regression: the persistence shape the DURABLE WORKER actually writes.
 #
 # app/workers/shadow/runner.py always writes the session at the telemetry ROOT
