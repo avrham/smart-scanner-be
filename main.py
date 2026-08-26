@@ -16,7 +16,7 @@ from app.history_warmup_mode import is_history_warmup_route_allowed
 from app.prospective_mode import is_prospective_route_allowed
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
-from app.routers import public, admin, outcomes, shadow
+from app.routers import public, admin, outcomes, shadow, scanner
 from app.routers import jobs as jobs_router
 from app.utils.logging import setup_logging
 from app.workers.scheduler import start_scheduler
@@ -161,6 +161,7 @@ app.add_middleware(
 app.include_router(public.router, prefix="/api", tags=["public"])
 app.include_router(outcomes.router, prefix="/api", tags=["outcomes"])
 app.include_router(shadow.router, prefix="/api", tags=["shadow"])
+app.include_router(scanner.router, prefix="/api", tags=["scanner"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(jobs_router.router, prefix="/api/admin", tags=["jobs"])
 

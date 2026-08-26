@@ -1,8 +1,9 @@
 """Audit-only route gate (Deployment Readiness).
 
 When AUDIT_ONLY_MODE is enabled, the running API must expose ONLY a narrow,
-read-only allowlist: revision/liveness plus the shadow-cohort audit routes.
-Every other route — including all mutation endpoints, provider/universe/scan
+read-only allowlist: revision/liveness, the shadow-cohort audit routes, and
+the product-facing Smart Scanner UI routes (app/routers/scanner.py). Every
+other route — including all mutation endpoints, provider/universe/scan
 endpoints, campaign create/resume, outcome calculation, and the OpenAPI/docs
 routes — is rejected BEFORE its handler executes, so no provider or database
 mutation path can be reached even with a valid worker token.
@@ -36,6 +37,12 @@ AUDIT_ONLY_ALLOWLIST: Set[str] = frozenset({
     "/api/admin/shadow-cohort/paired-comparison",
     "/api/admin/shadow-cohort/paired-metrics",
     "/api/admin/shadow-cohort/prospective-readiness",
+    # Product-facing Smart Scanner UI surface (read-only; GET only). Query
+    # params carry all variable input (symbol, session, limit) so each path
+    # stays an exact, statically allowlistable string.
+    "/api/scanner/overview",
+    "/api/scanner/symbol",
+    "/api/scanner/scans",
 })
 
 # Read-only HTTP methods permitted for allowlisted routes (HEAD supported so
