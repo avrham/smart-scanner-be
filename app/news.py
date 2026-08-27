@@ -124,20 +124,31 @@ _CATEGORY_PATTERNS = (
         r"\b(upgrades?|downgrades?|price\s+target|initiates?\s+coverage"
         r"|reiterates?\s+(buy|sell|hold)|analyst\s+rating)\b")),
     (CATEGORY_MERGER_ACQUISITION, re.compile(
+        # NOT "to buy X": in this feed that phrase is almost always advice
+        # ("3 Dividend Stocks to Buy and Hold"), not a transaction. Measured on
+        # the real corpus, it produced false positives and nothing else.
         r"\b(acquires?|acquisition|merger|merges?\s+with|takeover"
-        r"|to\s+buy\s+\w+|buyout|divests?|spin[-\s]?off)\b")),
+        r"|buyout|divests?|spin[-\s]?off)\b")),
     (CATEGORY_REGULATORY_LEGAL, re.compile(
         r"\b(lawsuit|sues?|sued|antitrust|regulators?|investigation"
         r"|settlement|fined?|subpoena|ftc|doj|sec\s+(probe|charges))\b")),
     (CATEGORY_MANAGEMENT, re.compile(
-        r"\b(ceo|cfo|coo|chief\s+executive|steps?\s+down|resigns?"
-        r"|appoints?|names?\s+new\s+\w+|succession)\b")),
+        # A management CHANGE, not any sentence containing "CEO" — quoting a
+        # sitting chief executive is not a corporate event.
+        r"\b((ceo|cfo|coo|chief\s+executive)\s+(steps?\s+down|resigns?"
+        r"|departs?|to\s+retire|out\b)|steps?\s+down\s+as|resigns?\s+as"
+        r"|appoints?\s+\w+\s+(ceo|cfo|coo)|names?\s+new\s+(ceo|cfo|coo)"
+        r"|succession\s+plan)\b")),
     (CATEGORY_PRODUCT_ANNOUNCEMENT, re.compile(
         r"\b(launches?|unveils?|announces?\s+new|introduces?|debuts?"
         r"|rolls?\s+out|releases?\s+new)\b")),
     (CATEGORY_FINANCING_CAPITAL, re.compile(
-        r"\b(dividend|buyback|share\s+repurchase|stock\s+split"
-        r"|offering|raises?\s+\$|debt\s+offering|issues?\s+notes)\b")),
+        # A capital ACTION. Bare "dividend" matched every dividend-screen
+        # opinion piece in the corpus, which is a topic, not an event.
+        r"\b(raises?\s+(its\s+)?dividend|dividend\s+(hike|increase|cut)"
+        r"|declares?\s+(a\s+)?(special\s+)?dividend|buyback"
+        r"|share\s+repurchase|stock\s+split|debt\s+offering"
+        r"|issues?\s+notes|secondary\s+offering)\b")),
 )
 
 # ---- proximity -------------------------------------------------------------- #
