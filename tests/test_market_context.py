@@ -229,21 +229,25 @@ class TestUniverseBreadth:
 # --------------------------------------------------------------------------- #
 
 class TestUnavailableDimensions:
-    def test_benchmark_is_reported_unavailable_never_proxied(self):
-        b = mc.build_benchmark_context()
+    def test_benchmark_frame_is_unavailable_without_reference_data(self):
+        u = {f"S{i}": rising(70, step=1 + i) for i in range(25)}
+        ctx = mc.build_market_context("S00", u, as_of_session="2026-08-25")
+        b = ctx["benchmark_relative_strength"]
         assert b["status"] == mc.STATUS_UNAVAILABLE
         assert b["reason"] == "no_benchmark_series_stored"
 
-    def test_sector_is_reported_unavailable_never_invented(self):
-        s = mc.build_sector_context()
-        assert s["status"] == mc.STATUS_UNAVAILABLE
-        assert s["reason"] == "no_sector_metadata_stored"
-
-    def test_relative_strength_never_claims_a_benchmark_it_lacks(self):
+    def test_sector_frame_is_unavailable_for_an_unmapped_symbol(self):
         u = {f"S{i}": rising(70, step=1 + i) for i in range(25)}
         ctx = mc.build_market_context("S00", u, as_of_session="2026-08-25")
-        assert ctx["benchmark_context"]["status"] == mc.STATUS_UNAVAILABLE
-        assert ctx["relative_strength"]["comparator"] == mc.COMPARATOR_UNIVERSE_MEDIAN
+        s = ctx["sector_relative_strength"]
+        assert s["status"] == mc.STATUS_UNAVAILABLE
+        assert s["reason"] == "no_sector_metadata_for_symbol"
+
+    def test_universe_frame_never_claims_a_benchmark_it_lacks(self):
+        u = {f"S{i}": rising(70, step=1 + i) for i in range(25)}
+        ctx = mc.build_market_context("S00", u, as_of_session="2026-08-25")
+        assert ctx["scanner_universe_relative_strength"]["comparator"] == \
+            mc.COMPARATOR_UNIVERSE_MEDIAN
 
     def test_context_universe_is_exactly_what_was_supplied(self):
         """Candidate/benchmark isolation.
@@ -266,20 +270,22 @@ class TestMarketContextDto:
         assert ctx["contract_version"] == mc.MARKET_CONTEXT_CONTRACT_VERSION
         assert ctx["as_of_session"] == "2026-08-25"
         assert set(ctx) == {
-            "contract_version", "as_of_session", "relative_strength",
-            "volume_context", "benchmark_context", "sector_context",
+            "contract_version", "as_of_session",
+            "scanner_universe_relative_strength", "benchmark_relative_strength",
+            "sector_relative_strength", "volume_context", "market_regime",
         }
 
     def test_every_dimension_declares_an_explicit_status(self):
         u = {f"S{i}": rising(70, step=1 + i) for i in range(25)}
         ctx = mc.build_market_context("S05", u, as_of_session="2026-08-25")
-        for key in ("relative_strength", "volume_context", "benchmark_context",
-                    "sector_context"):
+        for key in ("scanner_universe_relative_strength",
+                    "benchmark_relative_strength", "sector_relative_strength",
+                    "volume_context", "market_regime"):
             assert ctx[key]["status"] in mc.CONTEXT_STATUSES
 
     def test_context_for_an_unscanned_symbol_degrades_cleanly(self):
         ctx = mc.build_market_context("NOPE", {}, as_of_session=None)
-        assert ctx["relative_strength"]["status"] == mc.STATUS_UNAVAILABLE
+        assert ctx["scanner_universe_relative_strength"]["status"] == mc.STATUS_UNAVAILABLE
         assert ctx["volume_context"]["status"] == mc.STATUS_INSUFFICIENT_HISTORY
         assert ctx["as_of_session"] is None
 
@@ -291,7 +297,12 @@ class TestRowContext:
         assert set(row) == {
             "relative_strength", "relative_strength_status",
             "relative_strength_excess_pct", "relative_strength_horizon_days",
-            "comparator", "volume", "volume_status", "relative_volume",
+            "comparator",
+            "benchmark_relative", "benchmark_relative_status",
+            "benchmark_relative_return_pct", "benchmark_symbol",
+            "sector_relative", "sector_relative_status",
+            "sector_relative_return_pct", "sector", "sector_benchmark_symbol",
+            "volume", "volume_status", "relative_volume",
         }
         assert row["relative_strength"] == mc.RS_OUTPERFORMING
         assert row["comparator"] == mc.COMPARATOR_UNIVERSE_MEDIAN

@@ -31,6 +31,7 @@ from app.deps import get_db
 import app.prospective_campaign as pc
 from app.prospective_session import resolve_latest_completed_session
 import app.market_context as mc
+import app.reference_market as rm
 import app.scanner_view as sv
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,19 @@ async def _fetch_scan_universe(db: asyncpg.Connection, run_id: Any) -> List[str]
         run_id,
     )
     return [r["symbol"] for r in rows]
+
+
+async def _fetch_reference_bars(
+    db: asyncpg.Connection, session: Optional[str]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Daily bars for the reference-market symbols, truncated at the same scan
+    session as the candidates.
+
+    ONE bounded query for all reference symbols — never per symbol, and never
+    per candidate row. Reference symbols are read here purely as context; they
+    are not part of the scanned universe and never enter `results`.
+    """
+    return await _fetch_universe_bars(db, rm.reference_symbols(), session)
 
 
 async def _resolve_universe(db: asyncpg.Connection, campaign: Dict[str, Any]) -> List[str]:
@@ -225,6 +239,7 @@ async def scanner_overview(
     now = datetime.now(timezone.utc)
     latest_completed_session = str(resolve_latest_completed_session(now))
     universe_breadth: Dict[str, Any] = mc.build_universe_breadth({})
+    market_regime: Dict[str, Any] = mc.build_market_regime({})
 
     campaign = await _fetch_latest_campaign(db, session=session)
     scanner_state = sv.classify_scanner_state(
@@ -246,9 +261,15 @@ async def scanner_overview(
         context_bars = await _fetch_universe_bars(
             db, universe_symbols, campaign["as_of_date"]
         )
+        reference_bars = await _fetch_reference_bars(db, campaign["as_of_date"])
         for row in results:
-            row["market_context"] = sv.build_row_context(row["symbol"], context_bars)
+            row["market_context"] = sv.build_row_context(
+                row["symbol"], context_bars, reference_bars
+            )
         universe_breadth = mc.build_universe_breadth(context_bars)
+        market_regime = mc.build_market_regime(
+            reference_bars, universe_breadth=universe_breadth
+        )
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -278,7 +299,9 @@ async def scanner_overview(
         "results_summary": sv.summarize_results(results),
         "attention_summary": sv.summarize_attention(results),
         # Breadth of the SCANNED UNIVERSE — explicitly not market breadth.
-        "universe_breadth": universe_breadth,
+        "scanner_universe_breadth": universe_breadth,
+        # Broad environment from the benchmark. Context only; it changes no verdict.
+        "market_regime": market_regime,
         "results": results,
         "strategy": {
             "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
@@ -355,8 +378,12 @@ async def scanner_symbol_detail(
     context_bars = await _fetch_universe_bars(
         db, universe_symbols, campaign["as_of_date"]
     )
+    reference_bars = await _fetch_reference_bars(db, campaign["as_of_date"])
     market_context = mc.build_market_context(
-        symbol, context_bars, as_of_session=campaign["as_of_date"]
+        symbol, context_bars,
+        as_of_session=campaign["as_of_date"],
+        reference_bars=reference_bars,
+        universe_breadth=mc.build_universe_breadth(context_bars),
     )
 
     daily = await db.fetchrow(

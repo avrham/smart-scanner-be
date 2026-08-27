@@ -252,7 +252,9 @@ def build_overview_row(row: Dict[str, Any], *, scanner_state: str) -> Dict[str, 
 
 
 def build_row_context(
-    symbol: str, bars_by_symbol: Dict[str, Any]
+    symbol: str,
+    bars_by_symbol: Dict[str, Any],
+    reference_bars: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """The COMPACT context a list row carries.
 
@@ -261,14 +263,30 @@ def build_row_context(
     hierarchy. The full object (horizons, benchmark, sector) lives on the
     symbol-detail response.
     """
+    refs = reference_bars or {}
     rs = mc.build_relative_strength(symbol, bars_by_symbol)
+    bench = mc.build_benchmark_relative_strength(symbol, bars_by_symbol, refs)
+    sector = mc.build_sector_relative_strength(symbol, bars_by_symbol, refs)
     volume = mc.build_volume_context(bars_by_symbol.get(symbol) or [])
     return {
+        # vs the other scanned symbols
         "relative_strength": rs["category"],
         "relative_strength_status": rs["status"],
         "relative_strength_excess_pct": rs["excess_pct"],
         "relative_strength_horizon_days": rs["primary_horizon_days"],
         "comparator": rs["comparator"],
+        # vs the broad market
+        "benchmark_relative": bench["category"],
+        "benchmark_relative_status": bench["status"],
+        "benchmark_relative_return_pct": bench["relative_return_pct"],
+        "benchmark_symbol": bench["reference_symbol"],
+        # vs its own sector
+        "sector_relative": sector["category"],
+        "sector_relative_status": sector["status"],
+        "sector_relative_return_pct": sector["relative_return_pct"],
+        "sector": sector.get("sector"),
+        "sector_benchmark_symbol": sector["reference_symbol"],
+        # participation
         "volume": volume["category"],
         "volume_status": volume["status"],
         "relative_volume": volume["relative_volume"],

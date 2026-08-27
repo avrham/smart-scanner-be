@@ -36,7 +36,9 @@ from __future__ import annotations
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-MARKET_CONTEXT_CONTRACT_VERSION = "smart_scanner_market_context.v1"
+import app.reference_market as rm
+
+MARKET_CONTEXT_CONTRACT_VERSION = "smart_scanner_market_context.v2"
 
 # ---- availability states --------------------------------------------------- #
 # Explicit, never null-as-a-meaning: product behaviour depends on telling
@@ -337,32 +339,273 @@ def build_universe_breadth(
     }
 
 
+
 # --------------------------------------------------------------------------- #
-# the unavailable dimensions, reported honestly
+# Benchmark- and sector-relative strength
+#
+# FORMULATION (documented, not implied): for symbol S, reference R and horizon H
+# trading sessions,
+#
+#     symbol_return_H    = (close_S(D) / close_S(D-H) - 1) * 100
+#     reference_return_H = (close_R(D) / close_R(D-H) - 1) * 100
+#     relative_return_H  = symbol_return_H - reference_return_H
+#
+# i.e. the arithmetic difference of simple percent returns over the SAME set of
+# completed market sessions. It is a spread in percentage points, not a ratio
+# and not an oscillator — this is never RSI.
+#
+# Alignment: both series are truncated at the same scan session before the
+# window is taken, and a horizon resolves only when BOTH have H+1 bars. A
+# reference with short history yields `insufficient_history`, never a silently
+# shorter window.
 # --------------------------------------------------------------------------- #
 
-def build_benchmark_context() -> Dict[str, Any]:
-    """No index or ETF series is stored — only the 25 candidate symbols — so
-    there is nothing to measure against. Reported rather than proxied."""
-    return {
-        "status": STATUS_UNAVAILABLE,
-        "reason": "no_benchmark_series_stored",
-        "detail": (
-            "Daily bars are stored only for the frozen candidate universe. "
-            "Relative strength is measured against the scanner universe median."
-        ),
+REL_OUTPERFORMING = "outperforming"
+REL_IN_LINE = "in_line"
+REL_UNDERPERFORMING = "underperforming"
+REL_CATEGORIES = (REL_OUTPERFORMING, REL_IN_LINE, REL_UNDERPERFORMING)
+
+# Display band in PERCENTAGE POINTS. A spread inside +/- this reads as in line,
+# so a trivial difference does not flip a label. An a priori round number, not
+# fitted to any outcome; the exact relative_return_pct is always returned too.
+REL_NEUTRAL_BAND_PCT = 1.0
+
+
+def classify_relative_return(relative_return_pct: Optional[float]) -> Optional[str]:
+    if relative_return_pct is None:
+        return None
+    if relative_return_pct > REL_NEUTRAL_BAND_PCT:
+        return REL_OUTPERFORMING
+    if relative_return_pct < -REL_NEUTRAL_BAND_PCT:
+        return REL_UNDERPERFORMING
+    return REL_IN_LINE
+
+
+def build_reference_relative_strength(
+    symbol_bars: Sequence[Dict[str, Any]],
+    reference_bars: Optional[Sequence[Dict[str, Any]]],
+    *,
+    reference_symbol: Optional[str],
+    reference_kind: str,
+    unavailable_reason: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Relative strength of one symbol against ONE named reference series."""
+    base: Dict[str, Any] = {
+        "reference_symbol": reference_symbol,
+        "reference_kind": reference_kind,
+        "primary_horizon_days": RS_PRIMARY_HORIZON,
+        "category": None,
+        "relative_return_pct": None,
+        "horizons": [],
+    }
+    if extra:
+        base.update(extra)
+
+    if not reference_symbol or not reference_bars:
+        base["status"] = STATUS_UNAVAILABLE
+        base["reason"] = unavailable_reason or "no_reference_series_stored"
+        return base
+    if not symbol_bars:
+        base["status"] = STATUS_UNAVAILABLE
+        base["reason"] = "no_stored_bars_for_symbol"
+        return base
+
+    horizons: List[Dict[str, Any]] = []
+    for days in RS_HORIZONS:
+        own = horizon_return_pct(symbol_bars, days)
+        ref = horizon_return_pct(reference_bars, days)
+        if own is None or ref is None:
+            horizons.append({
+                "days": days,
+                "status": STATUS_INSUFFICIENT_HISTORY,
+                "symbol_return_pct": _round(own),
+                "reference_return_pct": _round(ref),
+                "relative_return_pct": None,
+                "category": None,
+            })
+            continue
+        relative = own - ref
+        horizons.append({
+            "days": days,
+            "status": STATUS_AVAILABLE,
+            "symbol_return_pct": _round(own),
+            "reference_return_pct": _round(ref),
+            "relative_return_pct": _round(relative),
+            "category": classify_relative_return(relative),
+        })
+
+    primary = next((h for h in horizons if h["days"] == RS_PRIMARY_HORIZON), None)
+    ok = primary is not None and primary["status"] == STATUS_AVAILABLE
+    base["status"] = STATUS_AVAILABLE if ok else STATUS_INSUFFICIENT_HISTORY
+    base["category"] = primary["category"] if ok else None
+    base["relative_return_pct"] = primary["relative_return_pct"] if ok else None
+    base["horizons"] = horizons
+    return base
+
+
+def build_benchmark_relative_strength(
+    symbol: str,
+    bars_by_symbol: Dict[str, Sequence[Dict[str, Any]]],
+    reference_bars: Dict[str, Sequence[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Against the designated broad-market benchmark, plus secondary references."""
+    primary = rm.PRIMARY_BENCHMARK
+    block = build_reference_relative_strength(
+        bars_by_symbol.get(symbol) or [],
+        reference_bars.get(primary),
+        reference_symbol=primary,
+        reference_kind=rm.REFERENCE_BROAD_MARKET,
+        unavailable_reason="no_benchmark_series_stored",
+        extra={"reference_name": (rm.REFERENCE_BY_SYMBOL.get(primary).name
+                                  if primary in rm.REFERENCE_BY_SYMBOL else None)},
+    )
+    # Secondary broad references are reported ALONGSIDE — never as the benchmark.
+    secondary = []
+    for sym in rm.SECONDARY_BENCHMARKS:
+        entry = rm.REFERENCE_BY_SYMBOL.get(sym)
+        secondary.append(build_reference_relative_strength(
+            bars_by_symbol.get(symbol) or [],
+            reference_bars.get(sym),
+            reference_symbol=sym,
+            reference_kind=rm.REFERENCE_BROAD_MARKET,
+            unavailable_reason="no_benchmark_series_stored",
+            extra={"reference_name": entry.name if entry else None},
+        ))
+    block["secondary_references"] = secondary
+    return block
+
+
+def build_sector_relative_strength(
+    symbol: str,
+    bars_by_symbol: Dict[str, Sequence[Dict[str, Any]]],
+    reference_bars: Dict[str, Sequence[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Against the symbol's OWN sector benchmark.
+
+    Answers "is this strong because its whole sector is strong, or is it
+    outperforming its own sector?". When the sector is unmapped or its ETF has
+    no stored history the result is explicitly unavailable — the broad benchmark
+    is never silently substituted.
+    """
+    sector = rm.sector_for(symbol)
+    benchmark = rm.sector_benchmark_for(symbol)
+    extra = {
+        "sector": sector,
+        "sector_registry": rm.sector_registry_provenance(),
+        "reference_name": (rm.REFERENCE_BY_SYMBOL.get(benchmark).name
+                           if benchmark in rm.REFERENCE_BY_SYMBOL else None),
+    }
+    if sector is None:
+        block = build_reference_relative_strength(
+            bars_by_symbol.get(symbol) or [], None,
+            reference_symbol=None, reference_kind=rm.REFERENCE_SECTOR,
+            unavailable_reason="no_sector_metadata_for_symbol", extra=extra)
+        return block
+    return build_reference_relative_strength(
+        bars_by_symbol.get(symbol) or [],
+        reference_bars.get(benchmark) if benchmark else None,
+        reference_symbol=benchmark,
+        reference_kind=rm.REFERENCE_SECTOR,
+        unavailable_reason="no_sector_benchmark_series_stored",
+        extra=extra,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Market Regime V1
+#
+# A small, auditable description of the broad environment — NOT a prediction and
+# NOT an input to any verdict or tier. Two pieces of benchmark evidence decide
+# the category; universe breadth is reported alongside as secondary colour only,
+# so the regime cannot be moved by the 25-symbol sample.
+#
+#   trend      : SPY close vs its own 50-session simple moving average
+#   direction  : sign of SPY's 20-session return
+#
+#   supportive        trend above AND direction up
+#   defensive         trend below AND direction down
+#   mixed             the two disagree
+#   insufficient_data fewer than 51 stored SPY sessions
+#
+# Thresholds are structural (above/below, positive/negative). Nothing was tuned.
+# --------------------------------------------------------------------------- #
+
+REGIME_SUPPORTIVE = "supportive"
+REGIME_MIXED = "mixed"
+REGIME_DEFENSIVE = "defensive"
+REGIME_INSUFFICIENT = "insufficient_data"
+REGIME_CATEGORIES = (REGIME_SUPPORTIVE, REGIME_MIXED, REGIME_DEFENSIVE,
+                     REGIME_INSUFFICIENT)
+
+REGIME_TREND_WINDOW = 50
+REGIME_DIRECTION_HORIZON = 20
+
+
+def build_market_regime(
+    reference_bars: Dict[str, Sequence[Dict[str, Any]]],
+    *,
+    universe_breadth: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    benchmark = rm.PRIMARY_BENCHMARK
+    bars = reference_bars.get(benchmark) or []
+    breadth_note = None
+    if universe_breadth and universe_breadth.get("status") == STATUS_AVAILABLE:
+        above = universe_breadth.get("above_trend") or {}
+        breadth_note = {
+            "scope": universe_breadth.get("scope"),
+            "symbol_count": universe_breadth.get("symbol_count"),
+            "above_trend_pct": above.get("pct"),
+            "note": "Secondary colour only — it does not decide the regime.",
+        }
+
+    base: Dict[str, Any] = {
+        "benchmark_symbol": benchmark,
+        "trend_window_days": REGIME_TREND_WINDOW,
+        "direction_horizon_days": REGIME_DIRECTION_HORIZON,
+        "regime": REGIME_INSUFFICIENT,
+        "trend": None,
+        "direction": None,
+        "benchmark_close": None,
+        "benchmark_trend_average": None,
+        "benchmark_return_pct": None,
+        "universe_breadth": breadth_note,
     }
 
+    if len(bars) < REGIME_TREND_WINDOW + 1:
+        base["status"] = STATUS_INSUFFICIENT_HISTORY if bars else STATUS_UNAVAILABLE
+        base["reason"] = ("no_benchmark_series_stored" if not bars
+                          else "insufficient_benchmark_history")
+        return base
 
-def build_sector_context() -> Dict[str, Any]:
-    """The store has no sector/industry metadata at all — the `tickers` table is
-    empty and carries no sector column — so peer/sector comparison would be
-    invented, not derived."""
-    return {
-        "status": STATUS_UNAVAILABLE,
-        "reason": "no_sector_metadata_stored",
-        "detail": "No sector or industry data exists for the scanned symbols.",
-    }
+    closes = _closes(bars)
+    sma = sum(closes[-REGIME_TREND_WINDOW:]) / REGIME_TREND_WINDOW
+    close = closes[-1]
+    direction_return = horizon_return_pct(bars, REGIME_DIRECTION_HORIZON)
+    if direction_return is None:
+        base["status"] = STATUS_INSUFFICIENT_HISTORY
+        base["reason"] = "insufficient_benchmark_history"
+        return base
+
+    trend_above = close > sma
+    direction_up = direction_return > 0
+    if trend_above and direction_up:
+        regime = REGIME_SUPPORTIVE
+    elif not trend_above and not direction_up:
+        regime = REGIME_DEFENSIVE
+    else:
+        regime = REGIME_MIXED
+
+    base.update({
+        "status": STATUS_AVAILABLE,
+        "regime": regime,
+        "trend": "above" if trend_above else "below",
+        "direction": "up" if direction_up else "down",
+        "benchmark_close": _round(close),
+        "benchmark_trend_average": _round(sma),
+        "benchmark_return_pct": _round(direction_return),
+    })
+    return base
 
 
 def build_market_context(
@@ -370,15 +613,34 @@ def build_market_context(
     bars_by_symbol: Dict[str, Sequence[Dict[str, Any]]],
     *,
     as_of_session: Optional[str],
+    reference_bars: Optional[Dict[str, Sequence[Dict[str, Any]]]] = None,
+    universe_breadth: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """The full per-symbol context object exposed by the Product API."""
+    """The full per-symbol context object exposed by the Product API.
+
+    Three reference frames are kept SEPARATE and each names its own comparator,
+    so a consumer never has to wonder "relative to what?":
+
+      scanner_universe_relative_strength -> vs the other scanned symbols
+      benchmark_relative_strength        -> vs the broad market (SPY)
+      sector_relative_strength           -> vs the symbol's own sector ETF
+
+    They are never blended into a composite score, and none of them touches the
+    strategy verdict or the attention tier.
+    """
+    refs = reference_bars or {}
     return {
         "contract_version": MARKET_CONTEXT_CONTRACT_VERSION,
         "as_of_session": as_of_session,
-        "relative_strength": build_relative_strength(symbol, bars_by_symbol),
+        "scanner_universe_relative_strength": build_relative_strength(
+            symbol, bars_by_symbol),
+        "benchmark_relative_strength": build_benchmark_relative_strength(
+            symbol, bars_by_symbol, refs),
+        "sector_relative_strength": build_sector_relative_strength(
+            symbol, bars_by_symbol, refs),
         "volume_context": build_volume_context(bars_by_symbol.get(symbol) or []),
-        "benchmark_context": build_benchmark_context(),
-        "sector_context": build_sector_context(),
+        "market_regime": build_market_regime(
+            refs, universe_breadth=universe_breadth),
     }
 
 
@@ -395,5 +657,12 @@ __all__ = [
     "horizon_return_pct", "percentile_rank",
     "classify_relative_strength", "classify_volume",
     "build_relative_strength", "build_volume_context", "build_universe_breadth",
-    "build_benchmark_context", "build_sector_context", "build_market_context",
+    "build_market_context",
+    "REL_OUTPERFORMING", "REL_IN_LINE", "REL_UNDERPERFORMING", "REL_CATEGORIES",
+    "REL_NEUTRAL_BAND_PCT", "classify_relative_return",
+    "build_reference_relative_strength", "build_benchmark_relative_strength",
+    "build_sector_relative_strength",
+    "REGIME_SUPPORTIVE", "REGIME_MIXED", "REGIME_DEFENSIVE",
+    "REGIME_INSUFFICIENT", "REGIME_CATEGORIES",
+    "REGIME_TREND_WINDOW", "REGIME_DIRECTION_HORIZON", "build_market_regime",
 ]

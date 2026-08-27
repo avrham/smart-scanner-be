@@ -33,6 +33,7 @@ import asyncpg
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import app.market_context as mc  # noqa: E402
+import app.reference_market as rm  # noqa: E402
 import app.scanner_view as sv  # noqa: E402
 from app.prospective_campaign import (  # noqa: E402
     CANDIDATE_ARM_CODE,
@@ -67,6 +68,15 @@ WHERE trading_date <= $1::text::date
 ORDER BY symbol, trading_date
 """
 
+# Reference series are loaded SEPARATELY from candidate bars and never merged
+# into the scanned universe — the same split the Product API uses.
+REFERENCE_BARS_SQL = """
+SELECT symbol, trading_date, close, volume
+FROM daily_bars
+WHERE symbol = ANY($2::text[]) AND trading_date <= $1::text::date
+ORDER BY symbol, trading_date
+"""
+
 
 def _json(v: Any) -> Any:
     if isinstance(v, str):
@@ -83,14 +93,28 @@ async def load(dsn: str) -> Dict[str, Any]:
         evals = await conn.fetch(EVAL_SQL, CANDIDATE_ARM_CODE, CONTROL_ARM_CODE)
         sessions = sorted({r["session"] for r in evals if r["session"]})
         bars_by_session: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        refs_by_session: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        candidate_symbols = {r["symbol"] for r in evals}
         for session in sessions:
             rows = await conn.fetch(BARS_SQL, session)
             by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
             for b in rows:
+                # keep reference series OUT of the scanned universe
+                if b["symbol"] not in candidate_symbols:
+                    continue
                 by_symbol[b["symbol"]].append(
                     {"close": float(b["close"]), "volume": float(b["volume"] or 0.0)}
                 )
             bars_by_session[session] = dict(by_symbol)
+
+            ref_rows = await conn.fetch(
+                REFERENCE_BARS_SQL, session, rm.reference_symbols())
+            refs: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for b in ref_rows:
+                refs[b["symbol"]].append(
+                    {"close": float(b["close"]), "volume": float(b["volume"] or 0.0)}
+                )
+            refs_by_session[session] = dict(refs)
     finally:
         await conn.close()
 
@@ -110,7 +134,8 @@ async def load(dsn: str) -> Dict[str, Any]:
             candidate_verdict=d["cand_verdict"], control_verdict=d["ctrl_verdict"]
         )
         out.append(d)
-    return {"evals": out, "bars": bars_by_session, "sessions": sessions}
+    return {"evals": out, "bars": bars_by_session,
+            "refs": refs_by_session, "sessions": sessions}
 
 
 def line(title: str, ch: str = "-") -> None:
@@ -158,6 +183,7 @@ async def main() -> int:
 
     data = await load(dsn)
     evals, bars, sessions = data["evals"], data["bars"], data["sessions"]
+    refs = data["refs"]
 
     print("=" * 78)
     print("MARKET CONTEXT — DESCRIPTIVE AUDIT (no inference, no tuning)")
@@ -166,10 +192,49 @@ async def main() -> int:
     print(f"relative strength comparator: {mc.COMPARATOR_UNIVERSE_MEDIAN} "
           f"(NOT a market index — none is stored)")
 
-    # attach context as of each session
+    # attach context as of each session — no lookahead: both the candidate and
+    # the reference series are truncated at that session before any window.
     for r in evals:
         by_symbol = bars.get(r["session"]) or {}
-        r["context"] = sv.build_row_context(r["symbol"], by_symbol)
+        by_ref = refs.get(r["session"]) or {}
+        r["context"] = sv.build_row_context(r["symbol"], by_symbol, by_ref)
+
+    line("REFERENCE DATA COVERAGE PER CAMPAIGN", "=")
+    for session in sessions:
+        by_ref = refs.get(session) or {}
+        have = {s: len(b) for s, b in sorted(by_ref.items())}
+        print(f"  {session}: {have}")
+
+    line("MARKET REGIME PER CAMPAIGN (from the benchmark)", "=")
+    for session in sessions:
+        regime = mc.build_market_regime(
+            refs.get(session) or {},
+            universe_breadth=mc.build_universe_breadth(bars.get(session) or {}))
+        print(f"  {session}  regime={regime['regime']:<12} "
+              f"status={regime['status']:<20} trend={regime.get('trend')} "
+              f"direction={regime.get('direction')} "
+              f"{rm.PRIMARY_BENCHMARK} 20D={regime.get('benchmark_return_pct')}")
+
+    line("BENCHMARK / SECTOR RELATIVE STRENGTH DISTRIBUTION", "=")
+    for session in sessions:
+        b = Counter(r["context"]["benchmark_relative"]
+                    for r in evals if r["session"] == session)
+        sec = Counter(r["context"]["sector_relative"]
+                      for r in evals if r["session"] == session)
+        print(f"  {session}  broad {dict(b)}")
+        print(f"  {'':<12} sector {dict(sec)}")
+
+    line("ATTENTION x BROAD-MARKET RELATIVE (counts)", "=")
+    for (tier, cat), n in sorted(
+        Counter((r["attention"], r["context"]["benchmark_relative"])
+                for r in evals).items(), key=lambda kv: str(kv[0])):
+        print(f"  {tier:<16} {str(cat):<18} {n:>4}")
+
+    line("ATTENTION x SECTOR RELATIVE (counts)", "=")
+    for (tier, cat), n in sorted(
+        Counter((r["attention"], r["context"]["sector_relative"])
+                for r in evals).items(), key=lambda kv: str(kv[0])):
+        print(f"  {tier:<16} {str(cat):<18} {n:>4}")
 
     line("UNIVERSE BREADTH PER CAMPAIGN (scanner universe, NOT the market)", "=")
     breadth_report: Dict[str, Any] = {}
@@ -220,13 +285,23 @@ async def main() -> int:
     group_report("HIGH/DEVELOPING x RELATIVE STRENGTH",
                  [r for r in matured if r["attention"] in ("high_attention", "developing")],
                  lambda r: f"{r['attention']}/{r['context']['relative_strength']}")
+    group_report("BY BROAD-MARKET RELATIVE", matured,
+                 lambda r: r["context"]["benchmark_relative"] or "unavailable")
+    group_report("BY SECTOR RELATIVE", matured,
+                 lambda r: r["context"]["sector_relative"] or "unavailable")
+    group_report("HIGH/DEVELOPING x BROAD-MARKET RELATIVE",
+                 [r for r in matured if r["attention"] in ("high_attention", "developing")],
+                 lambda r: f"{r['attention']}/{r['context']['benchmark_relative']}")
     group_report("CROSS-ARM x RELATIVE STRENGTH",
                  [r for r in matured if r["cross_arm"] in ("baseline_only", "candidate_only")],
                  lambda r: f"{r['cross_arm']}/{r['context']['relative_strength']}")
 
     print("\n" + "=" * 78)
-    print("Read as: which context dimensions are worth SHOWING, not which make")
-    print("money. Benchmark and sector context are unavailable by design here.")
+    print("PHASE 14 CHECK — V1 found that universe-relative 'underperforming'")
+    print("did NOT obviously produce worse forward outcomes. Compare the")
+    print("BY BROAD-MARKET RELATIVE and BY SECTOR RELATIVE tables above against")
+    print("BY RELATIVE STRENGTH to see whether the external frames differ.")
+    print("Whatever they show: no RS metric was promoted into attention ranking.")
     print("=" * 78)
 
     if args.json:
