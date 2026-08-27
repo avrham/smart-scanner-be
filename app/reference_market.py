@@ -38,6 +38,23 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # The frozen warmup universe that carries reference history. Deliberately a
 # DIFFERENT universe from the candidate one, so campaign registration (which
 # pins a universe_id) can never pick these symbols up.
+#
+# FRESHNESS / OPERATING MODEL
+# ---------------------------
+# No second pipeline is needed to keep this current. The canonical history
+# lifecycle is already universe-driven end to end:
+#   * app/jobs/history_refresh.py takes (universe_id, universe_hash) and fans
+#     out one bounded refresh task per member symbol;
+#   * app/jobs/handlers/daily_pipeline_driver.py takes universe_id in its job
+#     PAYLOAD, not from configuration.
+# So refreshing reference data is the same operation as refreshing candidate
+# data, pointed at this universe id. Nothing here needs new code, new secrets,
+# new scheduling architecture or a new worker.
+#
+# What remains a deliberate, separate decision: enabling the production daily
+# pipeline at all. Until that switch is thrown, reference history is refreshed
+# the same way it was created — by running the existing bounded warmup/refresh
+# path against this universe on demand.
 REFERENCE_UNIVERSE_CODE = "SMART-SCANNER-REFERENCE-MARKET-V1"
 CANDIDATE_UNIVERSE_CODE = "WYCKOFF-HISTORY-WARMUP-QUALIFICATION"
 
