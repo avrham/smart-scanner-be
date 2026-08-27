@@ -280,7 +280,8 @@ class TestNoNewMigration:
             "013_wyckoff_v2_shadow_arms.sql"
         ]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("014_*"))] == ["014_market_bars_4h.sql"]
-        assert not list(MIGRATIONS_DIR.glob("019_*"))
+        assert [q.name for q in sorted(MIGRATIONS_DIR.glob("019_*"))] == ["019_catalyst_events.sql"]
+        assert not list(MIGRATIONS_DIR.glob("020_*"))
 
     def test_4h_evidence_fits_existing_schema(self):
         """Everything Phase 9E persists rides in EXISTING columns: the 4H

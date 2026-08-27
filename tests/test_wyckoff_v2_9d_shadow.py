@@ -435,7 +435,8 @@ class TestMigration013:
             "013_wyckoff_v2_shadow_arms.sql"
         ]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("014_*"))] == ["014_market_bars_4h.sql"]
-        assert not list(MIGRATIONS_DIR.glob("019_*"))
+        assert [q.name for q in sorted(MIGRATIONS_DIR.glob("019_*"))] == ["019_catalyst_events.sql"]
+        assert not list(MIGRATIONS_DIR.glob("020_*"))
 
     def test_arm_codes_in_sync_with_registry(self):
         sql = MIGRATION_013.read_text(encoding="utf-8")

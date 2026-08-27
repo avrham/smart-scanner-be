@@ -6,7 +6,7 @@ and reachability under the read-only audit-only staging gate.
 """
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -178,7 +178,8 @@ class FakeConn:
 
     def __init__(self, *, campaign_row=None, result_rows=None, freshness_row=None,
                  symbol_row=None, daily_row=None, bar_rows=None, campaign_list_rows=None,
-                 universe_rows=None):
+                 universe_rows=None, catalyst_rows=None, catalyst_state=None,
+                 catalyst_error=None):
         self.campaign_row = campaign_row
         self.result_rows = result_rows or []
         self.freshness_row = freshness_row or {"oldest": None, "latest": None}
@@ -189,6 +190,11 @@ class FakeConn:
         # Pair-derived universe (SELECT DISTINCT p.symbol ...). None = no pairs
         # persisted, which is what makes the route fall back to requested_symbols.
         self.universe_rows = universe_rows
+        # Catalyst reads are additive and must never be able to fail the route.
+        self.catalyst_rows = catalyst_rows or []
+        self.catalyst_state = catalyst_state or []
+        self.catalyst_error = catalyst_error
+        self.catalyst_queries = 0
         self.freshness_symbols = None
 
     async def fetchrow(self, sql, *a):
@@ -204,6 +210,15 @@ class FakeConn:
         return None
 
     async def fetch(self, sql, *a):
+        if "FROM symbol_catalyst_events" in sql:
+            self.catalyst_queries += 1
+            if self.catalyst_error:
+                raise self.catalyst_error
+            return self.catalyst_rows
+        if "FROM catalyst_source_state" in sql:
+            if self.catalyst_error:
+                raise self.catalyst_error
+            return self.catalyst_state
         if "SELECT DISTINCT p.symbol" in sql:
             return self.universe_rows or []
         if "FROM strategy_shadow_run_pairs rp" in sql and "candidate_verdict" in sql:
@@ -851,3 +866,203 @@ class TestAuditOnlyReachability:
         # a non-allowlisted route stays blocked
         resp2 = client.get("/api/admin/prospective/audit")
         assert resp2.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Catalyst context on the Product API.
+#
+# The route's obligations are narrow and testable: expose the context, batch the
+# read, and NEVER let a catalyst problem take the scanner down with it.
+# --------------------------------------------------------------------------- #
+
+_CATALYST_CAMPAIGN = _row(
+    id=RUN_ID, experiment_code="wyckoff_v2_vs_baseline", experiment_version=1,
+    status="completed", started_at=datetime(2026, 8, 25, 21, 0, tzinfo=timezone.utc),
+    finished_at=datetime(2026, 8, 25, 21, 5, tzinfo=timezone.utc), error_code=None,
+    campaign_id="c0ffee00-0000-4000-8000-000000000001", as_of_date="2026-08-25",
+    requested_symbols=json.dumps(["AAPL", "MSFT"]),
+)
+
+_CATALYST_RESULTS = [
+    _row(symbol="AAPL", candidate_verdict="WATCH", candidate_score=0.7,
+         candidate_details=json.dumps(_CANDIDATE_DETAILS),
+         control_verdict="AVOID", control_score=None),
+    _row(symbol="MSFT", candidate_verdict="AVOID", candidate_score=0.1,
+         candidate_details=json.dumps({"readiness": {"status": "ready"}, "policy": {}}),
+         control_verdict="AVOID", control_score=0.1),
+]
+
+
+def _catalyst_event(symbol="AAPL", event_type="earnings", event_date=date(2026, 8, 26),
+                    **over):
+    row = {
+        "symbol": symbol, "event_type": event_type, "event_date": event_date,
+        "session_timing": "after_market", "certainty": "confirmed",
+        "fiscal_period": "Q3", "fiscal_year": "2026",
+        "source": "provider_earnings_calendar", "source_reference": "ref-1",
+        "observed_at": datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc),
+    }
+    row.update(over)
+    return _row(**row)
+
+
+def _source_state(source, status="ok", *, age_hours=1.0, **over):
+    """A source state relative to the REAL clock — freshness is measured against
+    `now`, so a fixed past timestamp would silently read as stale."""
+    moment = datetime.now(timezone.utc) - timedelta(hours=age_hours)
+    row = {
+        "source": source, "status": status,
+        "last_refresh_at": moment,
+        "last_success_at": moment if status == "ok" else None,
+        "symbols_covered": 25, "events_upserted": 4, "detail": None,
+    }
+    row.update(over)
+    return _row(**row)
+
+
+def _catalyst_conn(**over):
+    kwargs = dict(campaign_row=_CATALYST_CAMPAIGN, result_rows=_CATALYST_RESULTS,
+                  freshness_row={"oldest": date(2026, 1, 2), "latest": date(2026, 8, 25)})
+    kwargs.update(over)
+    return FakeConn(**kwargs)
+
+
+class TestOverviewCatalystContext:
+    def _get(self, client, monkeypatch, conn):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(conn)
+        resp = client.get("/api/scanner/overview")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def test_every_row_carries_a_compact_catalyst_block(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(
+            catalyst_rows=[_catalyst_event()],
+            catalyst_state=[_source_state("provider_earnings_calendar"),
+                            _source_state("provider_financial_report_filings")]))
+        for row in body["results"]:
+            assert set(row["catalyst_context"]) == {
+                "earnings_status", "earnings_proximity", "earnings_sessions_until",
+                "earnings_timing", "earnings_certainty", "earnings_notable",
+                "last_report_proximity", "last_report_sessions_until",
+                "last_report_notable"}
+
+    def test_an_event_reaches_only_the_symbol_it_belongs_to(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(
+            catalyst_rows=[_catalyst_event(symbol="AAPL")],
+            catalyst_state=[_source_state("provider_earnings_calendar"),
+                            _source_state("provider_financial_report_filings")]))
+        by_symbol = {r["symbol"]: r["catalyst_context"] for r in body["results"]}
+        assert by_symbol["AAPL"]["earnings_notable"] is True
+        assert by_symbol["MSFT"]["earnings_notable"] is False
+        assert by_symbol["MSFT"]["earnings_proximity"] == "none_known"
+
+    def test_the_universe_is_read_in_one_query_not_one_per_symbol(self, client, monkeypatch):
+        conn = _catalyst_conn(
+            catalyst_rows=[_catalyst_event()],
+            catalyst_state=[_source_state("provider_earnings_calendar")])
+        self._get(client, monkeypatch, conn)
+        assert conn.catalyst_queries == 1
+
+    def test_per_source_freshness_is_reported_separately(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(
+            catalyst_state=[
+                _source_state("provider_earnings_calendar", status="unavailable",
+                              detail="provider_not_entitled: HTTP 403"),
+                _source_state("provider_financial_report_filings"),
+            ]))
+        sources = body["catalyst_sources"]
+        assert sources["earnings"]["status"] == "unavailable"
+        assert sources["earnings"]["reason"] == "source_unavailable"
+        assert sources["financial_reports"]["status"] == "available"
+
+    def test_a_source_that_never_ran_is_not_reported_as_no_events(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(catalyst_state=[]))
+        assert body["catalyst_sources"]["earnings"]["reason"] == "never_refreshed"
+        for row in body["results"]:
+            assert row["catalyst_context"]["earnings_status"] == "unavailable"
+
+    def test_a_catalyst_failure_never_takes_the_scanner_down(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(
+            catalyst_error=RuntimeError("catalyst table is unreadable")))
+        # The scan itself is unaffected...
+        assert body["scanner_state"] == sv.SCANNER_STATE_FRESH
+        assert len(body["results"]) == 2
+        assert body["results"][0]["candidate_verdict"] is not None
+        # ...and every catalyst field degrades to an honest "unavailable".
+        assert body["catalyst_sources"]["earnings"]["status"] == "unavailable"
+        for row in body["results"]:
+            assert row["catalyst_context"]["earnings_status"] == "unavailable"
+            assert row["catalyst_context"]["earnings_notable"] is False
+
+    def test_attention_and_ordering_are_untouched_by_catalysts(self, client, monkeypatch):
+        with_events = self._get(client, monkeypatch, _catalyst_conn(
+            catalyst_rows=[_catalyst_event()],
+            catalyst_state=[_source_state("provider_earnings_calendar")]))
+        without = self._get(client, monkeypatch, _catalyst_conn(
+            catalyst_error=RuntimeError("unreadable")))
+
+        def decisions(body):
+            return [{k: r[k] for k in
+                     ("symbol", "attention", "candidate_verdict", "candidate_score",
+                      "cross_arm", "reason_code", "setup_state")}
+                    for r in body["results"]]
+
+        assert decisions(with_events) == decisions(without)
+        assert with_events["attention_summary"] == without["attention_summary"]
+
+
+class TestSymbolDetailCatalystContext:
+    def _get(self, client, monkeypatch, conn, symbol="AAPL"):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(conn)
+        resp = client.get(f"/api/scanner/symbol?symbol={symbol}")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def _conn(self, **over):
+        return _catalyst_conn(
+            symbol_row=_row(
+                candidate_verdict="WATCH", candidate_score=0.7,
+                candidate_reason="setup valid",
+                candidate_details=json.dumps(_CANDIDATE_DETAILS),
+                control_verdict="AVOID", control_score=None, control_reason=None),
+            daily_row={"n": 300, "oldest": date(2025, 1, 2),
+                       "latest": date(2026, 8, 25)},
+            **over)
+
+    def test_the_detail_carries_full_provenance(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_rows=[_catalyst_event()],
+            catalyst_state=[_source_state("provider_earnings_calendar"),
+                            _source_state("provider_financial_report_filings")]))
+        earnings = body["catalyst_context"]["earnings"]
+        assert body["catalyst_context"]["contract_version"] == \
+            "smart_scanner_catalyst_context.v1"
+        assert earnings["source"] == "provider_earnings_calendar"
+        assert earnings["source_reference"] == "ref-1"
+        assert earnings["observed_at"] is not None
+        assert earnings["fiscal_period"] == "Q3"
+
+    def test_earnings_and_filings_are_separate_blocks(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_rows=[
+                _catalyst_event(event_type="earnings", event_date=date(2026, 8, 26)),
+                _catalyst_event(event_type="financial_report_filing",
+                                event_date=date(2026, 8, 3), certainty="filed"),
+            ],
+            catalyst_state=[_source_state("provider_earnings_calendar"),
+                            _source_state("provider_financial_report_filings")]))
+        ctx = body["catalyst_context"]
+        assert ctx["earnings"]["event_date"] == "2026-08-26"
+        assert ctx["last_financial_report"]["event_date"] == "2026-08-03"
+        assert ctx["last_financial_report"]["certainty"] == "filed"
+
+    def test_a_catalyst_failure_never_takes_the_detail_down(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_error=RuntimeError("unreadable")))
+        assert body["candidate"]["verdict"] == "WATCH"
+        assert body["catalyst_context"]["earnings"]["status"] == "unavailable"
+        assert body["catalyst_context"]["earnings"]["notable"] is False

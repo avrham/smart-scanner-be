@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -30,6 +30,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.deps import get_db
 import app.prospective_campaign as pc
 from app.prospective_session import resolve_latest_completed_session
+import app.catalyst as cat
+import app.catalyst_ingest as ci
 import app.market_context as mc
 import app.reference_market as rm
 import app.scanner_view as sv
@@ -71,6 +73,17 @@ def _as_of_date_sql(alias: str = "") -> str:
 
 
 _AS_OF_DATE_SQL = _as_of_date_sql()
+
+
+def _parse_session(value: Optional[str]):
+    """Campaign sessions arrive from telemetry as text."""
+    from datetime import date as _date
+    if not value:
+        return None
+    try:
+        return _date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 async def _fetch_latest_campaign(db: asyncpg.Connection, *, session: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -228,6 +241,59 @@ async def _fetch_universe_bars(
         )
     return out
 
+async def _fetch_catalyst_events(
+    db: asyncpg.Connection, symbols: List[str]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Catalyst events for the whole universe in ONE bounded query.
+
+    Never per symbol and never per HTTP request to a provider — the Product API
+    reads persisted context only and holds no provider credential.
+    """
+    if not symbols:
+        return {}
+    rows = await db.fetch(
+        """
+        SELECT symbol, event_type, event_date, session_timing, certainty,
+               fiscal_period, fiscal_year, source, source_reference, observed_at
+        FROM symbol_catalyst_events
+        WHERE symbol = ANY($1::text[])
+        ORDER BY symbol, event_date DESC
+        """,
+        symbols,
+    )
+    out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+    for r in rows:
+        out.setdefault(r["symbol"], []).append(dict(r))
+    return out
+
+
+async def _fetch_catalyst_freshness(db: asyncpg.Connection) -> Dict[str, Dict[str, Any]]:
+    """One row per source — what lets the product distinguish 'nothing
+    scheduled' from 'we cannot see the schedule'."""
+    rows = await db.fetch(
+        "SELECT source, status, last_refresh_at, last_success_at, "
+        "symbols_covered, events_upserted, detail FROM catalyst_source_state"
+    )
+    return {r["source"]: dict(r) for r in rows}
+
+
+async def _load_catalysts(
+    db: asyncpg.Connection, symbols: List[str], now: datetime
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any], Dict[str, Any]]:
+    """Batch-load catalyst events + per-source freshness.
+
+    Wrapped by the caller so that a catalyst failure degrades this dimension
+    ONLY — the scanner, attention and market context must keep working.
+    """
+    events = await _fetch_catalyst_events(db, symbols)
+    state = await _fetch_catalyst_freshness(db)
+    earnings_fresh = cat.evaluate_freshness(
+        state.get(ci.SOURCE_EARNINGS_CALENDAR), now=now)
+    filings_fresh = cat.evaluate_freshness(
+        state.get(ci.SOURCE_FINANCIAL_FILINGS), now=now)
+    return events, earnings_fresh, filings_fresh
+
+
 @router.get("/scanner/overview")
 async def scanner_overview(
     session: Optional[str] = Query(None, description="ISO session date (YYYY-MM-DD); defaults to the latest campaign"),
@@ -240,6 +306,11 @@ async def scanner_overview(
     latest_completed_session = str(resolve_latest_completed_session(now))
     universe_breadth: Dict[str, Any] = mc.build_universe_breadth({})
     market_regime: Dict[str, Any] = mc.build_market_regime({})
+    catalyst_sources: Dict[str, Any] = {
+        "earnings": {"status": cat.STATUS_UNAVAILABLE,
+                     "reason": cat.REASON_NEVER_REFRESHED},
+        "financial_reports": {"status": cat.STATUS_UNAVAILABLE,
+                              "reason": cat.REASON_NEVER_REFRESHED}}
 
     campaign = await _fetch_latest_campaign(db, session=session)
     scanner_state = sv.classify_scanner_state(
@@ -270,6 +341,33 @@ async def scanner_overview(
         market_regime = mc.build_market_regime(
             reference_bars, universe_breadth=universe_breadth
         )
+
+        # Catalyst context is strictly additive: if it cannot be loaded, every
+        # catalyst field says `unavailable` and the scan is served regardless.
+        session_date = _parse_session(campaign["as_of_date"])
+        try:
+            events, earnings_fresh, filings_fresh = await _load_catalysts(
+                db, universe_symbols, now)
+            for row in results:
+                ctx = cat.build_catalyst_context(
+                    events.get(row["symbol"]) or [],
+                    as_of_session=session_date,
+                    earnings_freshness=earnings_fresh,
+                    filings_freshness=filings_fresh)
+                row["catalyst_context"] = cat.build_row_catalyst(ctx)
+            catalyst_sources = {
+                "earnings": earnings_fresh, "financial_reports": filings_fresh}
+        except Exception:
+            logger.warning("catalyst context unavailable for overview",
+                           exc_info=False)
+            empty = cat.empty_catalyst_context()
+            for row in results:
+                row["catalyst_context"] = cat.build_row_catalyst(empty)
+            catalyst_sources = {
+                "earnings": {"status": cat.STATUS_UNAVAILABLE,
+                             "reason": cat.REASON_SOURCE_UNAVAILABLE},
+                "financial_reports": {"status": cat.STATUS_UNAVAILABLE,
+                                      "reason": cat.REASON_SOURCE_UNAVAILABLE}}
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -302,6 +400,8 @@ async def scanner_overview(
         "scanner_universe_breadth": universe_breadth,
         # Broad environment from the benchmark. Context only; it changes no verdict.
         "market_regime": market_regime,
+        # Per-source catalyst freshness, so the UI never shows stale event dates.
+        "catalyst_sources": catalyst_sources,
         "results": results,
         "strategy": {
             "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
@@ -379,6 +479,18 @@ async def scanner_symbol_detail(
         db, universe_symbols, campaign["as_of_date"]
     )
     reference_bars = await _fetch_reference_bars(db, campaign["as_of_date"])
+    session_date = _parse_session(campaign["as_of_date"])
+    try:
+        events, earnings_fresh, filings_fresh = await _load_catalysts(
+            db, [symbol], now)
+        catalyst_context = cat.build_catalyst_context(
+            events.get(symbol) or [], as_of_session=session_date,
+            earnings_freshness=earnings_fresh, filings_freshness=filings_fresh)
+    except Exception:
+        logger.warning("catalyst context unavailable for symbol detail",
+                       exc_info=False)
+        catalyst_context = cat.empty_catalyst_context()
+
     market_context = mc.build_market_context(
         symbol, context_bars,
         as_of_session=campaign["as_of_date"],
@@ -455,6 +567,9 @@ async def scanner_symbol_detail(
         },
         # Context sits BESIDE the strategy result and never feeds into it.
         "market_context": market_context,
+        # Known corporate events. Separate from market_context on purpose:
+        # "this setup exists AND earnings are approaching", never "therefore".
+        "catalyst_context": catalyst_context,
         "readiness": {
             "daily_bar_count": daily["n"] if daily else 0,
             "oldest_daily_bar": daily["oldest"].isoformat() if daily and daily["oldest"] else None,
