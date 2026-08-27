@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.deps import get_db
 import app.prospective_campaign as pc
 from app.prospective_session import resolve_latest_completed_session
+import app.market_context as mc
 import app.scanner_view as sv
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _RECENT_BARS_LIMIT = 30
+
+# Longest context lookback (60D return needs 61 bars) plus a small margin so a
+# holiday-shortened window still resolves. Bounded on purpose: one query for the
+# whole universe, never per symbol.
+_CONTEXT_BARS_LIMIT = mc.RS_HORIZONS[-1] + 5
 
 
 def _as_json(value: Any) -> Any:
@@ -170,6 +176,44 @@ async def _fetch_data_freshness(db: asyncpg.Connection, symbols: List[str]) -> D
     }
 
 
+async def _fetch_universe_bars(
+    db: asyncpg.Connection, symbols: List[str], session: Optional[str]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Ascending daily bars per symbol, truncated AT the scan session.
+
+    Truncating at `session` is what makes the context as-of-correct: a scan from
+    an earlier session must be described by the market as it was then, never by
+    bars that arrived afterwards. Falls back to the latest stored bars only when
+    the run carries no session date at all.
+
+    One bounded window-function query for the whole universe — never N+1.
+    """
+    if not symbols:
+        return {}
+    rows = await db.fetch(
+        """
+        SELECT symbol, trading_date, close, volume
+        FROM (
+            SELECT symbol, trading_date, close, volume,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY symbol ORDER BY trading_date DESC
+                   ) AS rn
+            FROM daily_bars
+            WHERE symbol = ANY($1::text[])
+              AND ($2::text IS NULL OR trading_date <= $2::text::date)
+        ) t
+        WHERE rn <= $3
+        ORDER BY symbol, trading_date
+        """,
+        symbols, session, _CONTEXT_BARS_LIMIT,
+    )
+    out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+    for r in rows:
+        out.setdefault(r["symbol"], []).append(
+            {"close": float(r["close"]), "volume": float(r["volume"] or 0.0)}
+        )
+    return out
+
 @router.get("/scanner/overview")
 async def scanner_overview(
     session: Optional[str] = Query(None, description="ISO session date (YYYY-MM-DD); defaults to the latest campaign"),
@@ -180,6 +224,7 @@ async def scanner_overview(
     contract needs in one response."""
     now = datetime.now(timezone.utc)
     latest_completed_session = str(resolve_latest_completed_session(now))
+    universe_breadth: Dict[str, Any] = mc.build_universe_breadth({})
 
     campaign = await _fetch_latest_campaign(db, session=session)
     scanner_state = sv.classify_scanner_state(
@@ -198,6 +243,12 @@ async def scanner_overview(
         results.sort(key=sv.attention_sort_key)
         universe_symbols = await _resolve_universe(db, campaign)
         freshness = await _fetch_data_freshness(db, universe_symbols)
+        context_bars = await _fetch_universe_bars(
+            db, universe_symbols, campaign["as_of_date"]
+        )
+        for row in results:
+            row["market_context"] = sv.build_row_context(row["symbol"], context_bars)
+        universe_breadth = mc.build_universe_breadth(context_bars)
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -226,6 +277,8 @@ async def scanner_overview(
         "data_freshness": freshness,
         "results_summary": sv.summarize_results(results),
         "attention_summary": sv.summarize_attention(results),
+        # Breadth of the SCANNED UNIVERSE — explicitly not market breadth.
+        "universe_breadth": universe_breadth,
         "results": results,
         "strategy": {
             "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
@@ -255,6 +308,7 @@ async def scanner_symbol_detail(
         raise HTTPException(status_code=404, detail={"error": "no_campaign_available"})
     if symbol not in await _resolve_universe(db, campaign):
         raise HTTPException(status_code=404, detail={"error": "unknown_symbol", "symbol": symbol})
+
 
     scanner_state = sv.classify_scanner_state(
         campaign_status=campaign["status"], campaign_as_of_date=campaign["as_of_date"],
@@ -295,6 +349,14 @@ async def scanner_symbol_detail(
     symbol_state = sv.classify_symbol_state(
         scanner_state=scanner_state, has_candidate_result=has_candidate,
         candidate_verdict=candidate_verdict,
+    )
+
+    universe_symbols = await _resolve_universe(db, campaign)
+    context_bars = await _fetch_universe_bars(
+        db, universe_symbols, campaign["as_of_date"]
+    )
+    market_context = mc.build_market_context(
+        symbol, context_bars, as_of_session=campaign["as_of_date"]
     )
 
     daily = await db.fetchrow(
@@ -364,6 +426,8 @@ async def scanner_symbol_detail(
             "score": control_score,
             "reason": control_reason,
         },
+        # Context sits BESIDE the strategy result and never feeds into it.
+        "market_context": market_context,
         "readiness": {
             "daily_bar_count": daily["n"] if daily else 0,
             "oldest_daily_bar": daily["oldest"].isoformat() if daily and daily["oldest"] else None,

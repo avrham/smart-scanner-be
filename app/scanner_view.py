@@ -15,10 +15,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+import app.market_context as mc
 from app.prospective_campaign import candidate_signal_fields
 
-OVERVIEW_CONTRACT_VERSION = "smart_scanner_overview.v2"
-SYMBOL_DETAIL_CONTRACT_VERSION = "smart_scanner_symbol_detail.v2"
+OVERVIEW_CONTRACT_VERSION = "smart_scanner_overview.v3"
+SYMBOL_DETAIL_CONTRACT_VERSION = "smart_scanner_symbol_detail.v3"
 SCAN_LIST_CONTRACT_VERSION = "smart_scanner_scan_list.v1"
 
 # ---- scanner-level state -------------------------------------------------- #
@@ -249,6 +250,31 @@ def build_overview_row(row: Dict[str, Any], *, scanner_state: str) -> Dict[str, 
     }
 
 
+
+def build_row_context(
+    symbol: str, bars_by_symbol: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The COMPACT context a list row carries.
+
+    Deliberately only the two categories plus their evidence and status — the
+    row must stay scannable, and attention tier remains the first-order
+    hierarchy. The full object (horizons, benchmark, sector) lives on the
+    symbol-detail response.
+    """
+    rs = mc.build_relative_strength(symbol, bars_by_symbol)
+    volume = mc.build_volume_context(bars_by_symbol.get(symbol) or [])
+    return {
+        "relative_strength": rs["category"],
+        "relative_strength_status": rs["status"],
+        "relative_strength_excess_pct": rs["excess_pct"],
+        "relative_strength_horizon_days": rs["primary_horizon_days"],
+        "comparator": rs["comparator"],
+        "volume": volume["category"],
+        "volume_status": volume["status"],
+        "relative_volume": volume["relative_volume"],
+    }
+
+
 def summarize_results(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     summary = {state: 0 for state in SYMBOL_STATES}
     summary["total"] = len(rows)
@@ -401,7 +427,7 @@ __all__ = [
     "GATE_STRUCTURE", "GATE_SETUP", "GATE_TRIGGER", "GATE_ROLLOUT",
     "GATE_ORDER", "GATE_PASSED", "GATE_BLOCKED", "GATE_UNKNOWN",
     "build_gate_progress", "build_blockers",
-    "structure_state", "reason_code",
+    "structure_state", "reason_code", "build_row_context",
     "SCANNER_STATE_NO_CAMPAIGN_YET", "SCANNER_STATE_RUNNING",
     "SCANNER_STATE_FRESH", "SCANNER_STATE_STALE", "SCANNER_STATE_FAILED",
     "SCANNER_STATES",
