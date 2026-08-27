@@ -5,7 +5,7 @@
 --   GET /api/scanner/overview
 --   GET /api/scanner/scans
 --   GET /api/scanner/symbol
--- It holds SELECT on the EXACT 9 relations those routes touch and NO write
+-- It holds SELECT on the EXACT 11 relations those routes touch and NO write
 -- privilege anywhere. It is deliberately narrower than
 -- smart_scanner_audit_reader (13 relations): the product surface must not grow
 -- just because the audit surface did.
@@ -79,8 +79,10 @@ GRANT USAGE ON SCHEMA public TO smart_scanner_product_reader;
 --      catalyst_source_state       -> per-source availability + freshness (019)
 --      company_news_articles       -> company news context (020)
 --      company_news_symbols        -> per-symbol news association (020)
+--      sec_filings                 -> SEC 8-K material events (021)
+--      sec_filing_symbols          -> issuer/symbol association (021)
 --
---    The catalyst and news relations are READ-ONLY here for the same reason as
+--    The catalyst, news and SEC relations are READ-ONLY here for the same reason as
 --    the rest: the Product API holds no provider credential and writes nothing.
 GRANT SELECT ON public.strategy_shadow_runs        TO smart_scanner_product_reader;
 GRANT SELECT ON public.strategy_shadow_run_pairs   TO smart_scanner_product_reader;
@@ -91,9 +93,11 @@ GRANT SELECT ON public.symbol_catalyst_events      TO smart_scanner_product_read
 GRANT SELECT ON public.catalyst_source_state       TO smart_scanner_product_reader;
 GRANT SELECT ON public.company_news_articles       TO smart_scanner_product_reader;
 GRANT SELECT ON public.company_news_symbols        TO smart_scanner_product_reader;
+GRANT SELECT ON public.sec_filings                 TO smart_scanner_product_reader;
+GRANT SELECT ON public.sec_filing_symbols          TO smart_scanner_product_reader;
 
 -- 5) Row-level security.
---    RLS is ENABLED on all nine relations in the isolated staging database and
+--    RLS is ENABLED on all eleven relations in the isolated staging database and
 --    this role is NOBYPASSRLS, so a plain SELECT grant alone returns zero rows.
 --    Add one NARROW read-only policy per relation, scoped TO this role — the
 --    same pattern every other reader role in this database already uses. RLS is
@@ -115,7 +119,9 @@ BEGIN
     'symbol_catalyst_events',
     'catalyst_source_state',
     'company_news_articles',
-    'company_news_symbols'
+    'company_news_symbols',
+    'sec_filings',
+    'sec_filing_symbols'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_policies

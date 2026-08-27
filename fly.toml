@@ -39,7 +39,7 @@ primary_region = 'fra'
   # is a SECRET set later via `fly secrets set` — never in fly.toml. Until then,
   # audit mode fails closed (no fallback to any default database identity).
   #
-  # smart_scanner_product_reader holds SELECT on ONLY the 9 relations the three
+  # smart_scanner_product_reader holds SELECT on ONLY the 11 relations the three
   # Product API routes read (see ops/sql/create_smart_scanner_product_reader.sql)
   # — deliberately narrower than smart_scanner_audit_reader's 13, so the product
   # surface cannot widen with the audit surface.

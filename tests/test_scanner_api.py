@@ -16,6 +16,7 @@ from main import app
 from app.deps import get_db
 import app.news as nw
 import app.routers.scanner as scanner_mod
+import app.sec_events as se
 import app.scanner_view as sv
 
 
@@ -180,7 +181,8 @@ class FakeConn:
     def __init__(self, *, campaign_row=None, result_rows=None, freshness_row=None,
                  symbol_row=None, daily_row=None, bar_rows=None, campaign_list_rows=None,
                  universe_rows=None, catalyst_rows=None, catalyst_state=None,
-                 catalyst_error=None, news_rows=None, news_error=None):
+                 catalyst_error=None, news_rows=None, news_error=None,
+                 sec_rows=None, sec_error=None):
         self.campaign_row = campaign_row
         self.result_rows = result_rows or []
         self.freshness_row = freshness_row or {"oldest": None, "latest": None}
@@ -201,6 +203,11 @@ class FakeConn:
         self.news_error = news_error
         self.news_queries = 0
         self.news_query_args = None
+        # SEC reads are additive too, and fail INDEPENDENTLY of both others.
+        self.sec_rows = sec_rows or []
+        self.sec_error = sec_error
+        self.sec_queries = 0
+        self.sec_query_args = None
         self.freshness_symbols = None
 
     async def fetchrow(self, sql, *a):
@@ -216,6 +223,12 @@ class FakeConn:
         return None
 
     async def fetch(self, sql, *a):
+        if "FROM public.sec_filing_symbols" in sql:
+            self.sec_queries += 1
+            self.sec_query_args = a
+            if self.sec_error:
+                raise self.sec_error
+            return self.sec_rows
         if "FROM public.company_news_symbols" in sql:
             self.news_queries += 1
             self.news_query_args = a
@@ -955,10 +968,10 @@ class TestOverviewCatalystContext:
                             _source_state("provider_financial_report_filings")]))
         for row in body["results"]:
             # The earnings half of the row block is byte-for-byte what Catalyst
-            # V1 shipped. `news` is a SIBLING key added by News V1 — the only
-            # thing that grew — and it is asserted separately, in
-            # TestOverviewNewsContext.
-            assert set(row["catalyst_context"]) - {"news"} == {
+            # V1 shipped. `news` and `sec_events` are SIBLING keys added by the
+            # later milestones — the only things that grew — and each is
+            # asserted separately, in its own test class.
+            assert set(row["catalyst_context"]) - {"news", "sec_events"} == {
                 "earnings_status", "earnings_proximity", "earnings_sessions_until",
                 "earnings_timing", "earnings_certainty", "earnings_notable",
                 "last_report_proximity", "last_report_sessions_until",
@@ -1281,3 +1294,238 @@ class TestSymbolDetailNewsContext:
         conn = self._conn(news_rows=[_news_row()])
         self._get(client, monkeypatch, conn)
         assert conn.news_queries == 1
+
+
+# =========================================================================== #
+# SEC / 8-K Material Event Context V1
+# =========================================================================== #
+
+def _sec_row(**over):
+    """One persisted filing as the Product API's join returns it."""
+    codes = list(over.pop("item_codes", ["5.02", "9.01"]))
+    row = {
+        "symbol": "AAPL",
+        "accession_number": "0000320193-26-000018",
+        "cik": "0000320193",
+        "form": "8-K",
+        "accepted_at": datetime(2026, 8, 25, 13, 30, tzinfo=timezone.utc),
+        "filing_date": date(2026, 8, 25),
+        "period_of_report": date(2026, 8, 24),
+        "item_codes": codes,
+        "event_types": se.classify_event_types(codes),
+        "taxonomy_version": se.SEC_TAXONOMY_VERSION,
+        "is_primary_event": se.is_primary_event(codes),
+        "amends_accession_number": None,
+        "filing_url": "https://www.sec.gov/Archives/edgar/data/320193/x/aapl.htm",
+    }
+    row.update(over)
+    return _row(**row)
+
+
+class TestOverviewSecContext:
+    def _get(self, client, monkeypatch, conn):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(conn)
+        resp = client.get("/api/scanner/overview")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def _conn(self, **over):
+        base = dict(catalyst_state=[_source_state("provider_earnings_calendar"),
+                                    _source_state("provider_financial_report_filings"),
+                                    _source_state("provider_company_news"),
+                                    _source_state("sec_edgar_8k")])
+        base.update(over)
+        return _catalyst_conn(**base)
+
+    def test_every_row_carries_counts_not_filings(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(sec_rows=[_sec_row()]))
+        for row in body["results"]:
+            sec = row["catalyst_context"]["sec_events"]
+            assert set(sec) == {"status", "reason", "notable_count",
+                                "in_window_count", "primary_event_count",
+                                "top_event_type", "latest_accepted_at",
+                                "latest_proximity", "latest_form",
+                                "latest_item_codes"}
+            assert "items" not in sec
+
+    def test_a_filing_reaches_only_the_symbol_it_is_linked_to(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_rows=[_sec_row(symbol="AAPL")]))
+        by_symbol = {r["symbol"]: r["catalyst_context"]["sec_events"]
+                     for r in body["results"]}
+        assert by_symbol["AAPL"]["notable_count"] == 1
+        assert by_symbol["AAPL"]["top_event_type"] == "management_change"
+        assert by_symbol["MSFT"]["notable_count"] == 0
+        assert by_symbol["MSFT"]["latest_form"] is None
+
+    def test_the_whole_universe_is_read_in_one_query_not_one_per_symbol(
+            self, client, monkeypatch):
+        conn = self._conn(sec_rows=[_sec_row()])
+        self._get(client, monkeypatch, conn)
+        assert conn.sec_queries == 1
+
+    def test_the_query_is_bounded_by_the_session_close(self, client, monkeypatch):
+        conn = self._conn(sec_rows=[_sec_row()])
+        self._get(client, monkeypatch, conn)
+        symbols, lower, upper = conn.sec_query_args
+        assert upper == se.session_close_utc(date(2026, 8, 25))
+        assert lower < upper
+        assert set(symbols) == {"AAPL", "MSFT"}
+
+    def test_a_supporting_only_filing_never_makes_a_row_speak(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_rows=[_sec_row(item_codes=["7.01", "9.01"])]))
+        sec = {r["symbol"]: r["catalyst_context"]["sec_events"]
+               for r in body["results"]}["AAPL"]
+        assert sec["in_window_count"] == 1        # stored and counted...
+        assert sec["primary_event_count"] == 0
+        assert sec["notable_count"] == 0          # ...but silent
+
+    def test_sec_freshness_is_reported_as_its_own_source(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn())
+        assert body["catalyst_sources"]["sec_events"]["status"] == "available"
+
+    def test_a_source_that_never_ran_is_not_reported_as_no_filings(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(catalyst_state=[]))
+        assert body["catalyst_sources"]["sec_events"]["reason"] == "never_refreshed"
+        for row in body["results"]:
+            assert row["catalyst_context"]["sec_events"]["status"] == "unavailable"
+
+    def test_a_sec_failure_never_takes_the_scanner_down(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_error=RuntimeError("sec tables are unreadable")))
+        assert body["scanner_state"] == sv.SCANNER_STATE_FRESH
+        assert len(body["results"]) == 2
+        assert body["results"][0]["candidate_verdict"] is not None
+        assert body["catalyst_sources"]["sec_events"]["status"] == "unavailable"
+        for row in body["results"]:
+            assert row["catalyst_context"]["sec_events"]["notable_count"] == 0
+
+    def test_a_sec_failure_leaves_earnings_and_news_intact(self, client, monkeypatch):
+        # Three dimensions, three independent try/excepts.
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_rows=[_catalyst_event()], news_rows=[_news_row()],
+            sec_error=RuntimeError("unreadable")))
+        assert body["catalyst_sources"]["earnings"]["status"] == "available"
+        assert body["catalyst_sources"]["news"]["status"] == "available"
+        assert body["catalyst_sources"]["sec_events"]["status"] == "unavailable"
+        first = body["results"][0]["catalyst_context"]
+        assert first["earnings_notable"] is True
+        assert first["news"]["notable_count"] == 1
+
+    def test_a_news_failure_leaves_the_sec_dimension_intact(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_rows=[_sec_row()], news_error=RuntimeError("unreadable")))
+        assert body["catalyst_sources"]["news"]["status"] == "unavailable"
+        assert body["catalyst_sources"]["sec_events"]["status"] == "available"
+        assert body["results"][0]["catalyst_context"]["sec_events"]["notable_count"] == 1
+
+    def test_attention_and_ordering_are_untouched_by_sec_events(self, client, monkeypatch):
+        with_sec = self._get(client, monkeypatch, self._conn(
+            sec_rows=[_sec_row(symbol="AAPL")]))
+        without = self._get(client, monkeypatch, self._conn(
+            sec_error=RuntimeError("unreadable")))
+
+        def decisions(body):
+            return [{k: r[k] for k in
+                     ("symbol", "attention", "candidate_verdict", "candidate_score",
+                      "cross_arm", "reason_code", "setup_state")}
+                    for r in body["results"]]
+
+        assert decisions(with_sec) == decisions(without)
+        assert ([r["symbol"] for r in with_sec["results"]]
+                == [r["symbol"] for r in without["results"]])
+
+
+class TestSymbolDetailSecContext:
+    def _get(self, client, monkeypatch, conn, symbol="AAPL"):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(conn)
+        resp = client.get(f"/api/scanner/symbol?symbol={symbol}")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def _conn(self, **over):
+        base = dict(
+            symbol_row=_row(
+                candidate_verdict="WATCH", candidate_score=0.7,
+                candidate_reason="setup valid",
+                candidate_details=json.dumps(_CANDIDATE_DETAILS),
+                control_verdict="AVOID", control_score=None, control_reason=None),
+            daily_row={"n": 300, "oldest": date(2025, 1, 2),
+                       "latest": date(2026, 8, 25)},
+            catalyst_state=[_source_state("provider_earnings_calendar"),
+                            _source_state("provider_financial_report_filings"),
+                            _source_state("provider_company_news"),
+                            _source_state("sec_edgar_8k")])
+        base.update(over)
+        return _catalyst_conn(**base)
+
+    def test_the_detail_carries_structured_evidence_with_provenance(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(sec_rows=[_sec_row()]))
+        sec = body["catalyst_context"]["sec_events"]
+        assert sec["contract_version"] == "smart_scanner_sec_events.v1"
+        assert sec["taxonomy_version"] == "sec_8k_items.v1"
+        item = sec["items"][0]
+        assert item["accession_number"] == "0000320193-26-000018"
+        assert item["form"] == "8-K"
+        assert item["item_codes"] == ["5.02", "9.01"]
+        assert item["event_types"] == ["management_change",
+                                       "financial_statements_and_exhibits"]
+        assert item["source_reference"].startswith("https://www.sec.gov/Archives/")
+        assert item["proximity"] == "today"
+
+    def test_the_event_date_is_shown_but_is_not_the_disclosure_time(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(sec_rows=[_sec_row()]))
+        item = body["catalyst_context"]["sec_events"]["items"][0]
+        assert item["period_of_report"] == "2026-08-24"
+        assert item["accepted_at"].startswith("2026-08-25")
+
+    def test_a_multi_item_filing_keeps_every_code(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_rows=[_sec_row(item_codes=["2.02", "3.01", "7.01", "9.01"])]))
+        item = body["catalyst_context"]["sec_events"]["items"][0]
+        assert item["item_codes"] == ["2.02", "3.01", "7.01", "9.01"]
+        assert item["primary_event_types"] == ["results_of_operations",
+                                               "delisting_or_listing"]
+
+    def test_an_amendment_is_shown_as_an_amendment(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_rows=[_sec_row(form="8-K/A", item_codes=["5.02"])]))
+        item = body["catalyst_context"]["sec_events"]["items"][0]
+        assert item["form"] == "8-K/A"
+        assert item["is_amendment"] is True
+
+    def test_no_interpretation_reaches_the_client(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(sec_rows=[_sec_row()]))
+        blob = json.dumps(body["catalyst_context"]["sec_events"]).lower()
+        for banned in ("summary", "sentiment", "means", "score", "rating",
+                       "bullish", "bearish"):
+            assert banned not in blob
+
+    def test_the_three_catalyst_dimensions_are_siblings(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_rows=[_catalyst_event()], news_rows=[_news_row()],
+            sec_rows=[_sec_row()]))
+        ctx = body["catalyst_context"]
+        assert set(ctx) >= {"earnings", "last_financial_report", "news",
+                            "sec_events"}
+        # Catalyst V1 and News V1 contracts are untouched by the arrival of SEC.
+        assert ctx["contract_version"] == "smart_scanner_catalyst_context.v1"
+        assert ctx["news"]["contract_version"] == "smart_scanner_news_context.v1"
+        assert "sec" not in json.dumps(ctx["news"]).lower()
+
+    def test_a_sec_failure_never_takes_the_detail_down(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            sec_error=RuntimeError("unreadable")))
+        assert body["candidate"]["verdict"] == "WATCH"
+        assert body["catalyst_context"]["sec_events"]["status"] == "unavailable"
+        assert body["catalyst_context"]["sec_events"]["items"] == []
+
+    def test_the_detail_reads_sec_in_one_query(self, client, monkeypatch):
+        conn = self._conn(sec_rows=[_sec_row()])
+        self._get(client, monkeypatch, conn)
+        assert conn.sec_queries == 1

@@ -9,11 +9,12 @@ occurrence IDs, or interpreting raw internal enum combinations.
 
 Every route uses an exact static path (query params carry variable input, no
 path params) so each one can be listed verbatim in app.audit_mode's
-AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 9
+AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 11
 relations the SELECT-only smart_scanner_product_reader role is granted on
 (strategy_shadow_runs/run_pairs/pairs/evaluations, daily_bars,
 symbol_catalyst_events, catalyst_source_state, company_news_articles,
-company_news_symbols) plus the pure market-calendar resolver — see
+company_news_symbols, sec_filings, sec_filing_symbols) plus the pure
+market-calendar resolver — see
 ops/sql/create_smart_scanner_product_reader.sql.
 Decision-support only: never exposes allow_enter=true semantics,
 never reinterprets pair-level outcomes as candidate/control-specific returns.
@@ -39,6 +40,8 @@ import app.news as nw
 import app.news_ingest as ni
 import app.reference_market as rm
 import app.scanner_view as sv
+import app.sec_events as se
+import app.sec_ingest as si
 
 logger = logging.getLogger(__name__)
 
@@ -353,6 +356,62 @@ async def _load_news(
     return articles, freshness
 
 
+
+#: Calendar days of filings to load around a session. Deliberately WIDER than
+#: the product window (20 trading sessions) so the SQL bound stays a pure
+#: efficiency guard and `app.sec_events` remains the only thing deciding what a
+#: session may see.
+_SEC_QUERY_SPAN_DAYS = 45
+
+SEC_SQL = """
+SELECT s.symbol, f.accession_number, f.cik, f.form, f.accepted_at,
+       f.filing_date, f.period_of_report, f.item_codes, f.event_types,
+       f.taxonomy_version, f.is_primary_event, f.amends_accession_number,
+       f.filing_url
+FROM public.sec_filing_symbols s
+JOIN public.sec_filings f ON f.id = s.filing_id
+WHERE s.symbol = ANY($1::text[])
+  AND f.accepted_at >= $2
+  AND f.accepted_at <= $3
+ORDER BY s.symbol, f.accepted_at DESC
+"""
+
+
+async def _fetch_sec_filings(
+    db: asyncpg.Connection, symbols: List[str], session_date: Optional[date_type]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """SEC filings for the whole universe in ONE bounded query.
+
+    Never per symbol and never a request to the SEC — the Product API reads
+    persisted context only. The upper bound is the session close, so the query
+    itself cannot hand back a filing the session was not allowed to see.
+    """
+    if not symbols or session_date is None:
+        return {}
+    upper = se.session_close_utc(session_date)
+    lower = upper - timedelta(days=_SEC_QUERY_SPAN_DAYS)
+    rows = await db.fetch(SEC_SQL, symbols, lower, upper)
+    out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+    for r in rows:
+        out.setdefault(r["symbol"], []).append(dict(r))
+    return out
+
+
+async def _load_sec(
+    db: asyncpg.Connection, symbols: List[str],
+    session_date: Optional[date_type], now: datetime,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    """Batch-load SEC filings + the SEC source's freshness.
+
+    Wrapped by the caller so that a SEC failure degrades this dimension ONLY —
+    the scanner, attention, market context, earnings and news must keep working.
+    """
+    filings = await _fetch_sec_filings(db, symbols, session_date)
+    state = await _fetch_catalyst_freshness(db)
+    freshness = se.evaluate_freshness(state.get(si.SOURCE_SEC_EDGAR), now=now)
+    return filings, freshness
+
+
 @router.get("/scanner/overview")
 async def scanner_overview(
     session: Optional[str] = Query(None, description="ISO session date (YYYY-MM-DD); defaults to the latest campaign"),
@@ -449,6 +508,27 @@ async def scanner_overview(
             catalyst_sources["news"] = {
                 "status": nw.STATUS_UNAVAILABLE,
                 "reason": nw.REASON_SOURCE_UNAVAILABLE}
+
+        # A THIRD independently-wrapped dimension. Earnings, news and SEC each
+        # fail alone: a filing outage must not silence a headline, and neither
+        # can take the scanner down.
+        try:
+            filings, sec_fresh = await _load_sec(
+                db, universe_symbols, session_date, now)
+            for row in results:
+                row["catalyst_context"]["sec_events"] = se.build_row_sec(
+                    se.build_sec_context(
+                        filings.get(row["symbol"]) or [],
+                        as_of_session=session_date, freshness=sec_fresh))
+            catalyst_sources["sec_events"] = sec_fresh
+        except Exception:
+            logger.warning("sec context unavailable for overview", exc_info=False)
+            blank_sec = se.build_row_sec(se.empty_sec_context())
+            for row in results:
+                row["catalyst_context"]["sec_events"] = dict(blank_sec)
+            catalyst_sources["sec_events"] = {
+                "status": se.STATUS_UNAVAILABLE,
+                "reason": se.REASON_SOURCE_UNAVAILABLE}
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -583,6 +663,19 @@ async def scanner_symbol_detail(
     except Exception:
         logger.warning("news context unavailable for symbol detail", exc_info=False)
         catalyst_context["news"] = nw.empty_news_context(symbol=symbol)
+
+    # Independently wrapped — see the overview. `sec_events` is a SIBLING of
+    # `news`, never nested inside it: an article is somebody's account of an
+    # event, a filing is the registrant's own formal disclosure of one, and
+    # merging them would let commentary borrow the authority of a filing.
+    try:
+        filings, sec_fresh = await _load_sec(db, [symbol], session_date, now)
+        catalyst_context["sec_events"] = se.build_sec_context(
+            filings.get(symbol) or [], as_of_session=session_date,
+            freshness=sec_fresh)
+    except Exception:
+        logger.warning("sec context unavailable for symbol detail", exc_info=False)
+        catalyst_context["sec_events"] = se.empty_sec_context()
 
     market_context = mc.build_market_context(
         symbol, context_bars,
