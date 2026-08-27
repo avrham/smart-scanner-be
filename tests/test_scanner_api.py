@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from main import app
 from app.deps import get_db
+import app.news as nw
 import app.routers.scanner as scanner_mod
 import app.scanner_view as sv
 
@@ -179,7 +180,7 @@ class FakeConn:
     def __init__(self, *, campaign_row=None, result_rows=None, freshness_row=None,
                  symbol_row=None, daily_row=None, bar_rows=None, campaign_list_rows=None,
                  universe_rows=None, catalyst_rows=None, catalyst_state=None,
-                 catalyst_error=None):
+                 catalyst_error=None, news_rows=None, news_error=None):
         self.campaign_row = campaign_row
         self.result_rows = result_rows or []
         self.freshness_row = freshness_row or {"oldest": None, "latest": None}
@@ -195,6 +196,11 @@ class FakeConn:
         self.catalyst_state = catalyst_state or []
         self.catalyst_error = catalyst_error
         self.catalyst_queries = 0
+        # News reads are additive too, and fail INDEPENDENTLY of catalysts.
+        self.news_rows = news_rows or []
+        self.news_error = news_error
+        self.news_queries = 0
+        self.news_query_args = None
         self.freshness_symbols = None
 
     async def fetchrow(self, sql, *a):
@@ -210,6 +216,12 @@ class FakeConn:
         return None
 
     async def fetch(self, sql, *a):
+        if "FROM public.company_news_symbols" in sql:
+            self.news_queries += 1
+            self.news_query_args = a
+            if self.news_error:
+                raise self.news_error
+            return self.news_rows
         if "FROM symbol_catalyst_events" in sql:
             self.catalyst_queries += 1
             if self.catalyst_error:
@@ -942,7 +954,11 @@ class TestOverviewCatalystContext:
             catalyst_state=[_source_state("provider_earnings_calendar"),
                             _source_state("provider_financial_report_filings")]))
         for row in body["results"]:
-            assert set(row["catalyst_context"]) == {
+            # The earnings half of the row block is byte-for-byte what Catalyst
+            # V1 shipped. `news` is a SIBLING key added by News V1 — the only
+            # thing that grew — and it is asserted separately, in
+            # TestOverviewNewsContext.
+            assert set(row["catalyst_context"]) - {"news"} == {
                 "earnings_status", "earnings_proximity", "earnings_sessions_until",
                 "earnings_timing", "earnings_certainty", "earnings_notable",
                 "last_report_proximity", "last_report_sessions_until",
@@ -1066,3 +1082,202 @@ class TestSymbolDetailCatalystContext:
         assert body["candidate"]["verdict"] == "WATCH"
         assert body["catalyst_context"]["earnings"]["status"] == "unavailable"
         assert body["catalyst_context"]["earnings"]["notable"] is False
+
+
+# =========================================================================== #
+# News / Company Catalyst Context V1
+# =========================================================================== #
+
+def _news_row(**over):
+    """One persisted news row as the Product API's join returns it."""
+    row = {
+        "symbol": "AAPL",
+        "relevance": "primary",
+        "published_at": datetime(2026, 8, 25, 14, 30, tzinfo=timezone.utc),
+        "title": "Apple unveils a new Mac lineup",
+        "title_normalized": "apple unveils a new mac lineup",
+        "publisher": "Reuters",
+        "article_url": "https://reuters.com/tech/apple-macs",
+        "category": "product_announcement",
+        "category_source": "derived_title",
+        "scope": "company_specific",
+        "ticker_breadth": 1,
+    }
+    row.update(over)
+    return _row(**row)
+
+
+class TestOverviewNewsContext:
+    def _get(self, client, monkeypatch, conn):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(conn)
+        resp = client.get("/api/scanner/overview")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def _conn(self, **over):
+        base = dict(catalyst_state=[_source_state("provider_earnings_calendar"),
+                                    _source_state("provider_financial_report_filings"),
+                                    _source_state("provider_company_news")])
+        base.update(over)
+        return _catalyst_conn(**base)
+
+    def test_every_row_carries_counts_not_a_feed(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(news_rows=[_news_row()]))
+        for row in body["results"]:
+            news = row["catalyst_context"]["news"]
+            assert set(news) == {"status", "reason", "notable_count",
+                                 "in_window_count", "top_category",
+                                 "latest_published_at", "latest_proximity",
+                                 "latest_headline"}
+            assert "items" not in news
+
+    def test_an_article_reaches_only_the_symbol_it_is_linked_to(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            news_rows=[_news_row(symbol="AAPL")]))
+        by_symbol = {r["symbol"]: r["catalyst_context"]["news"]
+                     for r in body["results"]}
+        assert by_symbol["AAPL"]["notable_count"] == 1
+        assert by_symbol["MSFT"]["notable_count"] == 0
+        assert by_symbol["MSFT"]["latest_headline"] is None
+
+    def test_the_whole_universe_is_read_in_one_query_not_one_per_symbol(
+            self, client, monkeypatch):
+        conn = self._conn(news_rows=[_news_row()])
+        self._get(client, monkeypatch, conn)
+        assert conn.news_queries == 1
+
+    def test_the_query_is_bounded_by_the_session_close(self, client, monkeypatch):
+        conn = self._conn(news_rows=[_news_row()])
+        self._get(client, monkeypatch, conn)
+        symbols, lower, upper = conn.news_query_args
+        assert upper == nw.session_close_utc(date(2026, 8, 25))
+        assert lower < upper
+        assert set(symbols) == {"AAPL", "MSFT"}
+
+    def test_a_market_wide_roundup_never_makes_a_row_speak(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(news_rows=[
+            _news_row(title="5 stocks Berkshire owns", relevance="mentioned",
+                      scope="market_wide", ticker_breadth=25)]))
+        news = {r["symbol"]: r["catalyst_context"]["news"]
+                for r in body["results"]}["AAPL"]
+        assert news["in_window_count"] == 1     # stored and counted...
+        assert news["notable_count"] == 0       # ...but silent
+
+    def test_news_freshness_is_reported_as_its_own_source(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn())
+        assert body["catalyst_sources"]["news"]["status"] == "available"
+
+    def test_a_source_that_never_ran_is_not_reported_as_no_news(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, _catalyst_conn(catalyst_state=[]))
+        assert body["catalyst_sources"]["news"]["reason"] == "never_refreshed"
+        for row in body["results"]:
+            assert row["catalyst_context"]["news"]["status"] == "unavailable"
+
+    def test_a_news_failure_never_takes_the_scanner_down(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            news_error=RuntimeError("news tables are unreadable")))
+        assert body["scanner_state"] == sv.SCANNER_STATE_FRESH
+        assert len(body["results"]) == 2
+        assert body["results"][0]["candidate_verdict"] is not None
+        assert body["catalyst_sources"]["news"]["status"] == "unavailable"
+        for row in body["results"]:
+            assert row["catalyst_context"]["news"]["notable_count"] == 0
+
+    def test_a_news_failure_leaves_the_earnings_dimension_intact(self, client, monkeypatch):
+        # The two dimensions are wrapped separately on purpose.
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_rows=[_catalyst_event()],
+            news_error=RuntimeError("news tables are unreadable")))
+        assert body["catalyst_sources"]["earnings"]["status"] == "available"
+        assert body["results"][0]["catalyst_context"]["earnings_notable"] is True
+        assert body["catalyst_sources"]["news"]["status"] == "unavailable"
+
+    def test_a_catalyst_failure_leaves_the_news_dimension_intact(self, client, monkeypatch):
+        conn = _catalyst_conn(catalyst_error=RuntimeError("catalyst unreadable"))
+        conn.news_rows = [_news_row()]
+        conn.news_error = None
+        conn.catalyst_state = [_source_state("provider_company_news")]
+        body = self._get(client, monkeypatch, conn)
+        assert body["catalyst_sources"]["earnings"]["status"] == "unavailable"
+
+    def test_attention_and_ordering_are_untouched_by_news(self, client, monkeypatch):
+        with_news = self._get(client, monkeypatch, self._conn(
+            news_rows=[_news_row(symbol="AAPL")]))
+        without = self._get(client, monkeypatch, self._conn(
+            news_error=RuntimeError("unreadable")))
+
+        def decisions(body):
+            return [{k: r[k] for k in
+                     ("symbol", "attention", "candidate_verdict", "candidate_score",
+                      "cross_arm", "reason_code", "setup_state")}
+                    for r in body["results"]]
+
+        assert decisions(with_news) == decisions(without)
+        assert ([r["symbol"] for r in with_news["results"]]
+                == [r["symbol"] for r in without["results"]])
+
+
+class TestSymbolDetailNewsContext:
+    def _get(self, client, monkeypatch, conn, symbol="AAPL"):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(conn)
+        resp = client.get(f"/api/scanner/symbol?symbol={symbol}")
+        assert resp.status_code == 200
+        return resp.json()
+
+    def _conn(self, **over):
+        base = dict(
+            symbol_row=_row(
+                candidate_verdict="WATCH", candidate_score=0.7,
+                candidate_reason="setup valid",
+                candidate_details=json.dumps(_CANDIDATE_DETAILS),
+                control_verdict="AVOID", control_score=None, control_reason=None),
+            daily_row={"n": 300, "oldest": date(2025, 1, 2),
+                       "latest": date(2026, 8, 25)},
+            catalyst_state=[_source_state("provider_earnings_calendar"),
+                            _source_state("provider_financial_report_filings"),
+                            _source_state("provider_company_news")])
+        base.update(over)
+        return _catalyst_conn(**base)
+
+    def test_the_detail_carries_bounded_items_with_provenance(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(news_rows=[_news_row()]))
+        news = body["catalyst_context"]["news"]
+        assert news["contract_version"] == "smart_scanner_news_context.v1"
+        item = news["items"][0]
+        assert item["headline"] == "Apple unveils a new Mac lineup"
+        assert item["publisher"] == "Reuters"
+        assert item["url"] == "https://reuters.com/tech/apple-macs"
+        assert item["category"] == "product_announcement"
+        assert item["proximity"] == "today"
+
+    def test_no_provider_payload_and_no_opinion_reaches_the_client(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(news_rows=[_news_row()]))
+        blob = json.dumps(body["catalyst_context"]["news"]).lower()
+        for banned in ("sentiment", "reasoning", "insights", "description",
+                       "keywords", "image_url", "score"):
+            assert banned not in blob
+
+    def test_news_sits_beside_earnings_rather_than_inside_it(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            catalyst_rows=[_catalyst_event()], news_rows=[_news_row()]))
+        ctx = body["catalyst_context"]
+        assert set(ctx) >= {"earnings", "last_financial_report", "news"}
+        # Catalyst V1's own contract is untouched by the arrival of news.
+        assert ctx["contract_version"] == "smart_scanner_catalyst_context.v1"
+        assert "news" not in json.dumps(ctx["earnings"]).lower()
+
+    def test_a_news_failure_never_takes_the_detail_down(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, self._conn(
+            news_error=RuntimeError("unreadable")))
+        assert body["candidate"]["verdict"] == "WATCH"
+        assert body["catalyst_context"]["news"]["status"] == "unavailable"
+        assert body["catalyst_context"]["news"]["items"] == []
+
+    def test_the_detail_reads_news_in_one_query(self, client, monkeypatch):
+        conn = self._conn(news_rows=[_news_row()])
+        self._get(client, monkeypatch, conn)
+        assert conn.news_queries == 1

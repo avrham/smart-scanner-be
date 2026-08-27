@@ -9,10 +9,12 @@ occurrence IDs, or interpreting raw internal enum combinations.
 
 Every route uses an exact static path (query params carry variable input, no
 path params) so each one can be listed verbatim in app.audit_mode's
-AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 5
+AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 9
 relations the SELECT-only smart_scanner_product_reader role is granted on
-(strategy_shadow_runs/run_pairs/pairs/evaluations, daily_bars) plus the pure
-market-calendar resolver — see ops/sql/create_smart_scanner_product_reader.sql.
+(strategy_shadow_runs/run_pairs/pairs/evaluations, daily_bars,
+symbol_catalyst_events, catalyst_source_state, company_news_articles,
+company_news_symbols) plus the pure market-calendar resolver — see
+ops/sql/create_smart_scanner_product_reader.sql.
 Decision-support only: never exposes allow_enter=true semantics,
 never reinterprets pair-level outcomes as candidate/control-specific returns.
 """
@@ -21,7 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
@@ -33,6 +35,8 @@ from app.prospective_session import resolve_latest_completed_session
 import app.catalyst as cat
 import app.catalyst_ingest as ci
 import app.market_context as mc
+import app.news as nw
+import app.news_ingest as ni
 import app.reference_market as rm
 import app.scanner_view as sv
 
@@ -294,6 +298,61 @@ async def _load_catalysts(
     return events, earnings_fresh, filings_fresh
 
 
+#: Calendar days of articles to load around a session. Deliberately WIDER than
+#: the product window (7 trading sessions) so the SQL bound stays a pure
+#: efficiency guard and `app.news` remains the only thing deciding what a
+#: session may see.
+_NEWS_QUERY_SPAN_DAYS = 16
+
+NEWS_SQL = """
+SELECT s.symbol, s.relevance, a.published_at, a.title, a.title_normalized,
+       a.publisher, a.article_url, a.category, a.category_source,
+       a.scope, a.ticker_breadth
+FROM public.company_news_symbols s
+JOIN public.company_news_articles a ON a.id = s.article_id
+WHERE s.symbol = ANY($1::text[])
+  AND a.published_at >= $2
+  AND a.published_at <= $3
+ORDER BY s.symbol, a.published_at DESC
+"""
+
+
+async def _fetch_news_articles(
+    db: asyncpg.Connection, symbols: List[str], session_date: Optional[date_type]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Company news for the whole universe in ONE bounded query.
+
+    Never per symbol, never paginated per row, and never a provider call — the
+    Product API reads persisted context only and holds no provider credential.
+    The upper bound is the session close, so the query itself cannot hand back
+    an article the session was not allowed to see.
+    """
+    if not symbols or session_date is None:
+        return {}
+    upper = nw.session_close_utc(session_date)
+    lower = upper - timedelta(days=_NEWS_QUERY_SPAN_DAYS)
+    rows = await db.fetch(NEWS_SQL, symbols, lower, upper)
+    out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+    for r in rows:
+        out.setdefault(r["symbol"], []).append(dict(r))
+    return out
+
+
+async def _load_news(
+    db: asyncpg.Connection, symbols: List[str],
+    session_date: Optional[date_type], now: datetime,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Any]]:
+    """Batch-load news articles + the news source's freshness.
+
+    Wrapped by the caller so that a news failure degrades this dimension ONLY —
+    the scanner, attention, market context and earnings must keep working.
+    """
+    articles = await _fetch_news_articles(db, symbols, session_date)
+    state = await _fetch_catalyst_freshness(db)
+    freshness = nw.evaluate_freshness(state.get(ni.SOURCE_COMPANY_NEWS), now=now)
+    return articles, freshness
+
+
 @router.get("/scanner/overview")
 async def scanner_overview(
     session: Optional[str] = Query(None, description="ISO session date (YYYY-MM-DD); defaults to the latest campaign"),
@@ -368,6 +427,28 @@ async def scanner_overview(
                              "reason": cat.REASON_SOURCE_UNAVAILABLE},
                 "financial_reports": {"status": cat.STATUS_UNAVAILABLE,
                                       "reason": cat.REASON_SOURCE_UNAVAILABLE}}
+
+        # News is a SEPARATE dimension with its own try/except on purpose: a
+        # news outage must not cost the product its earnings context, and an
+        # earnings outage must not silence the news. Neither can take the
+        # scanner down.
+        try:
+            articles, news_fresh = await _load_news(
+                db, universe_symbols, session_date, now)
+            for row in results:
+                row["catalyst_context"]["news"] = nw.build_row_news(
+                    nw.build_news_context(
+                        articles.get(row["symbol"]) or [], symbol=row["symbol"],
+                        as_of_session=session_date, freshness=news_fresh))
+            catalyst_sources["news"] = news_fresh
+        except Exception:
+            logger.warning("news context unavailable for overview", exc_info=False)
+            blank = nw.build_row_news(nw.empty_news_context())
+            for row in results:
+                row["catalyst_context"]["news"] = dict(blank)
+            catalyst_sources["news"] = {
+                "status": nw.STATUS_UNAVAILABLE,
+                "reason": nw.REASON_SOURCE_UNAVAILABLE}
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -490,6 +571,18 @@ async def scanner_symbol_detail(
         logger.warning("catalyst context unavailable for symbol detail",
                        exc_info=False)
         catalyst_context = cat.empty_catalyst_context()
+
+    # Independently wrapped — see the overview. `news` is added BESIDE the
+    # earnings blocks rather than inside them: an article is not an earnings
+    # date, and the two answer different questions.
+    try:
+        articles, news_fresh = await _load_news(db, [symbol], session_date, now)
+        catalyst_context["news"] = nw.build_news_context(
+            articles.get(symbol) or [], symbol=symbol,
+            as_of_session=session_date, freshness=news_fresh)
+    except Exception:
+        logger.warning("news context unavailable for symbol detail", exc_info=False)
+        catalyst_context["news"] = nw.empty_news_context(symbol=symbol)
 
     market_context = mc.build_market_context(
         symbol, context_bars,

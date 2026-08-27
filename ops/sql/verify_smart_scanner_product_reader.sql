@@ -33,13 +33,17 @@ FROM (
   FROM pg_roles WHERE rolname = current_user
 ) t WHERE val;
 
--- 4) SELECT present and every write privilege absent on the exact 5 relations.
+-- 4) SELECT present and every write privilege absent on the exact 9 relations.
 WITH required(relation) AS (
   VALUES ('public.strategy_shadow_runs'),
          ('public.strategy_shadow_run_pairs'),
          ('public.strategy_shadow_pairs'),
          ('public.strategy_shadow_evaluations'),
-         ('public.daily_bars')
+         ('public.daily_bars'),
+         ('public.symbol_catalyst_events'),
+         ('public.catalyst_source_state'),
+         ('public.company_news_articles'),
+         ('public.company_news_symbols')
 )
 SELECT relation,
        to_regclass(relation) IS NOT NULL                     AS exists,
@@ -74,7 +78,7 @@ WHERE to_regclass(relation) IS NULL
    OR has_table_privilege(relation, 'TRUNCATE')
    OR has_table_privilege(relation, 'TRIGGER');
 
--- 6) ASSERT: no SELECT anywhere outside the 5 product relations. Expected:
+-- 6) ASSERT: no SELECT anywhere outside the 9 product relations. Expected:
 --    zero rows. This is what keeps the product surface from silently widening.
 SELECT c.relname AS unexpected_readable_relation
 FROM pg_class c
@@ -83,18 +87,26 @@ WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m','p')
   AND has_table_privilege(c.oid, 'SELECT')
   AND c.relname NOT IN ('strategy_shadow_runs','strategy_shadow_run_pairs',
                         'strategy_shadow_pairs','strategy_shadow_evaluations',
-                        'daily_bars')
+                        'daily_bars','symbol_catalyst_events',
+                        'catalyst_source_state','company_news_articles',
+                        'company_news_symbols')
 ORDER BY c.relname;
 
 -- 7) EFFECTIVE RESULT SET under RLS. The role is NOBYPASSRLS, so these counts
---    are what the Product API can actually see. All five must be > 0 for a
---    database holding a completed scan — a SELECT grant without a matching
---    read policy silently returns zero rows, and this is what catches that.
+--    are what the Product API can actually see. The five scanner relations
+--    must be > 0 for a database holding a completed scan; the catalyst and
+--    news relations are > 0 only once their refresh has run at least once.
+--    A SELECT grant without a matching read policy silently returns zero rows,
+--    and this is what catches that.
 SELECT 'strategy_shadow_runs'        AS relation, count(*) AS visible_rows FROM strategy_shadow_runs
 UNION ALL SELECT 'strategy_shadow_run_pairs',   count(*) FROM strategy_shadow_run_pairs
 UNION ALL SELECT 'strategy_shadow_pairs',       count(*) FROM strategy_shadow_pairs
 UNION ALL SELECT 'strategy_shadow_evaluations', count(*) FROM strategy_shadow_evaluations
 UNION ALL SELECT 'daily_bars',                  count(*) FROM daily_bars
+UNION ALL SELECT 'symbol_catalyst_events',      count(*) FROM symbol_catalyst_events
+UNION ALL SELECT 'catalyst_source_state',       count(*) FROM catalyst_source_state
+UNION ALL SELECT 'company_news_articles',       count(*) FROM company_news_articles
+UNION ALL SELECT 'company_news_symbols',        count(*) FROM company_news_symbols
 ORDER BY relation;
 
 -- 8) The exact shape the Product API resolves: latest campaign run, its
