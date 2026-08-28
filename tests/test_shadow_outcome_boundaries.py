@@ -55,7 +55,8 @@ class TestMigrationBoundaries:
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("020_*"))] == ["020_company_news.sql"]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("021_*"))] == ["021_sec_material_events.sql"]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("022_*"))] == ["022_external_signals.sql"]
-        assert not list(MIGRATIONS_DIR.glob("023_*"))
+        assert [q.name for q in sorted(MIGRATIONS_DIR.glob("023_*"))] == ["023_external_discovery.sql"]
+        assert not list(MIGRATIONS_DIR.glob("024_*"))
         sql = (MIGRATIONS_DIR / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
         assert "strategy_shadow" not in sql.lower()
         assert "wyckoff_mtf_v2" in sql

@@ -284,7 +284,8 @@ class TestNoNewMigration:
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("020_*"))] == ["020_company_news.sql"]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("021_*"))] == ["021_sec_material_events.sql"]
         assert [q.name for q in sorted(MIGRATIONS_DIR.glob("022_*"))] == ["022_external_signals.sql"]
-        assert not list(MIGRATIONS_DIR.glob("023_*"))
+        assert [q.name for q in sorted(MIGRATIONS_DIR.glob("023_*"))] == ["023_external_discovery.sql"]
+        assert not list(MIGRATIONS_DIR.glob("024_*"))
 
     def test_4h_evidence_fits_existing_schema(self):
         """Everything Phase 9E persists rides in EXISTING columns: the 4H
