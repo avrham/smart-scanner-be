@@ -1,6 +1,11 @@
 -- =============================================================================
 -- Verify smart_scanner_product_reader is correctly least-privileged AND can
 -- actually serve the three Product API routes under RLS.
+--
+-- The relation list grew to 13 with the External Intelligence Hub (migration
+-- 022): the product reads normalised external signals and the source registry.
+-- It is deliberately NOT granted external_signal_deliveries — raw third-party
+-- payloads are operator data, not product data.
 -- =============================================================================
 -- Run this CONNECTED AS smart_scanner_product_reader, so every has_*_privilege
 -- and every row count reflects the real product identity. Entirely read-only:
@@ -45,7 +50,9 @@ WITH required(relation) AS (
          ('public.company_news_articles'),
          ('public.company_news_symbols'),
          ('public.sec_filings'),
-         ('public.sec_filing_symbols')
+         ('public.sec_filing_symbols'),
+         ('public.external_signals'),
+         ('public.external_signal_sources')
 )
 SELECT relation,
        to_regclass(relation) IS NOT NULL                     AS exists,

@@ -200,6 +200,59 @@ class Settings(BaseSettings):
     MAINTENANCE_LOCKED_COHORT_HASH: str = ""
 
     # ---------------------------------------------------------------------
+    # External-intelligence ingress (External Intelligence Hub V1,
+    # migration 022). The FIRST internet-facing write path in this codebase.
+    #
+    # It cannot share the Product API app: that one runs AUDIT_ONLY_MODE with a
+    # GET-only allowlist and connects as a role whose sessions are
+    # default_transaction_read_only. A webhook is a POST that INSERTs, so it
+    # gets its own bounded mode, its own Fly app and its own least-privilege
+    # role — the same isolation pattern as audit / maintenance / warmup /
+    # prospective.
+    # ---------------------------------------------------------------------
+    # When true the app exposes ONLY liveness/version + the external-signal
+    # ingress routes, and never runs the scheduler. Mutually exclusive with
+    # every other bounded mode. Default false leaves all deployments unchanged.
+    EXTERNAL_INGEST_ONLY_MODE: bool = False
+    # Explicit ingress database identity: a COMPLETE PostgreSQL DSN
+    # authenticating as smart_scanner_external_ingest (fail closed if absent —
+    # never falls back to the audit, maintenance, warmup, prospective or
+    # default identity). SECRET; Fly secret only.
+    EXTERNAL_INGEST_DATABASE_URL: str = ""
+    EXTERNAL_INGEST_EXPECTED_DB_ROLE: str = "smart_scanner_external_ingest"
+    # The shared ingress credential a third party must present. SECRET.
+    #
+    # It travels in the `X-Smart-Scanner-Token` header when the caller can set
+    # headers, and in the `?token=` query parameter when it cannot — TradingView
+    # webhooks send a fixed body to a fixed URL with no custom headers, so a
+    # URL-borne credential is the only mechanism the platform offers. It is
+    # NEVER accepted from the request BODY: an alert message is user-editable
+    # text that gets pasted into support threads and screenshots.
+    #
+    # Empty by default, and the verifier fails CLOSED on an empty expected
+    # value — a deployment that forgot this secret rejects everything rather
+    # than accepting everyone.
+    EXTERNAL_INGEST_TOKEN: str = ""
+    # Per-process sliding window (see app/external_ingest.py on why in-process
+    # is honest here). A TradingView alert fires at most once per bar close.
+    EXTERNAL_INGEST_RATE_LIMIT_PER_MINUTE: int = 60
+    # Hard body ceiling, enforced BEFORE the JSON parser runs.
+    EXTERNAL_INGEST_MAX_PAYLOAD_BYTES: int = 8192
+    # How far a source's own timestamp may sit from arrival before the delivery
+    # is refused. This is the replay window; see app/external_adapters.py.
+    EXTERNAL_INGEST_MAX_CLOCK_SKEW_SECONDS: int = 1800
+    # OPTIONAL comma-separated source-IP allowlist, OFF by default.
+    #
+    # TradingView publishes the fixed addresses its webhooks come from
+    # (52.89.214.238, 34.212.75.30, 54.218.53.128, 52.32.178.7 as documented at
+    # the time of writing), so an operator may pin them for defence in depth.
+    # It stays off by default deliberately: pinning a third party's published
+    # addresses becomes an outage the day they change them without notice. The
+    # token is the security boundary; this is a bonus, not a replacement.
+    # Not sensitive.
+    EXTERNAL_INGEST_ALLOWED_IPS: str = ""
+
+    # ---------------------------------------------------------------------
     # Durable PostgreSQL-backed job queue + dedicated worker (migration 018).
     # PostgreSQL is the ONLY queue source of truth (no Redis/Celery/broker).
     # The queue framework is generic; only the prospective symbol-evaluation

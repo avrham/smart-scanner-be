@@ -1,0 +1,114 @@
+# fly.external-ingest.toml — smart-scanner-be-external-ingest-staging
+#
+# THE EXTERNAL-SIGNAL INGRESS. The only Smart Scanner app that accepts a write
+# from the public internet.
+#
+# WHY IT IS A SEPARATE APP
+# ------------------------
+# It cannot live beside the Product API. That app runs AUDIT_ONLY_MODE with a
+# GET-only allowlist and connects as smart_scanner_product_reader, whose
+# sessions are default_transaction_read_only. A webhook is a POST that INSERTs,
+# so putting the two together would mean either widening the product role to
+# write or widening the audit gate to accept POST — both of which would undo
+# guarantees that took real work to establish.
+#
+# So it follows the isolation pattern this repository already uses five times
+# (audit / maintenance / warmup / prospective / worker): its own bounded mode,
+# its own Fly app, and its own least-privilege database role.
+#
+# WHAT THIS APP CAN REACH
+# -----------------------
+# EXTERNAL_INGEST_ONLY_MODE exposes exactly seven paths: liveness/version, the
+# ingress health and source registry, and ONE POST. Every other route in the
+# FastAPI tree — the entire admin surface, the scanner Product API, campaign,
+# outcome and provider paths, and the OpenAPI/docs routes — is rejected before
+# its handler runs.
+#
+# It runs NO scheduler, NO background processing and holds NO provider
+# credential. It connects as smart_scanner_external_ingest, which can append to
+# two external tables, read the registry and the frozen universe, and upsert
+# its own freshness rows (RLS-confined to `external_%`). It holds no privilege
+# of any kind on any scanner relation — see
+# ops/sql/create_smart_scanner_external_ingest.sql.
+#
+# Canonical write target: the isolated Fly Postgres holding the scanner
+# pipeline output (app `smart-scanner-history-warmup-db-staging`, database
+# `warmup`, region fra), reached over the private 6PN network. The connection
+# is the EXTERNAL_INGEST_DATABASE_URL SECRET and is never committed here.
+#
+# The Git SHA is intentionally NOT set here — it is supplied at deploy time via
+# --build-arg APP_GIT_SHA="$(git rev-parse HEAD)" so /version always reflects
+# the exact deployed commit.
+
+app = 'smart-scanner-be-external-ingest-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+# Non-secret, safety-critical toggles. The SECRETS — EXTERNAL_INGEST_TOKEN,
+# EXTERNAL_INGEST_DATABASE_URL, WORKER_TOKEN and the non-production SUPABASE_*
+# placeholders — are set via `fly secrets set` and are never committed here.
+[env]
+  APP_ENVIRONMENT = 'staging'
+  EXTERNAL_INGEST_ONLY_MODE = 'true'   # expose ONLY liveness + the ingress surface
+  # Mutually exclusive with every other bounded mode; startup fails fast if two
+  # are ever enabled together (see main.py).
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  HISTORY_WARMUP_ONLY_MODE = 'false'
+  PROSPECTIVE_CAMPAIGN_ONLY_MODE = 'false'
+  ENABLE_SCHEDULER = 'false'           # no cron, no background jobs, no provider
+  REQUIRE_WORKER_TOKEN = 'true'        # the admin surface is unreachable anyway
+  LOG_FORMAT = 'json'
+
+  # The custom role the ingress connection MUST authenticate as. NON-secret
+  # (just a role name); the connection itself is a Fly secret. Until that
+  # secret is set the mode fails closed — no fallback to any other identity.
+  EXTERNAL_INGEST_EXPECTED_DB_ROLE = 'smart_scanner_external_ingest'
+
+  # A TradingView alert fires at most once per bar close, so 60/min is already
+  # far above any legitimate rate and exists to bound abuse, not to shape
+  # traffic.
+  EXTERNAL_INGEST_RATE_LIMIT_PER_MINUTE = '60'
+  # TradingView caps an alert message at 4000 characters from the dialog; 8 KiB
+  # accepts that with room for a larger Pine-generated body while still
+  # refusing anything that is not an alert.
+  EXTERNAL_INGEST_MAX_PAYLOAD_BYTES = '8192'
+  EXTERNAL_INGEST_MAX_CLOCK_SKEW_SECONDS = '1800'
+  # OPTIONAL source-IP pinning, deliberately EMPTY.
+  #
+  # TradingView publishes the addresses its webhooks originate from
+  # (52.89.214.238, 34.212.75.30, 54.218.53.128, 52.32.178.7 at the time of
+  # writing). Pinning them is available as defence in depth, and is off by
+  # default because it becomes a silent outage the day that list changes
+  # without notice. The token is the security boundary.
+  EXTERNAL_INGEST_ALLOWED_IPS = ''
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  # NEVER auto-stop. Every other bounded app here may cold-start, because a
+  # human waits for its response. This one is called by a third party that
+  # allows THREE SECONDS and documents no retry, so a cold start is a lost
+  # alert. `min_machines_running = 1` is the difference between an ingress that
+  # works and one that silently drops the first signal after a quiet period.
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  # /version is always 200 and needs no database, so a health check against it
+  # proves the revision is up without depending on the DB secret being set yet.
+  [[http_service.checks]]
+    interval = '30s'
+    timeout = '5s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/version'
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512

@@ -42,6 +42,8 @@ MODE_PROSPECTIVE_EXPLICIT = "prospective_explicit"
 MODE_PROSPECTIVE_UNCONFIGURED = "prospective_unconfigured"
 MODE_JOB_WORKER_EXPLICIT = "job_worker_explicit"
 MODE_JOB_WORKER_UNCONFIGURED = "job_worker_unconfigured"
+MODE_EXTERNAL_INGEST_EXPLICIT = "external_ingest_explicit"
+MODE_EXTERNAL_INGEST_UNCONFIGURED = "external_ingest_unconfigured"
 
 # asyncpg pool kwargs for the AUDIT pool. statement_cache_size=0 disables
 # prepared statements so the pool is safe behind a Supavisor pooler (and
@@ -90,6 +92,17 @@ JOB_WORKER_POOL_KWARGS = {
     "command_timeout": 120,
     "statement_cache_size": 0,
 }
+# External-ingest pool: WRITE-capable, but the narrowest write in the system —
+# the role holds INSERT on three relations and no UPDATE or DELETE anywhere.
+# Kept small and short-timeout on purpose: one delivery is a handful of fast
+# statements, and an internet-facing endpoint must never be able to tie up
+# connections waiting on a slow query.
+EXTERNAL_INGEST_POOL_KWARGS = {
+    "min_size": 1,
+    "max_size": 5,
+    "command_timeout": 15,
+    "statement_cache_size": 0,
+}
 DEFAULT_POOL_KWARGS = {"min_size": 1, "max_size": 10, "command_timeout": 60}
 
 
@@ -116,6 +129,14 @@ def _prospective_url() -> str:
 
 def _job_worker_url() -> str:
     return (getattr(settings, "JOB_WORKER_DATABASE_URL", "") or "").strip()
+
+
+def _external_ingest_url() -> str:
+    return (getattr(settings, "EXTERNAL_INGEST_DATABASE_URL", "") or "").strip()
+
+
+def external_ingest_database_configured() -> bool:
+    return bool(_external_ingest_url())
 
 
 def maintenance_database_configured() -> bool:
@@ -209,6 +230,9 @@ def get_connection_mode() -> str:
     if getattr(settings, "JOB_WORKER_ENABLED", False):
         return (MODE_JOB_WORKER_EXPLICIT if _job_worker_url()
                 else MODE_JOB_WORKER_UNCONFIGURED)
+    if getattr(settings, "EXTERNAL_INGEST_ONLY_MODE", False):
+        return (MODE_EXTERNAL_INGEST_EXPLICIT if _external_ingest_url()
+                else MODE_EXTERNAL_INGEST_UNCONFIGURED)
     if getattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", False):
         return (MODE_PROSPECTIVE_EXPLICIT if _prospective_url()
                 else MODE_PROSPECTIVE_UNCONFIGURED)
@@ -245,6 +269,19 @@ def select_connection_plan() -> Tuple[str, List[Tuple[str, str]], Dict[str, Any]
         validate_audit_database_url(raw)
         return (MODE_JOB_WORKER_EXPLICIT, [("job_worker_explicit", raw)],
                 dict(JOB_WORKER_POOL_KWARGS))
+
+    if getattr(settings, "EXTERNAL_INGEST_ONLY_MODE", False):
+        raw = _external_ingest_url()
+        if not raw:
+            raise AuditDatabaseError(
+                "external ingest database not configured: "
+                "EXTERNAL_INGEST_ONLY_MODE=true requires "
+                "EXTERNAL_INGEST_DATABASE_URL (no fallback to the prospective, "
+                "audit, maintenance, warmup or default database)")
+        validate_audit_database_url(raw)
+        return (MODE_EXTERNAL_INGEST_EXPLICIT,
+                [("external_ingest_explicit", raw)],
+                dict(EXTERNAL_INGEST_POOL_KWARGS))
 
     if getattr(settings, "PROSPECTIVE_CAMPAIGN_ONLY_MODE", False):
         raw = _prospective_url()
@@ -312,6 +349,10 @@ __all__ = [
     "MODE_PROSPECTIVE_UNCONFIGURED",
     "MODE_JOB_WORKER_EXPLICIT",
     "MODE_JOB_WORKER_UNCONFIGURED",
+    "MODE_EXTERNAL_INGEST_EXPLICIT",
+    "MODE_EXTERNAL_INGEST_UNCONFIGURED",
+    "EXTERNAL_INGEST_POOL_KWARGS",
+    "external_ingest_database_configured",
     "AuditDatabaseError",
     "validate_audit_database_url",
     "audit_dsn_diagnostic",

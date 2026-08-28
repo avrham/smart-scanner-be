@@ -14,9 +14,10 @@ from app.audit_mode import is_audit_route_allowed
 from app.maintenance_mode import is_maintenance_route_allowed
 from app.history_warmup_mode import is_history_warmup_route_allowed
 from app.prospective_mode import is_prospective_route_allowed
+from app.external_ingest_mode import is_external_ingest_route_allowed
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
-from app.routers import public, admin, outcomes, shadow, scanner
+from app.routers import public, admin, outcomes, shadow, scanner, external
 from app.routers import jobs as jobs_router
 from app.utils.logging import setup_logging
 from app.workers.scheduler import start_scheduler
@@ -88,6 +89,38 @@ async def lifespan(app: FastAPI):
             "ENABLE_SCHEDULER=false (prospective mode never runs background work)"
         )
 
+    # External-ingest-only mode guards (External Intelligence Hub V1): mutually
+    # exclusive with every other bounded mode, and never runs the scheduler.
+    #
+    # This is the only bounded mode that exposes a WRITE to the public
+    # internet, so the exclusivity is not tidiness — running it alongside
+    # audit mode would put an anonymous POST in front of the read-only product
+    # role, and alongside prospective mode would put it in front of a role that
+    # can write scanner evaluations.
+    if settings.EXTERNAL_INGEST_ONLY_MODE and (
+            settings.AUDIT_ONLY_MODE or settings.MAINTENANCE_ONLY_MODE
+            or settings.HISTORY_WARMUP_ONLY_MODE
+            or settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE):
+        raise RuntimeError(
+            "invalid configuration: EXTERNAL_INGEST_ONLY_MODE is mutually "
+            "exclusive with AUDIT_ONLY_MODE, MAINTENANCE_ONLY_MODE, "
+            "HISTORY_WARMUP_ONLY_MODE and PROSPECTIVE_CAMPAIGN_ONLY_MODE"
+        )
+    if settings.EXTERNAL_INGEST_ONLY_MODE and settings.ENABLE_SCHEDULER:
+        raise RuntimeError(
+            "invalid configuration: EXTERNAL_INGEST_ONLY_MODE=true requires "
+            "ENABLE_SCHEDULER=false (the ingress never runs background work)"
+        )
+    # An ingress with no credential would accept nothing at all (the verifier
+    # fails closed), so booting it that way is a misconfiguration that should
+    # be loud at startup rather than silent until the first alert is lost.
+    if settings.EXTERNAL_INGEST_ONLY_MODE and not (
+            settings.EXTERNAL_INGEST_TOKEN or "").strip():
+        raise RuntimeError(
+            "invalid configuration: EXTERNAL_INGEST_ONLY_MODE=true requires "
+            "EXTERNAL_INGEST_TOKEN (the ingress fails closed without it)"
+        )
+
     # The durable job WORKER is a dedicated non-HTTP process (`python -m
     # app.jobs.worker`). The FastAPI HTTP app must NEVER set JOB_WORKER_ENABLED —
     # doing so would make the web app adopt the worker's DB identity and run the
@@ -102,7 +135,8 @@ async def lifespan(app: FastAPI):
     if (settings.ENABLE_SCHEDULER and not settings.AUDIT_ONLY_MODE
             and not settings.MAINTENANCE_ONLY_MODE
             and not settings.HISTORY_WARMUP_ONLY_MODE
-            and not settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE):
+            and not settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE
+            and not settings.EXTERNAL_INGEST_ONLY_MODE):
         start_scheduler()
         logger.info("Scheduler started")
     elif settings.MAINTENANCE_ONLY_MODE:
@@ -135,6 +169,8 @@ async def lifespan(app: FastAPI):
         logger.info("History-warmup-only mode: scheduler and background work disabled")
     elif settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE:
         logger.info("Prospective-campaign-only mode: scheduler and background work disabled")
+    elif settings.EXTERNAL_INGEST_ONLY_MODE:
+        logger.info("External-ingest-only mode: scheduler and background work disabled")
 
     yield
     
@@ -162,6 +198,7 @@ app.include_router(public.router, prefix="/api", tags=["public"])
 app.include_router(outcomes.router, prefix="/api", tags=["outcomes"])
 app.include_router(shadow.router, prefix="/api", tags=["shadow"])
 app.include_router(scanner.router, prefix="/api", tags=["scanner"])
+app.include_router(external.router, prefix="/api", tags=["external"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(jobs_router.router, prefix="/api/admin", tags=["jobs"])
 
@@ -189,6 +226,10 @@ async def audit_only_gate(request, call_next):
     ):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     if settings.PROSPECTIVE_CAMPAIGN_ONLY_MODE and not is_prospective_route_allowed(
+        request.method, request.url.path
+    ):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    if settings.EXTERNAL_INGEST_ONLY_MODE and not is_external_ingest_route_allowed(
         request.method, request.url.path
     ):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})

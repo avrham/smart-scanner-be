@@ -9,15 +9,22 @@ occurrence IDs, or interpreting raw internal enum combinations.
 
 Every route uses an exact static path (query params carry variable input, no
 path params) so each one can be listed verbatim in app.audit_mode's
-AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 11
+AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 13
 relations the SELECT-only smart_scanner_product_reader role is granted on
 (strategy_shadow_runs/run_pairs/pairs/evaluations, daily_bars,
 symbol_catalyst_events, catalyst_source_state, company_news_articles,
-company_news_symbols, sec_filings, sec_filing_symbols) plus the pure
-market-calendar resolver — see
+company_news_symbols, sec_filings, sec_filing_symbols, external_signals,
+external_signal_sources) plus the pure market-calendar resolver — see
 ops/sql/create_smart_scanner_product_reader.sql.
 Decision-support only: never exposes allow_enter=true semantics,
 never reinterprets pair-level outcomes as candidate/control-specific returns.
+
+External intelligence (022) is read here but WRITTEN somewhere else entirely:
+the webhook gateway is a separate app with a separate role, because this one's
+sessions are default_transaction_read_only and its route gate is GET-only. The
+product surface reads normalised signals and the registry; it is deliberately
+NOT granted `external_signal_deliveries`, which holds raw third-party payloads
+and is operator data rather than product data.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ import app.prospective_campaign as pc
 from app.prospective_session import resolve_latest_completed_session
 import app.catalyst as cat
 import app.catalyst_ingest as ci
+import app.external_signals as ex
 import app.market_context as mc
 import app.news as nw
 import app.news_ingest as ni
@@ -412,6 +420,80 @@ async def _load_sec(
     return filings, freshness
 
 
+_EXTERNAL_QUERY_SPAN_DAYS = 45
+
+EXTERNAL_SIGNALS_SQL = """
+SELECT id, source, symbol, source_signal_id,
+       observed_at, received_at, effective_at, clock_skew_seconds,
+       timeframe, timeframe_normalized,
+       signal_type, signal_type_normalized,
+       direction, direction_normalized,
+       confidence, confidence_scale,
+       indicator, indicator_version, alert_id,
+       contract_version, source_payload_version, supersedes_signal_id
+FROM public.external_signals
+WHERE symbol = ANY($1::text[])
+  AND symbol_scope = 'scanner_universe'
+  AND effective_at >= $2
+  AND effective_at <= $3
+ORDER BY symbol, effective_at DESC
+"""
+
+EXTERNAL_SOURCES_SQL = """
+SELECT source, display_name, transports, supports_realtime, supports_historical,
+       supports_symbol_scan, supports_signal_events, emits_signals,
+       requires_paid_plan, status, notes
+FROM public.external_signal_sources
+ORDER BY status <> 'live', source
+"""
+
+
+async def _fetch_external_signals(
+    db: asyncpg.Connection, symbols: List[str], session_date: Optional[date_type]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """External signals for the whole universe in ONE bounded query.
+
+    Never per symbol — 25 symbols must cost one round trip, not 25. The upper
+    bound is the session close, so the query itself cannot hand back a signal
+    the session was not allowed to see, and `symbol_scope` keeps
+    research-only discoveries out of the product surface entirely.
+    """
+    if not symbols or session_date is None:
+        return {}
+    upper = ex.session_close_utc(session_date)
+    lower = upper - timedelta(days=_EXTERNAL_QUERY_SPAN_DAYS)
+    rows = await db.fetch(EXTERNAL_SIGNALS_SQL, symbols, lower, upper)
+    out: Dict[str, List[Dict[str, Any]]] = {s: [] for s in symbols}
+    for r in rows:
+        out.setdefault(r["symbol"], []).append(dict(r))
+    return out
+
+
+async def _load_external(
+    db: asyncpg.Connection, symbols: List[str],
+    session_date: Optional[date_type], now: datetime,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Batch-load external signals, the source registry, and freshness.
+
+    Wrapped by the caller so an external-intelligence failure degrades this
+    dimension ONLY — the scanner, attention, market context, earnings, news
+    and SEC must all keep working when a third party goes quiet or the
+    registry is unreadable. That is the whole point of a hub that sits beside
+    the strategy rather than inside it.
+    """
+    signals = await _fetch_external_signals(db, symbols, session_date)
+    source_rows = [dict(r) for r in await db.fetch(EXTERNAL_SOURCES_SQL)]
+    state = await _fetch_catalyst_freshness(db)
+    per_source = {
+        row["source"]: ex.evaluate_freshness(
+            state.get(ex.source_state_key(row["source"])), now=now,
+            registry_status=row.get("status"))
+        for row in source_rows
+        if row.get("source") in ex.WEBHOOK_SOURCES
+    }
+    return signals, source_rows, ex.combine_freshness(per_source)
+
+
 @router.get("/scanner/overview")
 async def scanner_overview(
     session: Optional[str] = Query(None, description="ISO session date (YYYY-MM-DD); defaults to the latest campaign"),
@@ -429,6 +511,17 @@ async def scanner_overview(
                      "reason": cat.REASON_NEVER_REFRESHED},
         "financial_reports": {"status": cat.STATUS_UNAVAILABLE,
                               "reason": cat.REASON_NEVER_REFRESHED}}
+    # External intelligence is a TOP-LEVEL dimension, not a catalyst source:
+    # a catalyst is something that happened to the company, an external signal
+    # is another system's opinion about the same chart. It therefore gets its
+    # own summary rather than a fourth entry in `catalyst_sources`.
+    external_intelligence: Dict[str, Any] = {
+        "contract_version": ex.EXTERNAL_INTELLIGENCE_CONTRACT_VERSION,
+        "status": ex.STATUS_UNAVAILABLE,
+        "reason": ex.REASON_NEVER_REFRESHED,
+        "external_sources_present": [], "symbols_with_external_signal": 0,
+        "recent_signal_count": 0, "agreement_symbol_count": 0,
+        "disagreement_symbol_count": 0, "sources": []}
 
     campaign = await _fetch_latest_campaign(db, session=session)
     scanner_state = sv.classify_scanner_state(
@@ -530,6 +623,44 @@ async def scanner_overview(
                 "status": se.STATUS_UNAVAILABLE,
                 "reason": se.REASON_SOURCE_UNAVAILABLE}
 
+        # A FOURTH independently-wrapped dimension, and the only one whose
+        # data arrives from outside this system. A third party going quiet,
+        # a registry that will not read, or an ingress that was never
+        # configured must all cost exactly this block and nothing else.
+        try:
+            signals, source_rows, ext_fresh = await _load_external(
+                db, universe_symbols, session_date, now)
+            contexts = []
+            for row in results:
+                ctx = ex.build_external_context(
+                    signals.get(row["symbol"]) or [],
+                    as_of_session=session_date, sources=source_rows,
+                    freshness=ext_fresh, attention=row.get("attention"))
+                contexts.append(ctx)
+                row["external_intelligence"] = ex.build_row_external(ctx)
+            external_intelligence = {
+                "contract_version": ex.EXTERNAL_INTELLIGENCE_CONTRACT_VERSION,
+                "status": ext_fresh.get("status"),
+                "reason": ext_fresh.get("reason"),
+                **ex.summarize_sources(contexts),
+                "sources": [ex.build_source_entry(r) for r in source_rows],
+            }
+        except Exception:
+            logger.warning("external intelligence unavailable for overview",
+                           exc_info=False)
+            blank_ext = ex.build_row_external(ex.empty_external_context(
+                reason=ex.REASON_SOURCE_UNAVAILABLE))
+            for row in results:
+                row["external_intelligence"] = dict(blank_ext)
+            external_intelligence = {
+                "contract_version": ex.EXTERNAL_INTELLIGENCE_CONTRACT_VERSION,
+                "status": ex.STATUS_UNAVAILABLE,
+                "reason": ex.REASON_SOURCE_UNAVAILABLE,
+                "external_sources_present": [],
+                "symbols_with_external_signal": 0, "recent_signal_count": 0,
+                "agreement_symbol_count": 0, "disagreement_symbol_count": 0,
+                "sources": []}
+
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
         "generated_at": now.isoformat(),
@@ -563,6 +694,11 @@ async def scanner_overview(
         "market_regime": market_regime,
         # Per-source catalyst freshness, so the UI never shows stale event dates.
         "catalyst_sources": catalyst_sources,
+        # THIRD-PARTY OPINIONS, deliberately outside both market_context and
+        # catalyst_context. Compact evidence only — who is talking and about
+        # how many symbols; the claims themselves live on the detail screen
+        # where their provenance can travel with them.
+        "external_intelligence": external_intelligence,
         "results": results,
         "strategy": {
             "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
@@ -684,6 +820,31 @@ async def scanner_symbol_detail(
         universe_breadth=mc.build_universe_breadth(context_bars),
     )
 
+    # External intelligence is built AFTER the attention tier, because the
+    # confluence reading needs to know what our own scanner thinks. Note the
+    # direction of that dependency: confluence is derived FROM the attention
+    # tier and can never feed back into it. The tier above was computed
+    # without any knowledge that this block exists.
+    evidence = sv.build_symbol_evidence(candidate_details)
+    attention = sv.classify_attention(
+        has_candidate_result=has_candidate,
+        candidate_verdict=candidate_verdict,
+        setup_state=evidence["setup_state"] if evidence else None,
+        readiness_status=evidence["readiness_status"] if evidence else None,
+        control_verdict=control_verdict,
+    )
+    try:
+        signals, source_rows, ext_fresh = await _load_external(
+            db, [symbol], session_date, now)
+        external_intelligence = ex.build_external_context(
+            signals.get(symbol) or [], as_of_session=session_date,
+            sources=source_rows, freshness=ext_fresh, attention=attention)
+    except Exception:
+        logger.warning("external intelligence unavailable for symbol detail",
+                       exc_info=False)
+        external_intelligence = ex.empty_external_context(
+            reason=ex.REASON_SOURCE_UNAVAILABLE)
+
     daily = await db.fetchrow(
         "SELECT COUNT(*)::int AS n, MIN(trading_date) AS oldest, MAX(trading_date) AS latest "
         "FROM daily_bars WHERE symbol = $1",
@@ -704,18 +865,11 @@ async def scanner_symbol_detail(
         for b in reversed(bars)
     ]
 
-    evidence = sv.build_symbol_evidence(candidate_details)
     return {
         "contract_version": sv.SYMBOL_DETAIL_CONTRACT_VERSION,
         "symbol": symbol,
         "symbol_state": symbol_state,
-        "attention": sv.classify_attention(
-            has_candidate_result=has_candidate,
-            candidate_verdict=candidate_verdict,
-            setup_state=evidence["setup_state"] if evidence else None,
-            readiness_status=evidence["readiness_status"] if evidence else None,
-            control_verdict=control_verdict,
-        ),
+        "attention": attention,
         "cross_arm": sv.classify_cross_arm(
             candidate_verdict=candidate_verdict, control_verdict=control_verdict
         ),
@@ -756,6 +910,12 @@ async def scanner_symbol_detail(
         # Known corporate events. Separate from market_context on purpose:
         # "this setup exists AND earnings are approaching", never "therefore".
         "catalyst_context": catalyst_context,
+        # What systems OUTSIDE Smart Scanner claimed about this symbol, with
+        # every claim's provenance attached. A sibling of catalyst_context and
+        # never a member of it: an 8-K is a company's formal disclosure, an
+        # external signal is a machine's opinion, and merging them would let
+        # the opinion borrow the filing's authority.
+        "external_intelligence": external_intelligence,
         "readiness": {
             "daily_bar_count": daily["n"] if daily else 0,
             "oldest_daily_bar": daily["oldest"].isoformat() if daily and daily["oldest"] else None,

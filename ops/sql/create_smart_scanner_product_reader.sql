@@ -5,10 +5,14 @@
 --   GET /api/scanner/overview
 --   GET /api/scanner/scans
 --   GET /api/scanner/symbol
--- It holds SELECT on the EXACT 11 relations those routes touch and NO write
--- privilege anywhere. It is deliberately narrower than
--- smart_scanner_audit_reader (13 relations): the product surface must not grow
--- just because the audit surface did.
+-- It holds SELECT on the EXACT 13 relations those routes touch and NO write
+-- privilege anywhere. It is deliberately narrow: the product surface must not
+-- grow just because the audit surface did.
+--
+-- Note what is NOT here even though the External Intelligence Hub added it:
+-- `external_signal_deliveries`. That table holds raw third-party payloads and
+-- rejection diagnostics, which is operator data, not product data — the
+-- Product API reads normalised signals and the registry, and nothing else.
 --
 -- This file contains NO real password, NO hostname and NO database name.
 -- An operator applies it manually against the intended database.
@@ -81,6 +85,8 @@ GRANT USAGE ON SCHEMA public TO smart_scanner_product_reader;
 --      company_news_symbols        -> per-symbol news association (020)
 --      sec_filings                 -> SEC 8-K material events (021)
 --      sec_filing_symbols          -> issuer/symbol association (021)
+--      external_signals            -> third-party signal observations (022)
+--      external_signal_sources     -> the external source registry (022)
 --
 --    The catalyst, news and SEC relations are READ-ONLY here for the same reason as
 --    the rest: the Product API holds no provider credential and writes nothing.
@@ -95,9 +101,11 @@ GRANT SELECT ON public.company_news_articles       TO smart_scanner_product_read
 GRANT SELECT ON public.company_news_symbols        TO smart_scanner_product_reader;
 GRANT SELECT ON public.sec_filings                 TO smart_scanner_product_reader;
 GRANT SELECT ON public.sec_filing_symbols          TO smart_scanner_product_reader;
+GRANT SELECT ON public.external_signals            TO smart_scanner_product_reader;
+GRANT SELECT ON public.external_signal_sources     TO smart_scanner_product_reader;
 
 -- 5) Row-level security.
---    RLS is ENABLED on all eleven relations in the isolated staging database and
+--    RLS is ENABLED on all thirteen relations in the isolated staging database and
 --    this role is NOBYPASSRLS, so a plain SELECT grant alone returns zero rows.
 --    Add one NARROW read-only policy per relation, scoped TO this role — the
 --    same pattern every other reader role in this database already uses. RLS is
@@ -121,7 +129,9 @@ BEGIN
     'company_news_articles',
     'company_news_symbols',
     'sec_filings',
-    'sec_filing_symbols'
+    'sec_filing_symbols',
+    'external_signals',
+    'external_signal_sources'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_policies
