@@ -471,7 +471,7 @@ async def _fetch_external_signals(
 
 async def _load_external(
     db: asyncpg.Connection, symbols: List[str],
-    session_date: Optional[date_type], now: datetime,
+    anchor_session: Optional[date_type], now: datetime,
 ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]], Dict[str, Any]]:
     """Batch-load external signals, the source registry, and freshness.
 
@@ -481,7 +481,7 @@ async def _load_external(
     registry is unreadable. That is the whole point of a hub that sits beside
     the strategy rather than inside it.
     """
-    signals = await _fetch_external_signals(db, symbols, session_date)
+    signals = await _fetch_external_signals(db, symbols, anchor_session)
     source_rows = [dict(r) for r in await db.fetch(EXTERNAL_SOURCES_SQL)]
     state = await _fetch_catalyst_freshness(db)
     per_source = {
@@ -628,13 +628,21 @@ async def scanner_overview(
         # a registry that will not read, or an ingress that was never
         # configured must all cost exactly this block and nothing else.
         try:
+            # The DISPLAY anchor, which is the scan session unless the caller
+            # wants the current picture and the scan has gone stale — see
+            # ex.resolve_anchor_session. The measurement view
+            # (external_signal_session_links) is unaffected and still gates
+            # strictly at the scan session's close.
+            anchor = ex.resolve_anchor_session(
+                session_date, now=now, pinned=session is not None)
             signals, source_rows, ext_fresh = await _load_external(
-                db, universe_symbols, session_date, now)
+                db, universe_symbols, anchor, now)
             contexts = []
             for row in results:
                 ctx = ex.build_external_context(
                     signals.get(row["symbol"]) or [],
-                    as_of_session=session_date, sources=source_rows,
+                    as_of_session=anchor, scan_session=session_date,
+                    sources=source_rows,
                     freshness=ext_fresh, attention=row.get("attention"))
                 contexts.append(ctx)
                 row["external_intelligence"] = ex.build_row_external(ctx)
@@ -834,11 +842,14 @@ async def scanner_symbol_detail(
         control_verdict=control_verdict,
     )
     try:
+        anchor = ex.resolve_anchor_session(
+            session_date, now=now, pinned=session is not None)
         signals, source_rows, ext_fresh = await _load_external(
-            db, [symbol], session_date, now)
+            db, [symbol], anchor, now)
         external_intelligence = ex.build_external_context(
-            signals.get(symbol) or [], as_of_session=session_date,
-            sources=source_rows, freshness=ext_fresh, attention=attention)
+            signals.get(symbol) or [], as_of_session=anchor,
+            scan_session=session_date, sources=source_rows,
+            freshness=ext_fresh, attention=attention)
     except Exception:
         logger.warning("external intelligence unavailable for symbol detail",
                        exc_info=False)

@@ -366,3 +366,67 @@ class TestDegradation:
         block = ex.build_external_context(
             [signal()], as_of_session=None, sources=REGISTRY, freshness=FRESH)
         assert block["status"] == ex.STATUS_UNAVAILABLE
+
+
+# --------------------------------------------------------------------------- #
+# the display anchor
+# --------------------------------------------------------------------------- #
+
+class TestDisplayAnchor:
+    """External signals are PUSHED continuously; the scan is produced on our
+    own schedule. When the scan goes stale the two diverge, and the display
+    must not report "no external signal" for something that fired an hour ago.
+    """
+
+    NOW = datetime(2026, 8, 28, 9, 52, tzinfo=UTC)   # a Friday, before the close
+
+    def test_a_pinned_session_is_never_widened(self):
+        # Viewing a past session must show what THAT session could see. Any
+        # widening here would be lookahead.
+        assert ex.resolve_anchor_session(date(2026, 8, 25), now=self.NOW,
+                                         pinned=True) == date(2026, 8, 25)
+
+    def test_the_default_view_anchors_on_the_current_session(self):
+        assert ex.resolve_anchor_session(date(2026, 8, 25), now=self.NOW,
+                                         pinned=False) == date(2026, 8, 28)
+
+    def test_a_scan_newer_than_now_is_left_alone(self):
+        assert ex.resolve_anchor_session(date(2026, 9, 10), now=self.NOW,
+                                         pinned=False) == date(2026, 9, 10)
+
+    def test_no_scan_session_means_no_anchor(self):
+        assert ex.resolve_anchor_session(None, now=self.NOW, pinned=False) is None
+
+    def test_a_current_signal_is_visible_beside_a_stale_scan(self):
+        fresh = signal(effective="2026-08-28T09:52:00+00:00")
+        anchor = ex.resolve_anchor_session(date(2026, 8, 25), now=self.NOW,
+                                           pinned=False)
+        block = ex.build_external_context(
+            [fresh], as_of_session=anchor, scan_session=date(2026, 8, 25),
+            sources=REGISTRY, freshness=FRESH, attention="high_attention")
+        assert block["in_window_count"] == 1
+        assert block["items"][0]["proximity"] == ex.PROXIMITY_THIS_SESSION
+
+    def test_the_divergence_is_reported_rather_than_hidden(self):
+        # The reader must be able to see that a current signal is sitting
+        # beside an older scan — otherwise the UI implies the scanner saw it.
+        block = ex.build_external_context(
+            [], as_of_session=date(2026, 8, 28), scan_session=date(2026, 8, 25),
+            sources=REGISTRY, freshness=FRESH)
+        assert block["anchor_is_scan_session"] is False
+        assert block["as_of_session"] == "2026-08-28"
+        assert block["scan_session"] == "2026-08-25"
+        assert ex.build_row_external(block)["anchor_is_scan_session"] is False
+
+    def test_a_fresh_scan_leaves_the_two_identical(self):
+        block = ex.build_external_context(
+            [], as_of_session=date(2026, 8, 28), scan_session=date(2026, 8, 28),
+            sources=REGISTRY, freshness=FRESH)
+        assert block["anchor_is_scan_session"] is True
+
+    def test_the_measurement_gate_is_not_affected(self):
+        # `is_visible_to_session` is what the outcome-linkage view mirrors. It
+        # takes a session and answers strictly; the anchor rule lives above it
+        # and must never have loosened it.
+        late = datetime(2026, 8, 28, 9, 52, tzinfo=UTC)
+        assert not ex.is_visible_to_session(late, date(2026, 8, 25))

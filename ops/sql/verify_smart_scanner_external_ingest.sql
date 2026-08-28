@@ -186,3 +186,26 @@ WHERE schemaname = 'public' AND tablename = 'catalyst_source_state'
 --     shared freshness table shows ONLY external rows. The earnings, news and
 --     SEC rows exist in the table and are invisible here.
 SELECT source, status FROM public.catalyst_source_state ORDER BY source;
+
+-- 11) EFFECTIVE READ on the frozen universe.
+--
+--     A privilege check is not enough here. RLS is enabled on these relations
+--     and this role is NOBYPASSRLS, so a SELECT grant with no policy returns
+--     zero rows — and the symptom is nasty: every incoming signal is classified
+--     `external_discovery` and silently disappears from the product, because an
+--     empty universe cannot be told apart from "this symbol is not in it".
+--
+--     This section therefore asserts what the role can actually READ, not what
+--     it is permitted to read.
+SELECT count(*) AS universe_symbols_visible
+FROM public.history_warmup_universe_symbols s
+JOIN public.history_warmup_universes u ON u.id = s.universe_id
+WHERE u.universe_code = 'WYCKOFF-HISTORY-WARMUP-QUALIFICATION';
+
+-- 12) ASSERT: the frozen universe is readable. Expected: zero rows.
+SELECT 'frozen universe is not readable — every signal would be misclassified '
+       'as external_discovery' AS violation
+WHERE (SELECT count(*)
+       FROM public.history_warmup_universe_symbols s
+       JOIN public.history_warmup_universes u ON u.id = s.universe_id
+       WHERE u.universe_code = 'WYCKOFF-HISTORY-WARMUP-QUALIFICATION') = 0;

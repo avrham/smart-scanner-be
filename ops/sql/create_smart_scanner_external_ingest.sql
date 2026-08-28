@@ -142,6 +142,28 @@ BEGIN
     END IF;
   END LOOP;
 
+  -- The frozen universe, read-only. RLS is enabled on both relations, and
+  -- this role is NOBYPASSRLS, so the SELECT grant above yields ZERO ROWS
+  -- without a policy. That failure is SILENT and its symptom is subtle: every
+  -- signal is classified `external_discovery` and quietly vanishes from the
+  -- product, because an empty universe is indistinguishable from "this symbol
+  -- is not in it". Section 11 asserts the universe is actually readable for
+  -- exactly this reason.
+  FOREACH rel IN ARRAY ARRAY[
+    'history_warmup_universes',
+    'history_warmup_universe_symbols'
+  ] LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_policies
+      WHERE schemaname = 'public' AND tablename = rel
+        AND policyname = 'smart_scanner_external_ingest_select'
+    ) THEN
+      EXECUTE format(
+        'CREATE POLICY smart_scanner_external_ingest_select ON public.%I '
+        'FOR SELECT TO smart_scanner_external_ingest USING (true)', rel);
+    END IF;
+  END LOOP;
+
   -- Append policies. Only the two signal tables, never the registry.
   FOREACH rel IN ARRAY ARRAY[
     'external_signal_deliveries',

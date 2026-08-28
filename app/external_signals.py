@@ -597,6 +597,49 @@ def classify_confluence(*, attention: Optional[str],
 # the product objects
 # --------------------------------------------------------------------------- #
 
+def live_anchor_session(now: datetime) -> Optional[date]:
+    """The session a signal arriving RIGHT NOW could first act on.
+
+    Reuses the same market clock as everything else here, so the display
+    anchor and the visibility gate cannot drift apart.
+    """
+    return effective_session(now)
+
+
+def resolve_anchor_session(scan_session: Optional[date], *, now: datetime,
+                           pinned: bool) -> Optional[date]:
+    """Which session the DISPLAY window is anchored on.
+
+    This is the one place where external intelligence deliberately parts
+    company with the earnings, news and SEC layers, and the reason is a real
+    asymmetry rather than convenience.
+
+    Those three are PULLED on the same pipeline run that produces the scan, so
+    an article and a scan are naturally from the same day; anchoring them on
+    the scan session loses nothing. External signals are PUSHED continuously by
+    a third party on their schedule, not ours. They keep arriving while our
+    pipeline is idle — so when the latest scan is three days old, anchoring the
+    display on it would report "no external signal" for a symbol an indicator
+    flagged an hour ago. That is not caution; it is a false statement.
+
+    So:
+      * pinned (the caller asked for a specific past session) -> that session,
+        strictly. Showing signals that arrived afterwards would be lookahead.
+      * default (the caller wants the current picture) -> the later of the scan
+        session and the session we are currently in.
+
+    The MEASUREMENT path is untouched by this and must stay that way:
+    `external_signal_session_links` gates strictly at the scan session's close,
+    because a cohort built for outcome analysis may never see a signal the
+    session could not have used. Display and measurement are different
+    questions, and this function answers only the first.
+    """
+    if pinned or scan_session is None:
+        return scan_session
+    live = live_anchor_session(now)
+    return max(scan_session, live) if live else scan_session
+
+
 def build_external_context(
     signals: Sequence[Dict[str, Any]],
     *,
@@ -604,14 +647,27 @@ def build_external_context(
     sources: Sequence[Dict[str, Any]],
     freshness: Dict[str, Any],
     attention: Optional[str] = None,
+    scan_session: Optional[date] = None,
     limit: int = MAX_DETAIL_ITEMS,
 ) -> Dict[str, Any]:
-    """The full per-symbol external-intelligence block."""
+    """The full per-symbol external-intelligence block.
+
+    `as_of_session` is the DISPLAY anchor (see `resolve_anchor_session`);
+    `scan_session` is the session the scanner result itself belongs to. Both
+    are reported, because when they differ the reader must be able to see that
+    a current signal is being shown beside an older scan.
+    """
     base: Dict[str, Any] = {
         "contract_version": EXTERNAL_INTELLIGENCE_CONTRACT_VERSION,
         "status": freshness.get("status"),
         "reason": freshness.get("reason"),
         "as_of_session": as_of_session.isoformat() if as_of_session else None,
+        "scan_session": scan_session.isoformat() if scan_session else None,
+        # False means the signals below are NEWER than the scan they sit beside.
+        # The UI needs this to label them honestly rather than implying the
+        # scanner saw them.
+        "anchor_is_scan_session": (scan_session is None
+                                   or as_of_session == scan_session),
         "last_signal_at": None,
         "age_hours": freshness.get("age_hours"),
         "window_sessions": OLDER_CONTEXT_MAX_SESSIONS,
@@ -692,6 +748,7 @@ def build_row_external(context: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "status": context.get("status"),
         "reason": context.get("reason"),
+        "anchor_is_scan_session": context.get("anchor_is_scan_session", True),
         "notable_count": context.get("notable_count", 0),
         "in_window_count": context.get("in_window_count", 0),
         "sources_present": list(context.get("sources_present") or []),
@@ -777,7 +834,7 @@ __all__ = [
     "REASON_STALE_REFRESH", "REASON_NOT_CONFIGURED", "FRESHNESS_MAX_AGE_HOURS",
     "session_close_utc", "is_visible_to_session", "effective_session",
     "evaluate_freshness", "combine_freshness", "select_visible_signals",
-    "build_signal_item",
+    "build_signal_item", "live_anchor_session", "resolve_anchor_session",
     "CONFLUENCE_AGREEMENT", "CONFLUENCE_DISAGREEMENT", "CONFLUENCE_MIXED",
     "CONFLUENCE_EXTERNAL_ONLY", "CONFLUENCE_INTERNAL_ONLY",
     "CONFLUENCE_NO_EXTERNAL_SIGNAL", "CONFLUENCE_UNAVAILABLE",
