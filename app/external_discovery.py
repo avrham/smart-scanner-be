@@ -48,17 +48,34 @@ the database and `ops/analysis` reads it, and NOTHING here is exposed through
 the Product API or the UI. Ingesting for our own research is a different act
 from publishing, and the code boundary matches the licence boundary rather
 than relying on someone remembering the distinction later.
+
+Wave 2 made that boundary explicit rather than merely observed: every row
+carries the licence class it was collected under, and the Product API's
+database role holds no privilege on this table at all. See
+`app/source_licensing.py`.
+
+WAVE 2 ADDITIONS
+----------------
+`aggregate_discovery` rolls a session up per symbol while keeping EVERY reason
+it was noticed — "top gainer AND most active" stays two facts a reader can
+check, and deliberately never becomes a 2, then a score, then an ordering
+somebody trades. `cross_reference_universe` answers the question this whole
+path exists for: of what the market noticed today, how much is inside our
+frozen 25, how much is outside it, and how much we could not study even if we
+wanted to because we hold no history for it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import httpx
 
 from app.news import effective_session
+from app.source_licensing import LICENSING_INTERNAL_ONLY, resolve_visibility
 
 #: The registry source this dimension reports as.
 SOURCE_FMP = "fmp"
@@ -141,10 +158,21 @@ class FmpDiscoveryClient:
         self.interval_seconds = interval_seconds
         self.timeout = timeout
 
-    async def get_list(self, path: str) -> List[Dict[str, Any]]:
+    async def get_list(self, path: str,
+                       params: Optional[Dict[str, Any]] = None,
+                       ) -> List[Dict[str, Any]]:
+        """GET one /stable feed as a list.
+
+        `params` are merged with the credential rather than appended to the
+        path, because httpx REPLACES a URL's query string when `params` is
+        given — a symbol spelled into the path would have been silently
+        discarded and every caller would have got the market-wide feed.
+        """
         url = f"{self.base_url}/{path}"
+        query = {"apikey": self._api_key}
+        query.update({k: v for k, v in (params or {}).items() if v is not None})
         async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.get(url, params={"apikey": self._api_key})
+            response = await client.get(url, params=query)
         if response.status_code == 401:
             raise DiscoverySourceUnavailable(
                 "unauthorized", "the FMP credential was rejected")
@@ -171,6 +199,14 @@ class FmpDiscoveryClient:
 
     async def pause(self) -> None:
         await asyncio.sleep(self.interval_seconds)
+
+
+#: The same client, under a name that does not claim discovery owns it.
+#: Wave 2's analyst path speaks to the identical base URL with the identical
+#: credential and the identical error vocabulary (402 = not entitled, 403 =
+#: legacy endpoint), so giving it a second copy would mean two places to fix
+#: when FMP next changes an error code.
+FmpStableClient = FmpDiscoveryClient
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +269,34 @@ def normalize_candidate(row: Dict[str, Any], *, list_kind: str, rank: int,
         "observed_at": observed_at,
         "session_date": session_date,
         "in_scanner_universe": bool(universe and symbol in universe),
+        # The provider's own row, bounded. Kept because a rank means nothing
+        # without the numbers it was assigned from, and because a feed that
+        # quietly changes its field names must be diagnosable after the fact
+        # rather than only while someone is watching.
+        "source_metadata": bound_source_row(row),
+        # The licence class AS IT WAS AT INGESTION. Denormalised from the
+        # registry on purpose: if a display licence is ever acquired, the rows
+        # collected under the old terms stay identifiable.
+        "licensing_visibility": resolve_visibility(SOURCE_FMP),
     }
+
+
+#: Fields worth keeping from a movers row, and nothing else. A whole raw
+#: payload in a JSONB column becomes a place for unbounded provider text to
+#: accumulate; this keeps it to the numbers the rank was derived from.
+_METADATA_KEYS = ("price", "change", "changesPercentage", "changePercentage",
+                  "volume", "avgVolume", "marketCap", "exchange", "name")
+
+
+def bound_source_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in _METADATA_KEYS:
+        value = row.get(key)
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        out[key] = value if isinstance(value, (int, float, bool)) \
+            else str(value)[:64]
+    return out
 
 
 def normalize_list(rows: Sequence[Dict[str, Any]], *, list_kind: str,
@@ -280,8 +343,8 @@ UPSERT_SQL = """
 INSERT INTO public.external_discovery_candidates (
     source, list_kind, symbol, company_name, exchange, rank, price,
     change_amount, change_percent, observed_at, session_date,
-    in_scanner_universe)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    in_scanner_universe, source_metadata, licensing_visibility)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
 ON CONFLICT (source, list_kind, symbol, session_date) DO UPDATE SET
     company_name = COALESCE(EXCLUDED.company_name,
                             external_discovery_candidates.company_name),
@@ -292,7 +355,9 @@ ON CONFLICT (source, list_kind, symbol, session_date) DO UPDATE SET
     change_amount = EXCLUDED.change_amount,
     change_percent = EXCLUDED.change_percent,
     observed_at = EXCLUDED.observed_at,
-    in_scanner_universe = EXCLUDED.in_scanner_universe
+    in_scanner_universe = EXCLUDED.in_scanner_universe,
+    source_metadata = EXCLUDED.source_metadata,
+    licensing_visibility = EXCLUDED.licensing_visibility
 RETURNING (xmax = 0) AS inserted
 """
 
@@ -331,7 +396,9 @@ async def upsert_candidates(conn, candidates: Iterable[Dict[str, Any]],
             candidate["rank"], candidate.get("price"),
             candidate.get("change_amount"), candidate.get("change_percent"),
             candidate["observed_at"], candidate["session_date"],
-            candidate["in_scanner_universe"])
+            candidate["in_scanner_universe"],
+            json.dumps(candidate.get("source_metadata") or {}),
+            candidate.get("licensing_visibility") or LICENSING_INTERNAL_ONLY)
         stats["inserted" if row["inserted"] else "updated"] += 1
     return stats
 
@@ -464,14 +531,177 @@ async def symbols_worth_investigating(conn, *, since: date,
     return [dict(r) for r in rows]
 
 
+# --------------------------------------------------------------------------- #
+# A3 — aggregation. One symbol, EVERY reason it was noticed.
+# --------------------------------------------------------------------------- #
+
+def aggregate_discovery(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per-symbol rollup of one session's candidate rows. Pure.
+
+    Every reason is preserved as a list. The temptation here is to turn "top
+    gainer AND most active" into a 2, and then into a score, and then into an
+    ordering somebody trades — so the rollup deliberately stops at the facts:
+    which lists, best rank, largest absolute move. A reader can say "CRM
+    appeared in top gainers and most actives" and check it; nothing here says
+    what that is worth.
+
+    Ordered by how many distinct lists noticed the symbol, then by best rank.
+    That is a display order for a research report, not a ranking of quality,
+    and no scanner path consumes it.
+    """
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        entry = grouped.setdefault(symbol, {
+            "symbol": symbol,
+            "company_name": row.get("company_name"),
+            "exchange": row.get("exchange"),
+            "in_scanner_universe": False,
+            "reasons": [],
+            "best_rank": None,
+            "max_abs_change_percent": None,
+            "observed_at": None,
+        })
+        kind = row.get("list_kind")
+        if kind and kind not in entry["reasons"]:
+            entry["reasons"].append(kind)
+        entry["in_scanner_universe"] = (entry["in_scanner_universe"]
+                                        or bool(row.get("in_scanner_universe")))
+        rank = row.get("rank")
+        if isinstance(rank, int) and (entry["best_rank"] is None
+                                      or rank < entry["best_rank"]):
+            entry["best_rank"] = rank
+        change = row.get("change_percent")
+        if isinstance(change, (int, float)):
+            magnitude = abs(float(change))
+            if (entry["max_abs_change_percent"] is None
+                    or magnitude > entry["max_abs_change_percent"]):
+                entry["max_abs_change_percent"] = magnitude
+        observed = row.get("observed_at")
+        if observed is not None and (entry["observed_at"] is None
+                                     or observed > entry["observed_at"]):
+            entry["observed_at"] = observed
+        entry["company_name"] = entry["company_name"] or row.get("company_name")
+        entry["exchange"] = entry["exchange"] or row.get("exchange")
+
+    out = list(grouped.values())
+    for entry in out:
+        entry["reasons"].sort()
+        entry["reason_count"] = len(entry["reasons"])
+    out.sort(key=lambda e: (-e["reason_count"],
+                            e["best_rank"] if e["best_rank"] is not None else 999,
+                            e["symbol"]))
+    return out
+
+
+CURRENT_DISCOVERY_SQL = """
+SELECT session_date, symbol, company_name, exchange, in_scanner_universe,
+       reasons, reason_count, best_rank, max_abs_change_percent, observed_at,
+       licensing_visibility
+FROM public.external_discovery_current
+WHERE session_date = $1
+ORDER BY reason_count DESC, best_rank ASC, symbol
+"""
+
+LATEST_SESSION_SQL = """
+SELECT max(session_date) AS session_date
+FROM public.external_discovery_candidates
+"""
+
+
+async def latest_discovery_session(conn) -> Optional[date]:
+    row = await conn.fetchrow(LATEST_SESSION_SQL)
+    return row["session_date"] if row else None
+
+
+async def current_discovery(conn, *, session_date: Optional[date] = None,
+                            ) -> List[Dict[str, Any]]:
+    """The deterministic current-discovery view for one session."""
+    session = session_date or await latest_discovery_session(conn)
+    if session is None:
+        return []
+    rows = await conn.fetch(CURRENT_DISCOVERY_SQL, session)
+    return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# A4 — cross-reference against the frozen universe
+#
+# The most important output of the whole discovery path, and the reason it
+# exists: it says exactly what the fixed 25-symbol universe is not seeing.
+# --------------------------------------------------------------------------- #
+
+#: Local daily bars needed before a discovered symbol could be studied at all
+#: with the tools this repository already has. Taken from the control
+#: strategy's own hard gate (sma150_bounce requires 200 completed daily bars),
+#: not invented here — a symbol below it cannot be evaluated by either arm.
+MIN_LOCAL_BARS = 200
+
+LOCAL_HISTORY_SQL = """
+SELECT symbol, count(*) AS bars, max(trading_date) AS last_bar
+FROM public.daily_bars
+WHERE symbol = ANY($1::text[])
+GROUP BY symbol
+"""
+
+
+async def cross_reference_universe(conn, *, session_date: Optional[date] = None,
+                                   ) -> Dict[str, Any]:
+    """What one discovery session found, sorted against what we actually hold.
+
+    Five buckets, and none of them is an instruction. A symbol appearing here
+    with 0 local bars is a research question — "the market noticed this four
+    sessions running and we cannot even chart it" — never an enqueue.
+    """
+    session = session_date or await latest_discovery_session(conn)
+    if session is None:
+        return {"session_date": None, "discovered": 0, "inside_universe": [],
+                "outside_universe": [], "multi_category": [],
+                "with_local_history": [], "insufficient_local_history": [],
+                "min_local_bars": MIN_LOCAL_BARS}
+
+    rows = await current_discovery(conn, session_date=session)
+    symbols = [r["symbol"] for r in rows]
+    history: Dict[str, Dict[str, Any]] = {}
+    if symbols:
+        for record in await conn.fetch(LOCAL_HISTORY_SQL, symbols):
+            history[record["symbol"]] = {"bars": record["bars"],
+                                         "last_bar": record["last_bar"]}
+
+    inside, outside, multi, has_history, thin = [], [], [], [], []
+    for row in rows:
+        bars = history.get(row["symbol"], {}).get("bars", 0) or 0
+        entry = {**row, "local_bars": bars,
+                 "last_local_bar": history.get(row["symbol"], {}).get("last_bar")}
+        (inside if row["in_scanner_universe"] else outside).append(entry)
+        if (row.get("reason_count") or 0) > 1:
+            multi.append(entry)
+        (has_history if bars >= MIN_LOCAL_BARS else thin).append(entry)
+
+    return {
+        "session_date": session.isoformat(),
+        "discovered": len(rows),
+        "min_local_bars": MIN_LOCAL_BARS,
+        "inside_universe": inside,
+        "outside_universe": outside,
+        "multi_category": multi,
+        "with_local_history": has_history,
+        "insufficient_local_history": thin,
+    }
+
+
 __all__ = [
     "SOURCE_FMP", "SOURCE_STATE_FMP_DISCOVERY",
     "LIST_TOP_GAINERS", "LIST_TOP_LOSERS", "LIST_MOST_ACTIVE", "LIST_KINDS",
     "FMP_STABLE_BASE_URL", "ENDPOINTS", "DEFAULT_LIST_LIMIT",
     "REQUEST_INTERVAL_SECONDS",
     "STATE_OK", "STATE_UNAVAILABLE", "STATE_ERROR", "STATE_NEVER_RUN",
-    "DiscoverySourceUnavailable", "FmpDiscoveryClient",
+    "DiscoverySourceUnavailable", "FmpDiscoveryClient", "FmpStableClient",
     "normalize_symbol", "normalize_candidate", "normalize_list",
     "resolve_session", "upsert_candidates", "record_source_state",
     "refresh_discovery_candidates", "symbols_worth_investigating",
+    "bound_source_row", "aggregate_discovery", "latest_discovery_session",
+    "current_discovery", "cross_reference_universe", "MIN_LOCAL_BARS",
 ]

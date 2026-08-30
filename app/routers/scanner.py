@@ -9,13 +9,13 @@ occurrence IDs, or interpreting raw internal enum combinations.
 
 Every route uses an exact static path (query params carry variable input, no
 path params) so each one can be listed verbatim in app.audit_mode's
-AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 13
+AUDIT_ONLY_ALLOWLIST for the read-only isolated staging app. Only reads the 14
 relations the SELECT-only smart_scanner_product_reader role is granted on
 (strategy_shadow_runs/run_pairs/pairs/evaluations, daily_bars,
 symbol_catalyst_events, catalyst_source_state, company_news_articles,
 company_news_symbols, sec_filings, sec_filing_symbols, external_signals,
-external_signal_sources) plus the pure market-calendar resolver — see
-ops/sql/create_smart_scanner_product_reader.sql.
+external_signal_sources, macro_events) plus the pure market-calendar resolver —
+see ops/sql/create_smart_scanner_product_reader.sql.
 Decision-support only: never exposes allow_enter=true semantics,
 never reinterprets pair-level outcomes as candidate/control-specific returns.
 
@@ -25,6 +25,15 @@ sessions are default_transaction_read_only and its route gate is GET-only. The
 product surface reads normalised signals and the registry; it is deliberately
 NOT granted `external_signal_deliveries`, which holds raw third-party payloads
 and is operator data rather than product data.
+
+Wave 2 (024) adds ONE readable relation, `macro_events`, and two that this
+module must never learn the names of. The calendar is readable because the
+FOMC and BEA schedules are U.S. Government works; the movers and analyst-grade
+tables are not, because they hold Financial Modeling Prep data whose licence
+forbids third-party access. The registry itself is filtered through
+`app.source_licensing.product_visible_rows` before it can reach a response, so
+a restricted source is not even NAMED here — see that module for why the rule
+lives in three independent places rather than in a convention.
 """
 
 from __future__ import annotations
@@ -32,7 +41,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date as date_type, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -43,6 +52,8 @@ from app.prospective_session import resolve_latest_completed_session
 import app.catalyst as cat
 import app.catalyst_ingest as ci
 import app.external_signals as ex
+import app.macro_calendar as mcal
+import app.source_licensing as lic
 import app.market_context as mc
 import app.news as nw
 import app.news_ingest as ni
@@ -441,11 +452,52 @@ ORDER BY symbol, effective_at DESC
 
 EXTERNAL_SOURCES_SQL = """
 SELECT source, display_name, transports, supports_realtime, supports_historical,
-       supports_symbol_scan, supports_signal_events, emits_signals,
+       supports_symbol_scan, supports_signal_events, supports_discovery,
+       supports_calendar, licensing_visibility, emits_signals,
        requires_paid_plan, status, notes
 FROM public.external_signal_sources
 ORDER BY status <> 'live', source
 """
+
+_MACRO_QUERY_FORWARD_DAYS = mcal.WINDOW_FORWARD_DAYS
+_MACRO_QUERY_BACK_DAYS = mcal.WINDOW_BACK_DAYS
+
+MACRO_EVENTS_SQL = """
+SELECT source, event_type, title, scheduled_date, scheduled_start_date,
+       scheduled_time_local, scheduled_timezone, source_listing,
+       has_press_conference, has_projections, source_reference,
+       first_observed_at, observed_at
+FROM public.macro_events
+WHERE scheduled_date BETWEEN $1 AND $2
+ORDER BY scheduled_date, event_type
+"""
+
+
+async def _load_market_calendar(
+    db: asyncpg.Connection, session_date: Optional[date_type], now: datetime,
+    source_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The market-wide calendar block: scheduled macro events near this session.
+
+    ONE query for the whole screen, because the answer is the same for every
+    row. Wrapped by the caller so a calendar failure degrades this dimension
+    only — the scan, attention, market context, catalysts and external signals
+    must all keep working when a government web page changes its markup.
+    """
+    if session_date is None:
+        return mcal.empty_market_calendar_context()
+    lower = session_date - timedelta(days=_MACRO_QUERY_BACK_DAYS)
+    upper = session_date + timedelta(days=_MACRO_QUERY_FORWARD_DAYS)
+    rows = [dict(r) for r in await db.fetch(MACRO_EVENTS_SQL, lower, upper)]
+    state = await _fetch_catalyst_freshness(db)
+    per_source = {
+        source: mcal.evaluate_freshness(
+            state.get(mcal.source_state_key(source)), now=now)
+        for source in mcal.MACRO_SOURCES
+    }
+    return mcal.build_market_calendar_context(
+        rows, as_of_session=session_date,
+        freshness=mcal.combine_freshness(per_source), sources=source_rows)
 
 
 async def _fetch_external_signals(
@@ -482,7 +534,13 @@ async def _load_external(
     the strategy rather than inside it.
     """
     signals = await _fetch_external_signals(db, symbols, anchor_session)
-    source_rows = [dict(r) for r in await db.fetch(EXTERNAL_SOURCES_SQL)]
+    # LICENCE BOUNDARY. The registry is filtered before it can reach a
+    # response: a source we may never display is not named to the reader
+    # either. Naming it would hand somebody an expectation the licence
+    # forbids us to meet, and that expectation is what precedes a decision
+    # that one field "wouldn't hurt". See app/source_licensing.py.
+    source_rows = lic.product_visible_rows(
+        [dict(r) for r in await db.fetch(EXTERNAL_SOURCES_SQL)])
     state = await _fetch_catalyst_freshness(db)
     per_source = {
         row["source"]: ex.evaluate_freshness(
@@ -522,6 +580,15 @@ async def scanner_overview(
         "external_sources_present": [], "symbols_with_external_signal": 0,
         "recent_signal_count": 0, "agreement_symbol_count": 0,
         "disagreement_symbol_count": 0, "sources": []}
+    # A SCANNER-LEVEL block, never a per-row field. "FOMC tomorrow" is one
+    # fact about the whole screen; printed on 25 rows it becomes 25 copies of
+    # one fact and buries the per-symbol evidence that actually differs.
+    #
+    # None, not an `unavailable` block, when no scan exists at all. There is no
+    # session to anchor a calendar on yet, and reporting that as "the calendar
+    # could not be read" would blame a source for our own empty state.
+    market_calendar_context: Optional[Dict[str, Any]] = None
+    calendar_source_rows: Sequence[Dict[str, Any]] = []
 
     campaign = await _fetch_latest_campaign(db, session=session)
     scanner_state = sv.classify_scanner_state(
@@ -637,6 +704,7 @@ async def scanner_overview(
                 session_date, now=now, pinned=session is not None)
             signals, source_rows, ext_fresh = await _load_external(
                 db, universe_symbols, anchor, now)
+            calendar_source_rows = source_rows
             contexts = []
             for row in results:
                 ctx = ex.build_external_context(
@@ -656,6 +724,7 @@ async def scanner_overview(
         except Exception:
             logger.warning("external intelligence unavailable for overview",
                            exc_info=False)
+            calendar_source_rows = []
             blank_ext = ex.build_row_external(ex.empty_external_context(
                 reason=ex.REASON_SOURCE_UNAVAILABLE))
             for row in results:
@@ -668,6 +737,19 @@ async def scanner_overview(
                 "symbols_with_external_signal": 0, "recent_signal_count": 0,
                 "agreement_symbol_count": 0, "disagreement_symbol_count": 0,
                 "sources": []}
+
+        # The market calendar is loaded in its OWN try/except, not folded into
+        # the external one. They fail for unrelated reasons — a webhook source
+        # going quiet has nothing to do with a government page changing its
+        # markup — and sharing a handler would mean one taking the other down.
+        try:
+            market_calendar_context = await _load_market_calendar(
+                db, session_date, now, calendar_source_rows)
+        except Exception:
+            logger.warning("market calendar unavailable for overview",
+                           exc_info=False)
+            market_calendar_context = mcal.empty_market_calendar_context(
+                reason=mcal.REASON_SOURCE_UNAVAILABLE)
 
     return {
         "contract_version": sv.OVERVIEW_CONTRACT_VERSION,
@@ -707,6 +789,12 @@ async def scanner_overview(
         # how many symbols; the claims themselves live on the detail screen
         # where their provenance can travel with them.
         "external_intelligence": external_intelligence,
+        # SCHEDULED market-wide events. A fourth kind of thing again: not a
+        # price reading (market_regime), not a company event (catalyst), not an
+        # opinion (external) — a publisher's calendar. It carries no direction
+        # and no score, and it changes no verdict, no attention tier and no
+        # ordering.
+        "market_calendar_context": market_calendar_context,
         "results": results,
         "strategy": {
             "candidate_strategy_code": pc.CANDIDATE_STRATEGY_CODE,
@@ -841,11 +929,13 @@ async def scanner_symbol_detail(
         readiness_status=evidence["readiness_status"] if evidence else None,
         control_verdict=control_verdict,
     )
+    calendar_source_rows: Sequence[Dict[str, Any]] = []
     try:
         anchor = ex.resolve_anchor_session(
             session_date, now=now, pinned=session is not None)
         signals, source_rows, ext_fresh = await _load_external(
             db, [symbol], anchor, now)
+        calendar_source_rows = source_rows
         external_intelligence = ex.build_external_context(
             signals.get(symbol) or [], as_of_session=anchor,
             scan_session=session_date, sources=source_rows,
@@ -855,6 +945,15 @@ async def scanner_symbol_detail(
                        exc_info=False)
         external_intelligence = ex.empty_external_context(
             reason=ex.REASON_SOURCE_UNAVAILABLE)
+
+    try:
+        market_calendar_context = await _load_market_calendar(
+            db, session_date, now, calendar_source_rows)
+    except Exception:
+        logger.warning("market calendar unavailable for symbol detail",
+                       exc_info=False)
+        market_calendar_context = mcal.empty_market_calendar_context(
+            reason=mcal.REASON_SOURCE_UNAVAILABLE)
 
     daily = await db.fetchrow(
         "SELECT COUNT(*)::int AS n, MIN(trading_date) AS oldest, MAX(trading_date) AS latest "
@@ -927,6 +1026,12 @@ async def scanner_symbol_detail(
         # external signal is a machine's opinion, and merging them would let
         # the opinion borrow the filing's authority.
         "external_intelligence": external_intelligence,
+        # The SAME market-wide block the overview carries, and labelled as
+        # such (`applies_to: "market_wide"`). It is here because a reader on a
+        # symbol page still needs to know the Fed meets tomorrow — and it is
+        # labelled because they must never be able to read that as a statement
+        # about THIS company.
+        "market_calendar_context": market_calendar_context,
         "readiness": {
             "daily_bar_count": daily["n"] if daily else 0,
             "oldest_daily_bar": daily["oldest"].isoformat() if daily and daily["oldest"] else None,

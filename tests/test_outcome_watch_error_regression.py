@@ -425,7 +425,13 @@ class TestNoBehaviorDrift:
         assert [q.name for q in sorted(migrations.glob("021_*"))] == ["021_sec_material_events.sql"]
         assert [q.name for q in sorted(migrations.glob("022_*"))] == ["022_external_signals.sql"]
         assert [q.name for q in sorted(migrations.glob("023_*"))] == ["023_external_discovery.sql"]
-        assert not list(migrations.glob("024_*"))
+        # Wave 2 adds exactly 024_market_calendar_and_analyst
+        # (macro calendar + analyst change events + registry V2);
+        # nothing later exists.
+        assert [p.name for p in sorted(migrations.glob("024_*"))] == [
+            "024_market_calendar_and_analyst.sql"
+        ]
+        assert not list(migrations.glob("025_*"))
         sql = (migrations / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
         assert "strategy_shadow" not in sql.lower()
         assert "wyckoff_mtf_v2" in sql

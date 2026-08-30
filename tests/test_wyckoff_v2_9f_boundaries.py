@@ -87,7 +87,7 @@ class TestProductionSurfacesUnmodified:
             p.name for p in (ROOT / "app" / "db" / "migrations").glob("*.sql")
         )
         # Durable Job Queue task: migration 018 is the newest additive migration.
-        assert migrations[-1] == "023_external_discovery.sql"
+        assert migrations[-1] == "024_market_calendar_and_analyst.sql"
         assert [m for m in migrations if m.startswith("014_")] == ["014_market_bars_4h.sql"]
         assert [m for m in migrations if m.startswith("017_")] == [
             "017_prospective_campaign_registration.sql"]
@@ -97,7 +97,9 @@ class TestProductionSurfacesUnmodified:
         assert [m for m in migrations if m.startswith("021_")] == ["021_sec_material_events.sql"]
         assert [m for m in migrations if m.startswith("022_")] == ["022_external_signals.sql"]
         assert [m for m in migrations if m.startswith("023_")] == ["023_external_discovery.sql"]
-        assert not [m for m in migrations if m.startswith("024_")]
+        assert [m for m in migrations if m.startswith("024_")] == [
+            "024_market_calendar_and_analyst.sql"]
+        assert not [m for m in migrations if m.startswith("025_")]
 
 
 class TestNoActivationPath:

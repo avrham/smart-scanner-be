@@ -60,6 +60,7 @@ from app.catalyst import trading_sessions_between
 # the `external_signal_session_links` view and the gate here must all be the
 # SAME clock, and importing it through this module makes that hard to break.
 from app.news import session_close_utc
+from app.source_licensing import LICENSING_UNKNOWN
 
 EXTERNAL_INTELLIGENCE_CONTRACT_VERSION = "smart_scanner_external_intelligence.v1"
 
@@ -292,7 +293,21 @@ def is_notable(proximity: Optional[str], *, direction: Optional[str]) -> bool:
 STATUS_AVAILABLE = "available"
 STATUS_UNAVAILABLE = "unavailable"
 STATUS_STALE = "stale"
-EXTERNAL_STATUSES = (STATUS_AVAILABLE, STATUS_UNAVAILABLE, STATUS_STALE)
+#: The wiring is complete and the source has never spoken.
+#:
+#: This exists because `unavailable` was answering two different questions with
+#: one word. A webhook source that the account owner has fully configured — the
+#: alert armed on their chart, the ingress reachable, the registry marked
+#: `live` — has delivered nothing until its condition first fires, and on an
+#: alert that fires a few times a month that is the NORMAL state for weeks.
+#: Reporting it as `unavailable` tells the reader we are blind to the source,
+#: which is precisely backwards: we are watching it, and it has said nothing.
+#:
+#: It is a THIRD status rather than a flavour of `available` because there is
+#: genuinely no data behind it. Nothing downstream may read it as evidence.
+STATUS_CONNECTED = "connected"
+EXTERNAL_STATUSES = (STATUS_AVAILABLE, STATUS_CONNECTED, STATUS_UNAVAILABLE,
+                     STATUS_STALE)
 
 REASON_SOURCE_UNAVAILABLE = "source_unavailable"
 REASON_NEVER_REFRESHED = "never_refreshed"
@@ -301,6 +316,9 @@ REASON_STALE_REFRESH = "stale_refresh"
 #: third-party alert yet. Reporting this as an error would be a lie about our
 #: own system, and reporting it as `available` would be a lie about the data.
 REASON_NOT_CONFIGURED = "not_configured"
+#: The registry says `live` and no delivery has ever arrived. Paired with
+#: STATUS_CONNECTED; see that constant for why the distinction is load-bearing.
+REASON_AWAITING_FIRST_SIGNAL = "awaiting_first_signal"
 
 #: A source that has not delivered in this long is reported `stale`.
 #:
@@ -347,6 +365,16 @@ def evaluate_freshness(source_state: Optional[Dict[str, Any]], *,
     report `not_configured` instead of the misleading `never_refreshed`.
     """
     if not source_state:
+        # Three different "nothing here yet"s, and they are not interchangeable.
+        # `live` means the account owner finished the setup and the source has
+        # simply not fired; that is CONNECTED, not blind. The manual-setup
+        # states mean the wiring itself is incomplete. Anything else is a
+        # source we have genuinely never heard from.
+        if registry_status == "live":
+            return {"status": STATUS_CONNECTED,
+                    "reason": REASON_AWAITING_FIRST_SIGNAL,
+                    "last_refresh_at": None, "last_success_at": None,
+                    "age_hours": None, "detail": None}
         reason = (REASON_NOT_CONFIGURED
                   if registry_status in ("requires_manual_setup",
                                          "available_not_integrated")
@@ -395,9 +423,13 @@ def combine_freshness(per_source: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
                 "last_refresh_at": None, "last_success_at": None,
                 "age_hours": None, "detail": None, "per_source": {}}
 
-    order = {STATUS_AVAILABLE: 0, STATUS_STALE: 1, STATUS_UNAVAILABLE: 2}
+    # BEST-OF, and `connected` sits between `stale` and `unavailable`: a source
+    # that is wired and silent is a better description of the dimension than a
+    # source we cannot see at all, and a worse one than a source with data.
+    order = {STATUS_AVAILABLE: 0, STATUS_STALE: 1, STATUS_CONNECTED: 2,
+             STATUS_UNAVAILABLE: 3}
     best = min(per_source.values(),
-               key=lambda f: (order.get(f.get("status"), 3),
+               key=lambda f: (order.get(f.get("status"), 4),
                               f.get("age_hours") if f.get("age_hours")
                               is not None else float("inf")))
     return {**best, "per_source": per_source}
@@ -657,6 +689,7 @@ def build_external_context(
     are reported, because when they differ the reader must be able to see that
     a current signal is being shown beside an older scan.
     """
+    per_source: Dict[str, Any] = freshness.get("per_source") or {}
     base: Dict[str, Any] = {
         "contract_version": EXTERNAL_INTELLIGENCE_CONTRACT_VERSION,
         "status": freshness.get("status"),
@@ -678,11 +711,21 @@ def build_external_context(
         "confluence": CONFLUENCE_UNAVAILABLE,
         # The registry, so the UI can say "AI Edge: awaiting your alert setup"
         # instead of silently showing nothing for a source that exists.
-        "sources": [build_source_entry(s) for s in sources],
+        "sources": [build_source_entry(s, per_source.get(s.get("source")))
+                    for s in sources],
         "items": [],
     }
 
-    if freshness.get("status") == STATUS_UNAVAILABLE or as_of_session is None:
+    if (freshness.get("status") in (STATUS_UNAVAILABLE, STATUS_CONNECTED)
+            or as_of_session is None):
+        # `connected` leaves this branch with its own status and reason intact
+        # so the UI can say "connected, nothing has fired" — but it takes the
+        # SAME confluence answer as `unavailable`, deliberately. Confluence is
+        # a statement about two readings lining up, and there is no external
+        # reading here. Letting a connected-but-silent source fall through to
+        # the normal path would turn "we have heard nothing" into
+        # `internal_only`, which is a claim about the evidence, not about the
+        # plumbing. Nothing about confluence, ranking or attention changes.
         if as_of_session is None:
             base["status"] = STATUS_UNAVAILABLE
             base["reason"] = base["reason"] or REASON_NEVER_REFRESHED
@@ -712,14 +755,21 @@ def build_external_context(
     return base
 
 
-def build_source_entry(row: Dict[str, Any]) -> Dict[str, Any]:
+def build_source_entry(row: Dict[str, Any],
+                       availability: Optional[Dict[str, Any]] = None,
+                       ) -> Dict[str, Any]:
     """One registry row, as the product sees it.
 
     Capability metadata is surfaced so the UI can distinguish "this source is
     silent" from "this source was never connected" — two states that look
     identical in the data and mean completely different things to a user.
+
+    `availability` is that source's OWN freshness verdict. Without it the UI
+    could only read the dimension-level (best-of) verdict, so a live source
+    that has never fired sat behind whatever the healthiest source reported and
+    could not be described honestly on its own row.
     """
-    return {
+    entry = {
         "source": row.get("source"),
         "display_name": row.get("display_name"),
         "status": row.get("status"),
@@ -728,10 +778,27 @@ def build_source_entry(row: Dict[str, Any]) -> Dict[str, Any]:
         "supports_historical": bool(row.get("supports_historical")),
         "supports_symbol_scan": bool(row.get("supports_symbol_scan")),
         "supports_signal_events": bool(row.get("supports_signal_events")),
+        # Registry V2. Absent on a database still on migration 022, which is
+        # why every one of these reads through .get with a default rather than
+        # assuming the column exists.
+        "supports_discovery": bool(row.get("supports_discovery")),
+        "supports_calendar": bool(row.get("supports_calendar")),
+        "licensing_visibility": (row.get("licensing_visibility")
+                                 or LICENSING_UNKNOWN),
         "emits_signals": bool(row.get("emits_signals")),
         "requires_paid_plan": bool(row.get("requires_paid_plan")),
         "notes": row.get("notes"),
     }
+    if availability:
+        entry["availability"] = {
+            "status": availability.get("status"),
+            "reason": availability.get("reason"),
+            "last_success_at": availability.get("last_success_at"),
+            "age_hours": availability.get("age_hours"),
+        }
+    else:
+        entry["availability"] = None
+    return entry
 
 
 def build_row_external(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -830,8 +897,10 @@ __all__ = [
     "IN_WINDOW_PROXIMITIES", "NOTABLE_PROXIMITIES", "MAX_DETAIL_ITEMS",
     "classify_proximity", "is_notable",
     "STATUS_AVAILABLE", "STATUS_UNAVAILABLE", "STATUS_STALE",
+    "STATUS_CONNECTED",
     "EXTERNAL_STATUSES", "REASON_SOURCE_UNAVAILABLE", "REASON_NEVER_REFRESHED",
-    "REASON_STALE_REFRESH", "REASON_NOT_CONFIGURED", "FRESHNESS_MAX_AGE_HOURS",
+    "REASON_STALE_REFRESH", "REASON_NOT_CONFIGURED",
+    "REASON_AWAITING_FIRST_SIGNAL", "FRESHNESS_MAX_AGE_HOURS",
     "session_close_utc", "is_visible_to_session", "effective_session",
     "evaluate_freshness", "combine_freshness", "select_visible_signals",
     "build_signal_item", "live_anchor_session", "resolve_anchor_session",

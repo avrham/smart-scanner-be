@@ -182,7 +182,8 @@ class FakeConn:
                  symbol_row=None, daily_row=None, bar_rows=None, campaign_list_rows=None,
                  universe_rows=None, catalyst_rows=None, catalyst_state=None,
                  catalyst_error=None, news_rows=None, news_error=None,
-                 sec_rows=None, sec_error=None):
+                 sec_rows=None, sec_error=None,
+                 macro_rows=None, macro_error=None, source_rows=None):
         self.campaign_row = campaign_row
         self.result_rows = result_rows or []
         self.freshness_row = freshness_row or {"oldest": None, "latest": None}
@@ -208,6 +209,15 @@ class FakeConn:
         self.sec_error = sec_error
         self.sec_queries = 0
         self.sec_query_args = None
+        # Macro calendar reads are additive and fail INDEPENDENTLY of all
+        # three above: a government web page changing its markup has nothing
+        # to do with a webhook going quiet.
+        self.macro_rows = macro_rows or []
+        self.macro_error = macro_error
+        self.macro_queries = 0
+        # The external source registry, which the Product API filters by
+        # licence before it can reach a response.
+        self.source_rows = source_rows or []
         self.freshness_symbols = None
 
     async def fetchrow(self, sql, *a):
@@ -223,6 +233,13 @@ class FakeConn:
         return None
 
     async def fetch(self, sql, *a):
+        if "FROM public.macro_events" in sql:
+            self.macro_queries += 1
+            if self.macro_error:
+                raise self.macro_error
+            return self.macro_rows
+        if "FROM public.external_signal_sources" in sql:
+            return self.source_rows
         if "FROM public.sec_filing_symbols" in sql:
             self.sec_queries += 1
             self.sec_query_args = a
@@ -1529,3 +1546,199 @@ class TestSymbolDetailSecContext:
         conn = self._conn(sec_rows=[_sec_row()])
         self._get(client, monkeypatch, conn)
         assert conn.sec_queries == 1
+
+
+# --------------------------------------------------------------------------- #
+# Wave 2 — the market calendar block, and the licence boundary around it.
+# --------------------------------------------------------------------------- #
+
+import app.macro_calendar as mcal          # noqa: E402
+import app.source_licensing as lic         # noqa: E402
+
+_WAVE2_CAMPAIGN = dict(
+    id=RUN_ID, experiment_code="wyckoff_v2_vs_baseline", experiment_version=1,
+    status="completed", started_at=datetime(2026, 8, 25, 21, 0, tzinfo=timezone.utc),
+    finished_at=datetime(2026, 8, 25, 21, 5, tzinfo=timezone.utc), error_code=None,
+    as_of_date="2026-08-25",
+)
+
+
+def _wave2_campaign():
+    return _row(campaign_id=str(uuid4()),
+                requested_symbols=json.dumps(["AAPL"]), **_WAVE2_CAMPAIGN)
+
+
+def _wave2_results():
+    return [_row(symbol="AAPL", candidate_verdict="WATCH", candidate_score=0.7,
+                 candidate_details=json.dumps(_CANDIDATE_DETAILS),
+                 control_verdict="AVOID", control_score=None)]
+
+
+def _macro_row(event_type="fomc_rate_decision", scheduled=date(2026, 8, 26),
+               source="federal_reserve", listing="listed"):
+    return _row(
+        source=source, event_type=event_type,
+        title="FOMC meeting, 2026-08-25 to 2026-08-26",
+        scheduled_date=scheduled, scheduled_start_date=date(2026, 8, 25),
+        scheduled_time_local=None, scheduled_timezone="America/New_York",
+        source_listing=listing, has_press_conference=None, has_projections=True,
+        source_reference="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        first_observed_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        observed_at=datetime(2026, 8, 25, tzinfo=timezone.utc))
+
+
+#: A registry as the database holds it: two displayable sources and two that
+#: the licence forbids showing.
+_REGISTRY_ROWS = [
+    _row(source="ai_edge", display_name="AI Edge", status="live",
+         transports=["webhook"], supports_realtime=True,
+         supports_historical=False, supports_symbol_scan=False,
+         supports_signal_events=True, supports_discovery=False,
+         supports_calendar=False,
+         licensing_visibility="product_display_allowed",
+         emits_signals=True, requires_paid_plan=True, notes=None),
+    _row(source="federal_reserve", display_name="Federal Reserve Board",
+         status="live", transports=["api"], supports_realtime=False,
+         supports_historical=True, supports_symbol_scan=False,
+         supports_signal_events=False, supports_discovery=False,
+         supports_calendar=True,
+         licensing_visibility="product_display_allowed",
+         emits_signals=False, requires_paid_plan=False, notes=None),
+    _row(source="fmp", display_name="Financial Modeling Prep", status="live",
+         transports=["api"], supports_realtime=False, supports_historical=True,
+         supports_symbol_scan=True, supports_signal_events=False,
+         supports_discovery=True, supports_calendar=False,
+         licensing_visibility="internal_research_only",
+         emits_signals=False, requires_paid_plan=False, notes="restricted"),
+    _row(source="finviz", display_name="Finviz",
+         status="available_not_integrated", transports=["import"],
+         supports_realtime=False, supports_historical=False,
+         supports_symbol_scan=True, supports_signal_events=True,
+         supports_discovery=True, supports_calendar=False,
+         licensing_visibility="unknown_restriction",
+         emits_signals=True, requires_paid_plan=True, notes=None),
+]
+
+_HEALTHY_MACRO_STATE = [
+    _row(source=mcal.source_state_key("federal_reserve"), status="ok",
+         last_refresh_at=datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc),
+         last_success_at=datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc),
+         detail=None),
+]
+
+
+class TestMarketCalendarBlock:
+    def _get(self, client, monkeypatch, **kwargs):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(FakeConn(campaign_row=_wave2_campaign(),
+                      result_rows=_wave2_results(), **kwargs))
+        return client.get("/api/scanner/overview").json()
+
+    def test_the_block_is_present_and_market_wide(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        block = body["market_calendar_context"]
+        assert block["contract_version"] == mcal.MARKET_CALENDAR_CONTRACT_VERSION
+        assert block["applies_to"] == "market_wide"
+        assert block["headline"]["event_type"] == "fomc_rate_decision"
+        assert block["proximity"] == mcal.PROXIMITY_TOMORROW
+
+    def test_it_is_never_a_per_row_field(self, client, monkeypatch):
+        # The same event is true for every row. A per-row copy would read as
+        # one finding per symbol.
+        body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        for row in body["results"]:
+            assert "market_calendar_context" not in row
+            assert "macro" not in json.dumps(row).lower()
+
+    def test_it_is_outside_market_regime_and_catalysts(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        # Regime is what PRICE is doing; the calendar is what is SCHEDULED.
+        assert "market_calendar_context" not in body["market_regime"]
+        assert "fomc" not in json.dumps(body["market_regime"]).lower()
+        assert "fomc" not in json.dumps(body["catalyst_sources"]).lower()
+
+    def test_a_calendar_failure_costs_only_the_calendar(self, client, monkeypatch):
+        body = self._get(client, monkeypatch,
+                         macro_error=RuntimeError("markup changed"),
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        assert body["market_calendar_context"]["status"] == mcal.AVAIL_UNAVAILABLE
+        # Everything else still answered.
+        assert body["results"][0]["symbol"] == "AAPL"
+        assert body["results_summary"]["total"] == 1
+        assert body["external_intelligence"]["contract_version"]
+
+    def test_never_refreshed_shows_no_events(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
+                         catalyst_state=[], source_rows=_REGISTRY_ROWS)
+        block = body["market_calendar_context"]
+        assert block["status"] == mcal.AVAIL_UNAVAILABLE
+        assert block["upcoming"] == [] and block["headline"] is None
+
+    def test_no_scan_yet_reports_no_calendar_rather_than_a_broken_one(
+            self, client, monkeypatch):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(FakeConn(campaign_row=None))
+        body = client.get("/api/scanner/overview").json()
+        # There is no session to anchor on. Blaming a publisher for our own
+        # empty state would be a false statement about the source.
+        assert body["market_calendar_context"] is None
+
+    def test_the_symbol_screen_carries_the_same_market_wide_block(
+            self, client, monkeypatch):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        symbol_row = _row(symbol="AAPL", candidate_verdict="WATCH",
+                          candidate_score=0.7,
+                          candidate_details=json.dumps(_CANDIDATE_DETAILS),
+                          control_verdict="AVOID", control_score=None,
+                          candidate_reason=None, control_reason=None)
+        _use(FakeConn(campaign_row=_wave2_campaign(), symbol_row=symbol_row,
+                      macro_rows=[_macro_row()],
+                      catalyst_state=_HEALTHY_MACRO_STATE,
+                      source_rows=_REGISTRY_ROWS))
+        body = client.get("/api/scanner/symbol?symbol=AAPL").json()
+        assert body["market_calendar_context"]["applies_to"] == "market_wide"
+        # A sibling of catalyst_context, never a member of it: a Fed meeting is
+        # not an event about this company.
+        assert "market_calendar_context" not in body["catalyst_context"]
+
+
+class TestLicensingBoundaryInResponses:
+    def _body(self, client, monkeypatch):
+        monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
+                            lambda now: date(2026, 8, 25))
+        _use(FakeConn(campaign_row=_wave2_campaign(),
+                      result_rows=_wave2_results(),
+                      macro_rows=[_macro_row()],
+                      catalyst_state=_HEALTHY_MACRO_STATE,
+                      source_rows=_REGISTRY_ROWS))
+        return client.get("/api/scanner/overview").json()
+
+    def test_no_internal_only_source_appears_anywhere(self, client, monkeypatch):
+        body = self._body(client, monkeypatch)
+        assert lic.find_licensing_leaks(body) == []
+
+    def test_the_registry_the_product_returns_is_filtered(self, client, monkeypatch):
+        body = self._body(client, monkeypatch)
+        named = {s["source"] for s in body["external_intelligence"]["sources"]}
+        assert named == {"ai_edge", "federal_reserve"}
+        # Both restricted rows were in the database and neither is named.
+        assert "fmp" not in named and "finviz" not in named
+
+    def test_unknown_restriction_is_treated_as_forbidden(self, client, monkeypatch):
+        body = self._body(client, monkeypatch)
+        assert "finviz" not in json.dumps(body)
+
+    def test_the_calendar_sources_are_displayable_ones_only(self, client, monkeypatch):
+        body = self._body(client, monkeypatch)
+        for entry in body["market_calendar_context"]["sources"]:
+            assert lic.is_product_displayable(entry["licensing_visibility"])

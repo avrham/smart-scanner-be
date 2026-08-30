@@ -220,6 +220,24 @@ class Settings(BaseSettings):
     # default identity). SECRET; Fly secret only.
     EXTERNAL_INGEST_DATABASE_URL: str = ""
     EXTERNAL_INGEST_EXPECTED_DB_ROLE: str = "smart_scanner_external_ingest"
+
+    # ---------------------------------------------------------------------
+    # Wave 2 market-intelligence INGESTION identity (macro calendar, analyst
+    # grade changes, market movers). A COMPLETE PostgreSQL DSN authenticating
+    # as smart_scanner_market_intel — see
+    # ops/sql/create_smart_scanner_market_intel.sql.
+    #
+    # Deliberately NOT the external-ingest identity: that one belongs to the
+    # single internet-facing POST app and is append-only by design, while these
+    # are outbound polls that must correct a moved calendar entry in place.
+    # Deliberately not the product reader either: that one is read-only and
+    # holds no provider credential.
+    #
+    # Empty by default; the ops entry points fall back to the ordinary
+    # connection selector so nothing changes for a deployment that never sets
+    # it. SECRET; never committed and never logged.
+    MARKET_INTEL_DATABASE_URL: str = ""
+    MARKET_INTEL_EXPECTED_DB_ROLE: str = "smart_scanner_market_intel"
     # The shared ingress credential a third party must present. SECRET.
     #
     # It travels in the `X-Smart-Scanner-Token` header when the caller can set

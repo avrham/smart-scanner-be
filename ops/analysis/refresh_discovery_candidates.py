@@ -2,6 +2,7 @@
 
     python -m ops.analysis.refresh_discovery_candidates --refresh
     python -m ops.analysis.refresh_discovery_candidates --report --days 10
+    python -m ops.analysis.refresh_discovery_candidates --cross-reference
 
 WHAT QUESTION THIS ANSWERS
 --------------------------
@@ -40,7 +41,7 @@ from typing import Optional, Set
 
 import app.external_discovery as ed
 from app.config import settings
-from app.deps import close_db_pool, init_db_pool
+from ops.analysis.intel_connection import intel_connection
 
 UNIVERSE_SQL = """
 SELECT s.symbol
@@ -67,31 +68,28 @@ async def _universe(conn) -> Optional[Set[str]]:
 
 
 async def run_refresh(limit: int) -> dict:
-    pool = await init_db_pool()
-    try:
-        async with pool.acquire() as conn:
-            universe = await _universe(conn)
-            try:
-                client = ed.FmpDiscoveryClient(settings.FMP_API_KEY)
-            except ed.DiscoverySourceUnavailable:
-                # No credential is the ordinary case, not an error. The refresh
-                # records `unavailable` and returns a summary either way.
-                client = None
-            return await ed.refresh_discovery_candidates(
-                conn, client, universe=universe, limit=limit)
-    finally:
-        await close_db_pool()
+    async with intel_connection() as conn:
+        universe = await _universe(conn)
+        try:
+            client = ed.FmpDiscoveryClient(settings.FMP_API_KEY)
+        except ed.DiscoverySourceUnavailable:
+            # No credential is the ordinary case, not an error. The refresh
+            # records `unavailable` and returns a summary either way.
+            client = None
+        return await ed.refresh_discovery_candidates(
+            conn, client, universe=universe, limit=limit)
 
 
 async def run_report(days: int, limit: int) -> list:
-    pool = await init_db_pool()
-    try:
-        async with pool.acquire() as conn:
-            since = (datetime.now(timezone.utc).date() - timedelta(days=days))
-            return await ed.symbols_worth_investigating(
-                conn, since=since, limit=limit)
-    finally:
-        await close_db_pool()
+    async with intel_connection() as conn:
+        since = (datetime.now(timezone.utc).date() - timedelta(days=days))
+        return await ed.symbols_worth_investigating(
+            conn, since=since, limit=limit)
+
+
+async def run_cross_reference(session: Optional[date]) -> dict:
+    async with intel_connection() as conn:
+        return await ed.cross_reference_universe(conn, session_date=session)
 
 
 def main() -> None:
@@ -100,14 +98,19 @@ def main() -> None:
                         help="fetch the entitled movers feeds and upsert them")
     parser.add_argument("--report", action="store_true",
                         help="symbols outside the frozen universe, by persistence")
+    parser.add_argument("--cross-reference", action="store_true",
+                        help="one session, sorted against what we actually hold")
+    parser.add_argument("--session", type=date.fromisoformat, default=None,
+                        help="ISO session date for --cross-reference "
+                             "(default: the latest stored)")
     parser.add_argument("--days", type=int, default=10,
                         help="report lookback in calendar days (default 10)")
     parser.add_argument("--limit", type=int, default=ed.DEFAULT_LIST_LIMIT,
                         help=f"ranks to keep per list (default {ed.DEFAULT_LIST_LIMIT})")
     args = parser.parse_args()
 
-    if not args.refresh and not args.report:
-        parser.error("choose --refresh, --report, or both")
+    if not (args.refresh or args.report or args.cross_reference):
+        parser.error("choose --refresh, --report, --cross-reference, or several")
 
     if args.refresh:
         summary = asyncio.run(run_refresh(args.limit))
@@ -128,6 +131,42 @@ def main() -> None:
         print("\nPersistence first, not the size of any single move: a stock "
               "that gapped once is noise, one in the cohort four sessions "
               "running is a question. Nothing here enters the frozen universe.")
+
+    if args.cross_reference:
+        report = asyncio.run(run_cross_reference(args.session))
+        if report["session_date"] is None:
+            print("\nNo discovery candidates stored yet.")
+            return
+        print(f"\nDiscovery cross-reference for session "
+              f"{report['session_date']} — {report['discovered']} symbols:\n")
+        print(f"  inside the frozen 25 .............. "
+              f"{len(report['inside_universe'])}")
+        print(f"  OUTSIDE the frozen 25 ............. "
+              f"{len(report['outside_universe'])}")
+        print(f"  in more than one category ......... "
+              f"{len(report['multi_category'])}")
+        print(f"  with >= {report['min_local_bars']} local daily bars ...... "
+              f"{len(report['with_local_history'])}")
+        print(f"  with insufficient local history ... "
+              f"{len(report['insufficient_local_history'])}")
+
+        def _table(title, rows):
+            if not rows:
+                return
+            print(f"\n  {title}")
+            print(f"    {'SYMBOL':<10} {'RANK':>5} {'BARS':>6}  REASONS")
+            for row in rows[:25]:
+                reasons = ",".join(row.get("reasons") or [])
+                print(f"    {row['symbol']:<10} "
+                      f"{(row.get('best_rank') or 0):>5} "
+                      f"{row.get('local_bars', 0):>6}  {reasons}")
+
+        _table("Inside the frozen universe:", report["inside_universe"])
+        _table("Outside the frozen universe:", report["outside_universe"])
+        _table("Noticed by more than one list:", report["multi_category"])
+        print("\nThis is the blind spot, stated: every symbol in the OUTSIDE "
+              "list is one the scanner structurally cannot see. None of them "
+              "is added to any universe by this or any other script.")
 
 
 if __name__ == "__main__":

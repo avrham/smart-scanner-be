@@ -5,7 +5,7 @@
 --   GET /api/scanner/overview
 --   GET /api/scanner/scans
 --   GET /api/scanner/symbol
--- It holds SELECT on the EXACT 13 relations those routes touch and NO write
+-- It holds SELECT on the EXACT 14 relations those routes touch and NO write
 -- privilege anywhere. It is deliberately narrow: the product surface must not
 -- grow just because the audit surface did.
 --
@@ -13,6 +13,19 @@
 -- `external_signal_deliveries`. That table holds raw third-party payloads and
 -- rejection diagnostics, which is operator data, not product data — the
 -- Product API reads normalised signals and the registry, and nothing else.
+--
+-- WAVE 2 — AND THE TWO TABLES DELIBERATELY LEFT OUT
+-- `macro_events` IS granted: the FOMC calendar and the BEA release schedule
+-- are published by U.S. federal agencies and works of the U.S. Government are
+-- not subject to copyright protection in the United States (17 U.S.C. 105).
+--
+-- `external_discovery_candidates` and `analyst_grade_events` are NOT granted,
+-- and this omission is the enforcement, not an oversight. Both hold Financial
+-- Modeling Prep data, whose individual plans are personal and non-commercial
+-- and forbid integrating the data into tools accessible by third parties. A
+-- router that tried to read either would get `permission denied for table`,
+-- which is a much better failure than a code review that did not happen.
+-- See app/source_licensing.py for the same position stated in code.
 --
 -- This file contains NO real password, NO hostname and NO database name.
 -- An operator applies it manually against the intended database.
@@ -86,7 +99,8 @@ GRANT USAGE ON SCHEMA public TO smart_scanner_product_reader;
 --      sec_filings                 -> SEC 8-K material events (021)
 --      sec_filing_symbols          -> issuer/symbol association (021)
 --      external_signals            -> third-party signal observations (022)
---      external_signal_sources     -> the external source registry (022)
+--      external_signal_sources     -> the external source registry (022/024)
+--      macro_events                -> scheduled market-wide events (024)
 --
 --    The catalyst, news and SEC relations are READ-ONLY here for the same reason as
 --    the rest: the Product API holds no provider credential and writes nothing.
@@ -103,9 +117,10 @@ GRANT SELECT ON public.sec_filings                 TO smart_scanner_product_read
 GRANT SELECT ON public.sec_filing_symbols          TO smart_scanner_product_reader;
 GRANT SELECT ON public.external_signals            TO smart_scanner_product_reader;
 GRANT SELECT ON public.external_signal_sources     TO smart_scanner_product_reader;
+GRANT SELECT ON public.macro_events                TO smart_scanner_product_reader;
 
 -- 5) Row-level security.
---    RLS is ENABLED on all thirteen relations in the isolated staging database and
+--    RLS is ENABLED on all fourteen relations in the isolated staging database and
 --    this role is NOBYPASSRLS, so a plain SELECT grant alone returns zero rows.
 --    Add one NARROW read-only policy per relation, scoped TO this role — the
 --    same pattern every other reader role in this database already uses. RLS is
@@ -131,7 +146,8 @@ BEGIN
     'sec_filings',
     'sec_filing_symbols',
     'external_signals',
-    'external_signal_sources'
+    'external_signal_sources',
+    'macro_events'
   ] LOOP
     IF NOT EXISTS (
       SELECT 1 FROM pg_policies
@@ -146,6 +162,7 @@ BEGIN
 END
 $$;
 
--- NOT granted (by design): CREATE, INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER,
+-- NOT granted (by design): external_discovery_candidates, analyst_grade_events
+-- and external_signal_deliveries (see the header), plus CREATE, INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER,
 -- sequence privileges, membership in any application/service role, any job
 -- queue lifecycle or scheduler privilege, and any provider-related write.

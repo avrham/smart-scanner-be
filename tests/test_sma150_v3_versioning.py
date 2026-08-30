@@ -353,7 +353,13 @@ class TestMigration008:
         assert [q.name for q in sorted(MIGRATIONS.glob("021_*"))] == ["021_sec_material_events.sql"]
         assert [q.name for q in sorted(MIGRATIONS.glob("022_*"))] == ["022_external_signals.sql"]
         assert [q.name for q in sorted(MIGRATIONS.glob("023_*"))] == ["023_external_discovery.sql"]
-        assert not list(MIGRATIONS.glob("024_*"))
+        # Wave 2 adds exactly 024_market_calendar_and_analyst
+        # (macro calendar + analyst change events + registry V2);
+        # nothing later exists.
+        assert [p.name for p in sorted(MIGRATIONS.glob("024_*"))] == [
+            "024_market_calendar_and_analyst.sql"
+        ]
+        assert not list(MIGRATIONS.glob("025_*"))
     def test_v3_defaults_copy_is_isolated(self):
         """default_config() returns an independent copy (mutation-safe)."""
         strategy = get_strategy("sma150_bounce_v3")
