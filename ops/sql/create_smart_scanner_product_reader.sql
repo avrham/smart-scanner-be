@@ -19,6 +19,13 @@
 -- are published by U.S. federal agencies and works of the U.S. Government are
 -- not subject to copyright protection in the United States (17 U.S.C. 105).
 --
+-- WAVE 3 (026) adds `research_symbols` and `research_scan_results`, and neither
+-- is granted here either. Every research row exists BECAUSE of an FMP
+-- discovery; a symbol becoming more interesting does not move a licence
+-- boundary. The research scan's own output is derived from our strategy on our
+-- bars, but the fact that we chose to look at that symbol at all is the
+-- restricted provider's, so the whole row stays internal.
+--
 -- `external_discovery_candidates` and `analyst_grade_events` are NOT granted,
 -- and this omission is the enforcement, not an oversight. Both hold Financial
 -- Modeling Prep data, whose individual plans are personal and non-commercial

@@ -65,7 +65,10 @@ class TestMigrationBoundaries:
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("025_*"))] == [
             "025_discovery_reference_session.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("026_*"))
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("026_*"))] == [
+            "026_research_symbols.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("027_*"))
         sql = (MIGRATIONS_DIR / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
         assert "strategy_shadow" not in sql.lower()
         assert "wyckoff_mtf_v2" in sql

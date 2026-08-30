@@ -180,6 +180,21 @@ BEGIN
 END
 $$;
 
+-- ---------------------------------------------------------------------------
+-- WAVE 3 — the research domain (migration 026 grants these; repeated here so
+-- this file remains the single readable statement of what the role may do).
+--
+--   research_symbols        SELECT, INSERT, UPDATE
+--   research_scan_results   SELECT, INSERT, UPDATE
+--   daily_bars              INSERT, UPDATE — but CONFINED BY RLS to symbols
+--                           that are actually research symbols, so a research
+--                           warmup can never touch a frozen-universe bar.
+--
+-- Still NO privilege on any universe relation, so a discovered symbol cannot
+-- become a universe member through this role even by accident. That is the
+-- experiment boundary expressed as a privilege rather than as a convention.
+-- ---------------------------------------------------------------------------
+
 -- NOT granted (by design): every strategy_shadow_* relation, every job queue
 -- and scheduler relation, market_data_jobs, any universe MEMBERSHIP write, any
 -- DELETE anywhere, TRUNCATE, CREATE, sequence privileges, and membership in

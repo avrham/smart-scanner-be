@@ -104,6 +104,20 @@ ORDER BY scheduled_date
 #: Grouped by BOTH dates. The reference session is what the appearance was;
 #: the actionable session is what we may measure from. A cohort keyed on one
 #: of them alone would silently answer the other question.
+#: RESEARCH cohort — a SEPARATE descriptive domain, never the canonical
+#: 25-symbol experiment. Anchored on `first_actionable_session`, which is the
+#: earliest session anybody could have acted on the discovery; the reference
+#: session it describes is carried alongside as provenance and is never the
+#: anchor. Same rule, same reason, as every other cohort in this file.
+RESEARCH_COHORT_SQL = """
+SELECT r.symbol, r.first_actionable_session, r.first_reference_session,
+       r.discovery_reasons, r.history_daily_bars
+FROM public.research_symbols r
+WHERE r.first_actionable_session >= $1
+  AND r.history_daily_bars > 0
+ORDER BY r.first_actionable_session
+"""
+
 DISCOVERY_COHORT_SQL = """
 SELECT symbol, session_date, reference_session_date,
        array_agg(DISTINCT list_kind ORDER BY list_kind) AS reasons
@@ -305,22 +319,64 @@ async def run_discovery(days: int) -> None:
           "market noticed and we do not hold cannot be studied at all.")
 
 
+async def run_research(days: int) -> None:
+    """Forward behaviour of RESEARCH symbols. A separate domain, and it says so.
+
+    Nothing here touches `strategy_shadow_pair_outcomes` or any canonical
+    outcome relation — a dynamically discovered symbol must not contaminate the
+    experiment whose interpretability depends on a frozen cohort. This is
+    description of a different population, kept in a different place.
+    """
+    latest_completed = resolve_latest_completed_session(
+        datetime.now(timezone.utc))
+    async with intel_connection() as conn:
+        since = datetime.now(timezone.utc).date() - timedelta(days=days)
+        rows = [dict(r) for r in await conn.fetch(RESEARCH_COHORT_SQL, since)]
+        series = await _load_series(conn, [r["symbol"] for r in rows])
+
+    groups: Dict[str, List[Dict[int, Optional[float]]]] = {}
+    measured = unmeasured = 0
+    for row in rows:
+        # ACTIONABLE, never the reference session it describes.
+        anchor = _completed_anchor(row["first_actionable_session"],
+                                   latest_completed=latest_completed)
+        returns = (forward_returns(series.get(row["symbol"], []), anchor)
+                   if anchor else None)
+        if returns is None:
+            unmeasured += 1
+            continue
+        measured += 1
+        for reason in row["discovery_reasons"]:
+            groups.setdefault(reason, []).append(returns)
+    _print_table(
+        f"RESEARCH symbols, forward behaviour (last {days} days)",
+        {k: summarise(v) for k, v in sorted(groups.items())},
+        measured, unmeasured)
+    print("  A SEPARATE descriptive domain. No canonical pair outcome is read "
+          "or written, and a research symbol never enters the frozen "
+          "experiment's cohort.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analyst", action="store_true")
     parser.add_argument("--macro", action="store_true")
     parser.add_argument("--discovery", action="store_true")
+    parser.add_argument("--research", action="store_true")
     parser.add_argument("--days", type=int, default=3650,
                         help="lookback in calendar days (default 3650)")
     args = parser.parse_args()
-    if not (args.analyst or args.macro or args.discovery):
-        parser.error("choose --analyst, --macro, --discovery, or several")
+    if not (args.analyst or args.macro or args.discovery or args.research):
+        parser.error("choose --analyst, --macro, --discovery, --research, "
+                     "or several")
     if args.analyst:
         asyncio.run(run_analyst(args.days))
     if args.macro:
         asyncio.run(run_macro(args.days))
     if args.discovery:
         asyncio.run(run_discovery(args.days))
+    if args.research:
+        asyncio.run(run_research(args.days))
 
 
 if __name__ == "__main__":

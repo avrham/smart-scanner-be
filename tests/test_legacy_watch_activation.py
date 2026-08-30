@@ -436,4 +436,7 @@ class TestUnchangedBehavior:
         assert [p.name for p in sorted(MIGRATIONS.glob("025_*"))] == [
             "025_discovery_reference_session.sql"
         ]
-        assert not list(MIGRATIONS.glob("026_*"))
+        assert [p.name for p in sorted(MIGRATIONS.glob("026_*"))] == [
+            "026_research_symbols.sql"
+        ]
+        assert not list(MIGRATIONS.glob("027_*"))
