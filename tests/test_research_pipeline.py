@@ -604,46 +604,68 @@ class TestSectorHandling:
 
 
 class TestResearchCandidates:
+    """Rewritten for the V1 vocabulary: discovery strength explains why we
+    looked, strategy evidence decides whether it survived. The previous
+    version of this class asserted the old single-list behaviour that reported
+    hard-AVOID symbols as candidates."""
+
     def _row(self, **kw):
         base = {"state": ru.STATE_RESEARCH_SCANNED, "history_daily_bars": 520,
                 "discovery_reasons": ["most_active"],
                 "discovery_observation_count": 1,
+                "rejection_reason": None, "structure_state": None,
+                "setup_state": None, "benchmark_relative": None,
                 "latest_reference_session": REFERENCE}
         base.update(kw)
         return base
 
-    def test_reason_codes_are_facts_not_a_score(self):
-        reasons = ru.research_candidate_reasons(
+    def test_why_we_looked_is_discovery_only(self):
+        looked = ru.looked_because(
             self._row(discovery_reasons=["most_active", "top_gainers"],
-                      setup_state="setup_confirmed"),
+                      discovery_observation_count=3),
             latest_reference_session=REFERENCE)
-        assert ru.REASON_MULTIPLE_LISTS in reasons
-        assert ru.REASON_SETUP_PRESENT in reasons
-        assert all(isinstance(r, str) for r in reasons)
+        assert set(looked) <= set(ru.LOOKED_REASONS)
+        assert ru.LOOKED_MULTIPLE_LISTS in looked
+        assert ru.LOOKED_REPEATEDLY in looked
 
-    def test_every_reason_is_in_the_declared_vocabulary(self):
-        reasons = ru.research_candidate_reasons(
-            self._row(discovery_reasons=["a", "b"],
-                      discovery_observation_count=3,
-                      setup_state="setup_forming", structure_state="accumulation",
-                      benchmark_relative="leading"),
-            latest_reference_session=REFERENCE)
-        assert set(reasons) <= set(ru.RESEARCH_CANDIDATE_REASONS)
+    def test_what_the_screen_found_is_strategy_evidence_only(self):
+        findings = ru.screen_findings(
+            self._row(structure_state="accumulation",
+                      setup_state="setup_forming",
+                      benchmark_relative="outperforming"))
+        assert set(findings) <= set(ru.SCREEN_REASONS)
+        assert ru.SCREEN_STRUCTURE_PRESENT in findings
+
+    def test_the_two_vocabularies_never_overlap(self):
+        assert not set(ru.LOOKED_REASONS) & set(ru.SCREEN_REASONS)
 
     def test_an_unscanned_symbol_is_never_a_candidate(self):
         assert not ru.is_research_candidate(
-            self._row(state=ru.STATE_RESEARCH_READY),
-            latest_reference_session=REFERENCE)
+            self._row(state=ru.STATE_RESEARCH_READY))
 
-    def test_a_scanned_symbol_with_nothing_observed_is_not_a_candidate(self):
+    def test_a_hard_disqualified_symbol_is_never_a_candidate(self):
         assert not ru.is_research_candidate(
-            self._row(latest_reference_session=date(2020, 1, 2)),
-            latest_reference_session=REFERENCE)
+            self._row(rejection_reason="price_below_minimum",
+                      discovery_reasons=["a", "b", "c"],
+                      discovery_observation_count=5))
 
     def test_a_stale_discovery_loses_its_recency_reason(self):
         old = self._row(latest_reference_session=date(2026, 8, 1))
-        assert ru.REASON_RECENT_DISCOVERY not in ru.research_candidate_reasons(
+        assert ru.LOOKED_RECENTLY not in ru.looked_because(
             old, latest_reference_session=REFERENCE)
+
+    def test_every_candidate_state_is_in_the_declared_vocabulary(self):
+        for state in (ru.STATE_RESEARCH_SCANNED, ru.STATE_RESEARCH_READY,
+                      ru.STATE_UNAVAILABLE, ru.STATE_FAILED):
+            verdict = ru.classify_candidate(self._row(state=state))
+            assert verdict["candidate_state"] in ru.CANDIDATE_STATES
+
+    def test_no_score_is_produced_anywhere(self):
+        verdict = ru.classify_candidate(
+            self._row(structure_state="accumulation",
+                      setup_state="setup_confirmed"))
+        for banned in ("score", "rank", "weight", "confidence"):
+            assert banned not in verdict
 
 
 # =========================================================================== #

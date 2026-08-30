@@ -297,7 +297,10 @@ class TestNoNewMigration:
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("026_*"))] == [
             "026_research_symbols.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("027_*"))
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("027_*"))] == [
+            "027_research_admission.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("028_*"))
 
     def test_4h_evidence_fits_existing_schema(self):
         """Everything Phase 9E persists rides in EXISTING columns: the 4H

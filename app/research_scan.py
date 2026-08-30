@@ -144,6 +144,7 @@ async def evaluate_research_symbol(conn, symbol: str, *, session: date,
     arms, one local fetch shared by both, canonical frame, evaluate each arm —
     and stops before the part that creates a run.
     """
+    from app.workers.patterns.config import bound_config_connection
     from app.workers.shadow.experiments import get_experiment
     from app.workers.shadow.frames import (FrameRejection, build_canonical_frame,
                                            shared_required_history_bars)
@@ -154,11 +155,18 @@ async def evaluate_research_symbol(conn, symbol: str, *, session: date,
     scan_id = str(uuid.uuid4())
 
     experiment = get_experiment(RESEARCH_EXPERIMENT_CODE)
-    candidate = await _resolve_arm(
-        experiment.candidate_pattern_code, experiment.candidate_arm_code,
-        config_overrides=experiment.candidate_config_overrides)
-    control = await _resolve_arm(experiment.control_pattern_code,
-                                 experiment.control_arm_code)
+    # BOUND to this connection and FAIL-CLOSED, without altering the canonical
+    # execution layer. Previously the config was read through the global pool,
+    # which in an operator-run process points at a different database; the read
+    # failed, the resolver fell back to strategy defaults, and the resulting
+    # hash HAPPENED to equal the experiment's because staging stores no
+    # override for this pattern. An accidental equality is not an invariant.
+    with bound_config_connection(conn, require_db=True):
+        candidate = await _resolve_arm(
+            experiment.candidate_pattern_code, experiment.candidate_arm_code,
+            config_overrides=experiment.candidate_config_overrides)
+        control = await _resolve_arm(experiment.control_pattern_code,
+                                     experiment.control_arm_code)
     # Depth from the EXPERIMENT's own per-arm functions. The default pair
     # belongs to a different experiment and expects config keys these
     # strategies do not have.
@@ -302,6 +310,70 @@ async def persist_research_scan(conn, scan: Dict[str, Any],
     return bool(row["inserted"])
 
 
+CANDIDATE_ROW_SQL = """
+SELECT r.symbol, r.state, r.discovery_reasons, r.discovery_observation_count,
+       r.latest_reference_session,
+       s.verdict, s.rejection_reason, s.structure_state, s.setup_state,
+       s.benchmark_relative
+FROM public.research_symbols r
+LEFT JOIN LATERAL (
+    SELECT * FROM public.research_scan_results x
+    WHERE x.symbol = r.symbol ORDER BY x.scan_session DESC LIMIT 1
+) s ON true
+WHERE r.symbol = $1
+"""
+
+CANDIDATE_UPDATE_SQL = """
+UPDATE public.research_symbols
+SET candidate_state = $2, candidate_reason = $3, looked_because = $4,
+    screen_findings = $5, updated_at = NOW()
+WHERE symbol = $1
+"""
+
+
+async def classify_and_store_candidate(conn, symbol: str, *,
+                                       latest_reference_session=None,
+                                       now: Optional[datetime] = None,
+                                       ) -> Dict[str, Any]:
+    """Decide, and store, whether this symbol survived the research screen.
+
+    The two halves are written to two columns. Discovery strength explains why
+    we looked; only the scan's own evidence decides whether it survived, and
+    the first cohort proved what happens when one column carries both.
+    """
+    row = await conn.fetchrow(CANDIDATE_ROW_SQL, symbol)
+    if row is None:
+        return {"symbol": symbol, "candidate_state": None}
+    data = dict(row)
+    verdict = ru.classify_candidate(data)
+    looked = ru.looked_because(
+        data, latest_reference_session=latest_reference_session
+        or data.get("latest_reference_session"))
+    await conn.execute(CANDIDATE_UPDATE_SQL, symbol,
+                       verdict["candidate_state"], verdict["reason"],
+                       looked, verdict["screen"])
+    return {"symbol": symbol, **verdict, "looked_because": looked}
+
+
+async def reclassify_candidates(conn, *, now: Optional[datetime] = None,
+                                ) -> Dict[str, Any]:
+    """Recompute every symbol's candidate state from stored evidence.
+
+    Cheap, local, and idempotent — the classification is a pure function of
+    rows we already hold, so it is recomputed rather than trusted, exactly like
+    the history state.
+    """
+    rows = await conn.fetch("SELECT symbol FROM public.research_symbols")
+    tally: Dict[str, int] = {}
+    for row in rows:
+        verdict = await classify_and_store_candidate(conn, row["symbol"],
+                                                     now=now)
+        state = verdict.get("candidate_state")
+        if state:
+            tally[state] = tally.get(state, 0) + 1
+    return {"reclassified": len(rows), "states": tally}
+
+
 async def run_research_scans(conn, *, session: date,
                              limit: int = ru.MAX_WARMUP_SYMBOLS_PER_RUN,
                              now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -324,6 +396,7 @@ async def run_research_scans(conn, *, session: date,
                 "UPDATE public.research_symbols SET state=$2, "
                 "research_scanned_at=$3, updated_at=NOW() WHERE symbol=$1",
                 symbol, ru.STATE_RESEARCH_SCANNED, moment)
+            await classify_and_store_candidate(conn, symbol, now=moment)
             summary["scanned"].append({
                 "symbol": symbol, "verdict": scan.get("verdict"),
                 "rejection_reason": scan.get("rejection_reason"),
@@ -341,4 +414,5 @@ async def run_research_scans(conn, *, session: date,
 __all__ = [
     "CONTEXT_BARS", "build_context", "evaluate_research_symbol",
     "persist_research_scan", "run_research_scans",
+    "classify_and_store_candidate", "reclassify_candidates",
 ]

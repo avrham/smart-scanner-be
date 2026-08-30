@@ -43,6 +43,7 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+import app.research_admission as ra
 import app.research_universe as ru
 from app.config import settings
 from app.history_warmup_execute import (HISTORY_WARMUP_ADVISORY_LOCK_KEY,
@@ -235,6 +236,110 @@ async def admit_from_discovery(conn, *, since: date,
 
 
 # --------------------------------------------------------------------------- #
+# admission — decide BEFORE spending a provider request
+# --------------------------------------------------------------------------- #
+
+#: The last close we already hold, and the last price the discovery snapshot
+#: carried. Two sources, neither costing a provider request, tried in the order
+#: that prefers our own unrestricted data over FMP's.
+ADMISSION_PRICE_SQL = """
+SELECT r.symbol,
+       (SELECT b.close FROM public.daily_bars b
+        WHERE b.symbol = r.symbol
+        ORDER BY b.trading_date DESC LIMIT 1)            AS local_close,
+       (SELECT b.trading_date FROM public.daily_bars b
+        WHERE b.symbol = r.symbol
+        ORDER BY b.trading_date DESC LIMIT 1)            AS local_session,
+       (SELECT c.price FROM public.external_discovery_candidates c
+        WHERE c.symbol = r.symbol AND c.price IS NOT NULL
+        ORDER BY c.reference_session_date DESC, c.observed_at DESC
+        LIMIT 1)                                         AS discovery_price,
+       (SELECT c.reference_session_date
+        FROM public.external_discovery_candidates c
+        WHERE c.symbol = r.symbol AND c.price IS NOT NULL
+        ORDER BY c.reference_session_date DESC, c.observed_at DESC
+        LIMIT 1)                                         AS discovery_session
+FROM public.research_symbols r
+WHERE ($1::text[] IS NULL OR r.symbol = ANY($1::text[]))
+"""
+
+
+async def admission_prices(conn, symbols: Optional[Sequence[str]] = None,
+                           ) -> Dict[str, Dict[str, Any]]:
+    """One price per symbol, with the source that decides its licence.
+
+    Local bars first — our own canonical data, unrestricted, and the same
+    series the scan will read. The discovery snapshot second: FMP's price,
+    already stored, costing nothing, and internal-research-only.
+    """
+    rows = await conn.fetch(ADMISSION_PRICE_SQL,
+                            list(symbols) if symbols else None)
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if row["local_close"] is not None:
+            out[row["symbol"]] = {
+                "price": float(row["local_close"]),
+                "price_source": ra.PRICE_SOURCE_LOCAL_BARS,
+                "reference_session": row["local_session"]}
+        elif row["discovery_price"] is not None:
+            out[row["symbol"]] = {
+                "price": float(row["discovery_price"]),
+                "price_source": ra.PRICE_SOURCE_DISCOVERY,
+                "reference_session": row["discovery_session"]}
+        else:
+            out[row["symbol"]] = {"price": None, "price_source": None,
+                                  "reference_session": None}
+    return out
+
+
+ADMISSION_UPDATE_SQL = """
+UPDATE public.research_symbols
+SET admission_state = $2, admission_reason = $3, admission_price = $4,
+    admission_price_source = $5, admission_reference_session = $6,
+    admission_min_price = $7, admission_evaluated_at = $8, updated_at = NOW()
+WHERE symbol = $1
+"""
+
+
+async def evaluate_admissions(conn, *, min_price: Optional[float],
+                              symbols: Optional[Sequence[str]] = None,
+                              now: Optional[datetime] = None,
+                              ) -> Dict[str, Any]:
+    """Decide admission for every research symbol. Reads only; no provider.
+
+    `min_price` comes from the CANONICAL resolved configuration — this module
+    never carries a threshold of its own, so admission and the strategy cannot
+    drift apart.
+    """
+    moment = now or datetime.now(timezone.utc)
+    prices = await admission_prices(conn, symbols)
+    tally: Dict[str, int] = {}
+    rejected: List[Dict[str, Any]] = []
+    restricted = 0
+    for symbol, price in prices.items():
+        verdict = ra.evaluate_admission(
+            price=price["price"], price_source=price["price_source"],
+            min_price=min_price,
+            reference_session=price["reference_session"], now=moment)
+        tally[verdict["state"]] = tally.get(verdict["state"], 0) + 1
+        if verdict["restricted_source"]:
+            restricted += 1
+        if verdict["state"] == ra.ADMISSION_REJECTED:
+            rejected.append({"symbol": symbol, "reason": verdict["reason"],
+                             "price_source": verdict["price_source"]})
+        await conn.execute(
+            ADMISSION_UPDATE_SQL, symbol, verdict["state"], verdict["reason"],
+            verdict["price"], verdict["price_source"],
+            verdict["reference_session"], verdict["min_price"], moment)
+    return {"evaluated": len(prices), "states": tally,
+            "min_price": min_price,
+            "rejected_before_history": rejected,
+            "decisions_on_restricted_source": restricted,
+            # What the gate is FOR, counted rather than asserted.
+            "provider_requests_avoided": len(rejected)}
+
+
+# --------------------------------------------------------------------------- #
 # state refresh — recomputed, never trusted
 # --------------------------------------------------------------------------- #
 
@@ -292,6 +397,11 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
 # bounded warmup
 # --------------------------------------------------------------------------- #
 
+#: Admission is a HARD filter and it runs BEFORE priority — the ordering
+#: decides which of the survivors goes first, never whether a rejected symbol
+#: gets in. A $1 stock on three mover lists must not outrank a valid $20 one.
+#: `insufficient_admission_data` is included deliberately: we skip the request
+#: when we know the answer, and spend it when we do not.
 WARMUP_SELECT_SQL = """
 SELECT symbol, discovery_reasons AS reasons, discovery_observation_count AS observation_count,
        history_daily_bars AS daily_bars, latest_reference_session, best_rank,
@@ -299,6 +409,9 @@ SELECT symbol, discovery_reasons AS reasons, discovery_observation_count AS obse
 FROM public.research_symbols
 WHERE state IN ('discovered', 'history_required', 'history_warming')
   AND warmup_attempts < $1
+  AND (admission_state IS NULL
+       OR admission_state IN ('eligible_for_history',
+                              'insufficient_admission_data'))
 """
 
 

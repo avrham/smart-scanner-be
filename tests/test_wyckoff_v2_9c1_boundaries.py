@@ -70,7 +70,10 @@ def test_migration_012_exists_for_v2_only():
     assert [p.name for p in sorted(MIGRATIONS.glob("026_*"))] == [
         "026_research_symbols.sql"
     ]
-    assert not list(MIGRATIONS.glob("027_*"))
+    assert [p.name for p in sorted(MIGRATIONS.glob("027_*"))] == [
+        "027_research_admission.sql"
+    ]
+    assert not list(MIGRATIONS.glob("028_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
 
 

@@ -316,68 +316,143 @@ def explain_priority(row: Dict[str, Any]) -> List[str]:
 
 
 # --------------------------------------------------------------------------- #
-# research candidates — reason codes, never a score, never causality
+# research candidates
+#
+# THE DISTINCTION THIS SECTION EXISTS TO ENFORCE
+# ----------------------------------------------
+# The first cohort reported three symbols as "worth a human look" while their
+# canonical verdict was AVOID / price_below_minimum. That was wrong, and it was
+# wrong in a specific way: discovery strength was being used to answer a
+# question only strategy evidence can answer.
+#
+#   DISCOVERY REASONS  explain WHY WE LOOKED.        (it moved, on three lists)
+#   SCAN EVIDENCE      decides WHETHER IT SURVIVED.  (the strategy's own read)
+#
+# They never mix. A symbol on five mover lists that the strategy hard-rejects is
+# `scanned_not_candidate`, and the discovery reasons remain attached to explain
+# why we spent anything on it at all.
+#
+# Being a candidate is ALSO not ENTER or WATCH. It means the research screen did
+# not disqualify it and there is something to read.
 # --------------------------------------------------------------------------- #
-REASON_MULTIPLE_LISTS = "discovered_multiple_lists"
-REASON_REPEAT_OBSERVATION = "discovered_repeatedly"
-REASON_SETUP_PRESENT = "research_setup_present"
-REASON_STRUCTURE_PRESENT = "research_structure_present"
-REASON_BENCHMARK_LEADING = "benchmark_leading"
-REASON_RECENT_DISCOVERY = "discovery_recent"
+CANDIDATE_RESEARCH_CANDIDATE = "research_candidate"
+CANDIDATE_SCANNED_NOT_CANDIDATE = "scanned_not_candidate"
+CANDIDATE_INSUFFICIENT_DATA = "insufficient_data"
+CANDIDATE_UNAVAILABLE = "unavailable"
 
-RESEARCH_CANDIDATE_REASONS = (
-    REASON_MULTIPLE_LISTS, REASON_REPEAT_OBSERVATION, REASON_SETUP_PRESENT,
-    REASON_STRUCTURE_PRESENT, REASON_BENCHMARK_LEADING, REASON_RECENT_DISCOVERY)
+CANDIDATE_STATES = (CANDIDATE_RESEARCH_CANDIDATE,
+                    CANDIDATE_SCANNED_NOT_CANDIDATE,
+                    CANDIDATE_INSUFFICIENT_DATA, CANDIDATE_UNAVAILABLE)
+
+# ---- why we looked (discovery), kept separate on purpose ------------------- #
+LOOKED_MULTIPLE_LISTS = "discovered_multiple_lists"
+LOOKED_REPEATEDLY = "discovered_repeatedly"
+LOOKED_RECENTLY = "discovery_recent"
+LOOKED_REASONS = (LOOKED_MULTIPLE_LISTS, LOOKED_REPEATEDLY, LOOKED_RECENTLY)
+
+# ---- what the research screen found --------------------------------------- #
+SCREEN_STRUCTURE_PRESENT = "research_structure_present"
+SCREEN_SETUP_PRESENT = "research_setup_present"
+SCREEN_BENCHMARK_LEADING = "benchmark_outperforming"
+SCREEN_HARD_DISQUALIFIED = "hard_disqualified"
+SCREEN_NO_EVIDENCE = "no_research_evidence"
+SCREEN_NOT_SCANNED = "not_scanned"
+SCREEN_REASONS = (SCREEN_STRUCTURE_PRESENT, SCREEN_SETUP_PRESENT,
+                  SCREEN_BENCHMARK_LEADING, SCREEN_HARD_DISQUALIFIED,
+                  SCREEN_NO_EVIDENCE, SCREEN_NOT_SCANNED)
 
 #: How recent a discovery still counts as current, in market sessions.
 RECENT_DISCOVERY_MAX_SESSIONS = 3
 
+#: Setup states the strategy itself treats as present (see
+#: `prospective_campaign.candidate_signal_fields`, which reads
+#: `setup_state not in (None, "absent", "none")`). Restated here as a tuple for
+#: readability only — the membership rule is the strategy's, not ours.
+_SETUP_ABSENT = (None, "", "absent", "none")
 
-def research_candidate_reasons(row: Dict[str, Any], *,
-                               latest_reference_session: Optional[date] = None,
-                               ) -> List[str]:
-    """Why a human might look at this symbol. Facts, in a fixed order.
 
-    Every entry is a statement about what was OBSERVED. None of them is a
-    claim that one caused another, and there is deliberately no combination
-    rule: two reasons is not "twice as interesting", it is two facts.
+def looked_because(row: Dict[str, Any], *,
+                   latest_reference_session: Optional[date] = None,
+                   ) -> List[str]:
+    """Why this symbol was looked at. DISCOVERY facts only.
+
+    Never an argument that it is interesting — only that it is the reason we
+    spent a provider request. Kept apart from the screen so the two can never
+    be summed into one impression.
     """
     out: List[str] = []
     reasons = row.get("discovery_reasons") or row.get("reasons") or []
     if len(reasons) > 1:
-        out.append(REASON_MULTIPLE_LISTS)
+        out.append(LOOKED_MULTIPLE_LISTS)
     if (row.get("discovery_observation_count") or 0) > 1:
-        out.append(REASON_REPEAT_OBSERVATION)
-    if row.get("setup_state") in ("setup_confirmed", "setup_forming"):
-        out.append(REASON_SETUP_PRESENT)
-    if row.get("structure_state") and row.get("structure_state") != "none":
-        out.append(REASON_STRUCTURE_PRESENT)
-    if row.get("benchmark_relative") == "leading":
-        out.append(REASON_BENCHMARK_LEADING)
+        out.append(LOOKED_REPEATEDLY)
     seen = row.get("latest_reference_session")
     if (isinstance(seen, date) and isinstance(latest_reference_session, date)
             and (latest_reference_session - seen).days
             <= RECENT_DISCOVERY_MAX_SESSIONS):
-        out.append(REASON_RECENT_DISCOVERY)
+        out.append(LOOKED_RECENTLY)
     return out
+
+
+def screen_findings(row: Dict[str, Any]) -> List[str]:
+    """What the RESEARCH SCAN found. Strategy evidence only.
+
+    A `rejection_reason` is the strategy declining the symbol on one of its own
+    hard gates, and it ends the matter — `hard_disqualified` is returned alone,
+    because listing "structure present" beside "rejected on price" would invite
+    somebody to weigh one against the other.
+    """
+    if row.get("rejection_reason"):
+        return [SCREEN_HARD_DISQUALIFIED]
+    out: List[str] = []
+    structure = row.get("structure_state")
+    if structure and structure not in ("none", "absent"):
+        out.append(SCREEN_STRUCTURE_PRESENT)
+    if row.get("setup_state") not in _SETUP_ABSENT:
+        out.append(SCREEN_SETUP_PRESENT)
+    if row.get("benchmark_relative") == "outperforming":
+        out.append(SCREEN_BENCHMARK_LEADING)
+    return out or [SCREEN_NO_EVIDENCE]
+
+
+def classify_candidate(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The candidate verdict, with both halves reported separately.
+
+    Deterministic, no score, and no path by which discovery strength alone can
+    produce `research_candidate`.
+    """
+    state = row.get("state")
+    if state in TERMINAL_STATES:
+        return {"candidate_state": CANDIDATE_UNAVAILABLE,
+                "screen": [], "reason": state}
+    if state != STATE_RESEARCH_SCANNED:
+        return {"candidate_state": CANDIDATE_INSUFFICIENT_DATA,
+                "screen": [SCREEN_NOT_SCANNED], "reason": SCREEN_NOT_SCANNED}
+
+    findings = screen_findings(row)
+    if SCREEN_HARD_DISQUALIFIED in findings:
+        return {"candidate_state": CANDIDATE_SCANNED_NOT_CANDIDATE,
+                "screen": findings,
+                # The strategy's own words for WHY, kept verbatim.
+                "reason": row.get("rejection_reason")}
+    if findings == [SCREEN_NO_EVIDENCE]:
+        return {"candidate_state": CANDIDATE_SCANNED_NOT_CANDIDATE,
+                "screen": findings, "reason": SCREEN_NO_EVIDENCE}
+    return {"candidate_state": CANDIDATE_RESEARCH_CANDIDATE,
+            "screen": findings, "reason": None}
 
 
 def is_research_candidate(row: Dict[str, Any], *,
                           latest_reference_session: Optional[date] = None,
                           ) -> bool:
-    """Worth a human's attention: ready, scanned, and something was observed.
+    """Survived the research screen. NOT a recommendation, and NOT ENTER.
 
-    Explicit conditions, all of which a reader can check. It is not a
-    recommendation and there is nothing to rank it against.
+    `latest_reference_session` is accepted for call-compatibility and is
+    deliberately unused: recency explains why we looked, and can never by
+    itself make something a candidate.
     """
-    # `research_scanned` already implies the canonical readiness gate passed —
-    # a symbol cannot be scanned until `classify_history_state` said ready, and
-    # that function delegates to `prospective_readiness.evaluate_symbol`. One
-    # check, in one place.
-    if row.get("state") != STATE_RESEARCH_SCANNED:
-        return False
-    return bool(research_candidate_reasons(
-        row, latest_reference_session=latest_reference_session))
+    return (classify_candidate(row)["candidate_state"]
+            == CANDIDATE_RESEARCH_CANDIDATE)
 
 
 # --------------------------------------------------------------------------- #
@@ -418,11 +493,14 @@ __all__ = [
     "cooldown_until", "is_in_cooldown",
     "classify_history_state", "is_research_ready",
     "PRIORITY_DIMENSIONS", "priority_key", "prioritise", "explain_priority",
-    "REASON_MULTIPLE_LISTS", "REASON_REPEAT_OBSERVATION",
-    "REASON_SETUP_PRESENT", "REASON_STRUCTURE_PRESENT",
-    "REASON_BENCHMARK_LEADING", "REASON_RECENT_DISCOVERY",
-    "RESEARCH_CANDIDATE_REASONS", "RECENT_DISCOVERY_MAX_SESSIONS",
-    "research_candidate_reasons", "is_research_candidate",
+    "CANDIDATE_RESEARCH_CANDIDATE", "CANDIDATE_SCANNED_NOT_CANDIDATE",
+    "CANDIDATE_INSUFFICIENT_DATA", "CANDIDATE_UNAVAILABLE", "CANDIDATE_STATES",
+    "LOOKED_MULTIPLE_LISTS", "LOOKED_REPEATEDLY", "LOOKED_RECENTLY",
+    "LOOKED_REASONS", "SCREEN_STRUCTURE_PRESENT", "SCREEN_SETUP_PRESENT",
+    "SCREEN_BENCHMARK_LEADING", "SCREEN_HARD_DISQUALIFIED",
+    "SCREEN_NO_EVIDENCE", "SCREEN_NOT_SCANNED", "SCREEN_REASONS",
+    "RECENT_DISCOVERY_MAX_SESSIONS", "looked_because", "screen_findings",
+    "classify_candidate", "is_research_candidate",
     "SECTOR_KNOWN", "SECTOR_UNKNOWN", "REFERENCE_UNAVAILABLE",
     "SECTOR_STATES", "classify_sector_state",
 ]

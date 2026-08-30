@@ -184,6 +184,12 @@ $$;
 -- WAVE 3 — the research domain (migration 026 grants these; repeated here so
 -- this file remains the single readable statement of what the role may do).
 --
+--   pattern_configs         SELECT ONLY — the canonical strategy configuration
+--                           the research scan must evaluate with. Read, never
+--                           written: pattern_configs stays operator-only.
+--   sec_filings             SELECT, INSERT, UPDATE — PUBLIC EDGAR data, used
+--   sec_filing_symbols      by the lazy enrichment stage for symbols that
+--                           survived the research screen. No DELETE.
 --   research_symbols        SELECT, INSERT, UPDATE
 --   research_scan_results   SELECT, INSERT, UPDATE
 --   daily_bars              INSERT, UPDATE — but CONFINED BY RLS to symbols
