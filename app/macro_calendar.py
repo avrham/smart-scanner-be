@@ -362,12 +362,43 @@ def select_visible_events(rows: Sequence[Dict[str, Any]], *,
 # the product block
 # --------------------------------------------------------------------------- #
 
+def live_anchor_session(now: datetime) -> Optional[date]:
+    """The session a reader looking at the screen RIGHT NOW is standing in."""
+    from app.news import effective_session as news_effective_session
+    return news_effective_session(now)
+
+
+def resolve_anchor_session(scan_session: Optional[date], *, now: datetime,
+                           pinned: bool) -> Optional[date]:
+    """Which session the calendar's PROXIMITY is counted from.
+
+    Same rule, and the same reasoning, as `external_signals`: the scan runs on
+    our schedule and the world does not. Counting "how many days until the
+    Fed meets" from a scan that is five days old produces "in six days" for an
+    event that is tomorrow — not a cautious answer, a wrong one.
+
+      * pinned (the caller asked for a specific past session) -> that session,
+        strictly. A historical view must not be told about a meeting announced
+        afterwards.
+      * default -> the later of the scan session and the session we are
+        currently in.
+
+    The point-in-time gate is untouched: an event is still only visible if we
+    had OBSERVED it by the anchor session's close.
+    """
+    if pinned or scan_session is None:
+        return scan_session
+    live = live_anchor_session(now)
+    return max(scan_session, live) if live else scan_session
+
+
 def build_market_calendar_context(
     rows: Sequence[Dict[str, Any]],
     *,
     as_of_session: Optional[date],
     freshness: Dict[str, Any],
     sources: Sequence[Dict[str, Any]] = (),
+    scan_session: Optional[date] = None,
     limit: int = MAX_ITEMS,
 ) -> Dict[str, Any]:
     """The market-wide calendar block.
@@ -375,6 +406,11 @@ def build_market_calendar_context(
     `applies_to` is in the contract rather than left implicit. The same block
     is served on the symbol screen, and a reader must never be able to take
     "FOMC tomorrow" on a symbol page as a statement about that company.
+
+    `as_of_session` is the DISPLAY anchor (see `resolve_anchor_session`) and
+    `scan_session` is the session the scanner result belongs to. Both are
+    reported: when they differ, the reader is looking at a current calendar
+    beside an older scan, and the screen has to be able to say so.
     """
     base: Dict[str, Any] = {
         "contract_version": MARKET_CALENDAR_CONTRACT_VERSION,
@@ -382,6 +418,12 @@ def build_market_calendar_context(
         "status": freshness.get("status"),
         "reason": freshness.get("reason"),
         "as_of_session": as_of_session.isoformat() if as_of_session else None,
+        "scan_session": scan_session.isoformat() if scan_session else None,
+        # False means the calendar is counted from a LATER day than the scan.
+        # Without it a reader cannot tell that "FOMC tomorrow" is tomorrow for
+        # them and was six days away for the scan sitting beside it.
+        "anchor_is_scan_session": (scan_session is None
+                                   or as_of_session == scan_session),
         "age_hours": freshness.get("age_hours"),
         "window_forward_days": WINDOW_FORWARD_DAYS,
         "window_back_days": WINDOW_BACK_DAYS,
@@ -459,6 +501,7 @@ __all__ = [
     "AVAILABILITY_STATUSES", "REASON_SOURCE_UNAVAILABLE",
     "REASON_NEVER_REFRESHED", "REASON_STALE_REFRESH",
     "FRESHNESS_MAX_AGE_HOURS", "evaluate_freshness", "combine_freshness",
-    "is_visible_to_session", "build_event_item", "select_visible_events",
+    "is_visible_to_session", "live_anchor_session", "resolve_anchor_session",
+    "build_event_item", "select_visible_events",
     "build_market_calendar_context", "empty_market_calendar_context",
 ]

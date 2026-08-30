@@ -1628,12 +1628,18 @@ _HEALTHY_MACRO_STATE = [
 
 
 class TestMarketCalendarBlock:
-    def _get(self, client, monkeypatch, **kwargs):
+    def _get(self, client, monkeypatch, pinned=True, **kwargs):
         monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
                             lambda now: date(2026, 8, 25))
         _use(FakeConn(campaign_row=_wave2_campaign(),
                       result_rows=_wave2_results(), **kwargs))
-        return client.get("/api/scanner/overview").json()
+        # PINNED by default. The unpinned path deliberately counts proximity
+        # from the session the reader is in, which is the wall clock — so a
+        # test that asserted a day count without pinning would be asserting
+        # against `today` and would rot within a week.
+        path = ("/api/scanner/overview?session=2026-08-25" if pinned
+                else "/api/scanner/overview")
+        return client.get(path).json()
 
     def test_the_block_is_present_and_market_wide(self, client, monkeypatch):
         body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
@@ -1682,6 +1688,30 @@ class TestMarketCalendarBlock:
         assert block["status"] == mcal.AVAIL_UNAVAILABLE
         assert block["upcoming"] == [] and block["headline"] is None
 
+    def test_an_unpinned_view_counts_from_the_readers_session(
+            self, client, monkeypatch):
+        # The scan is 2026-08-25 and is stale. A reader looking today must be
+        # told how many days until the event from TODAY, and must be able to
+        # see that the calendar is newer than the scan beside it.
+        body = self._get(client, monkeypatch, pinned=False,
+                         macro_rows=[_macro_row(scheduled=date(2099, 1, 5))],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        block = body["market_calendar_context"]
+        assert block["scan_session"] == "2026-08-25"
+        assert block["as_of_session"] >= "2026-08-25"
+        assert block["anchor_is_scan_session"] == (
+            block["as_of_session"] == block["scan_session"])
+
+    def test_a_pinned_view_anchors_strictly_on_that_session(
+            self, client, monkeypatch):
+        body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        block = body["market_calendar_context"]
+        assert block["as_of_session"] == "2026-08-25"
+        assert block["anchor_is_scan_session"] is True
+
     def test_no_scan_yet_reports_no_calendar_rather_than_a_broken_one(
             self, client, monkeypatch):
         monkeypatch.setattr(scanner_mod, "resolve_latest_completed_session",
@@ -1705,8 +1735,10 @@ class TestMarketCalendarBlock:
                       macro_rows=[_macro_row()],
                       catalyst_state=_HEALTHY_MACRO_STATE,
                       source_rows=_REGISTRY_ROWS))
-        body = client.get("/api/scanner/symbol?symbol=AAPL").json()
+        body = client.get(
+            "/api/scanner/symbol?symbol=AAPL&session=2026-08-25").json()
         assert body["market_calendar_context"]["applies_to"] == "market_wide"
+        assert body["market_calendar_context"]["as_of_session"] == "2026-08-25"
         # A sibling of catalyst_context, never a member of it: a Fed meeting is
         # not an event about this company.
         assert "market_calendar_context" not in body["catalyst_context"]
@@ -1721,7 +1753,7 @@ class TestLicensingBoundaryInResponses:
                       macro_rows=[_macro_row()],
                       catalyst_state=_HEALTHY_MACRO_STATE,
                       source_rows=_REGISTRY_ROWS))
-        return client.get("/api/scanner/overview").json()
+        return client.get("/api/scanner/overview?session=2026-08-25").json()
 
     def test_no_internal_only_source_appears_anywhere(self, client, monkeypatch):
         body = self._body(client, monkeypatch)

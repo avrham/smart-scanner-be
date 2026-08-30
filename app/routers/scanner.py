@@ -475,7 +475,7 @@ ORDER BY scheduled_date, event_type
 
 async def _load_market_calendar(
     db: asyncpg.Connection, session_date: Optional[date_type], now: datetime,
-    source_rows: Sequence[Dict[str, Any]],
+    source_rows: Sequence[Dict[str, Any]], *, pinned: bool = False,
 ) -> Dict[str, Any]:
     """The market-wide calendar block: scheduled macro events near this session.
 
@@ -483,11 +483,20 @@ async def _load_market_calendar(
     row. Wrapped by the caller so a calendar failure degrades this dimension
     only — the scan, attention, market context, catalysts and external signals
     must all keep working when a government web page changes its markup.
+
+    The DISPLAY anchor is resolved the same way external signals resolve
+    theirs: unless the caller pinned a past session, proximity is counted from
+    the session the READER is in, not from a scan that may be days old.
+    Counting "days until the Fed meets" from a stale scan does not produce a
+    cautious answer, it produces a wrong one.
     """
     if session_date is None:
         return mcal.empty_market_calendar_context()
-    lower = session_date - timedelta(days=_MACRO_QUERY_BACK_DAYS)
-    upper = session_date + timedelta(days=_MACRO_QUERY_FORWARD_DAYS)
+    anchor = mcal.resolve_anchor_session(session_date, now=now, pinned=pinned)
+    if anchor is None:
+        return mcal.empty_market_calendar_context()
+    lower = anchor - timedelta(days=_MACRO_QUERY_BACK_DAYS)
+    upper = anchor + timedelta(days=_MACRO_QUERY_FORWARD_DAYS)
     rows = [dict(r) for r in await db.fetch(MACRO_EVENTS_SQL, lower, upper)]
     state = await _fetch_catalyst_freshness(db)
     per_source = {
@@ -496,7 +505,7 @@ async def _load_market_calendar(
         for source in mcal.MACRO_SOURCES
     }
     return mcal.build_market_calendar_context(
-        rows, as_of_session=session_date,
+        rows, as_of_session=anchor, scan_session=session_date,
         freshness=mcal.combine_freshness(per_source), sources=source_rows)
 
 
@@ -744,7 +753,8 @@ async def scanner_overview(
         # markup — and sharing a handler would mean one taking the other down.
         try:
             market_calendar_context = await _load_market_calendar(
-                db, session_date, now, calendar_source_rows)
+                db, session_date, now, calendar_source_rows,
+                pinned=session is not None)
         except Exception:
             logger.warning("market calendar unavailable for overview",
                            exc_info=False)
@@ -948,7 +958,8 @@ async def scanner_symbol_detail(
 
     try:
         market_calendar_context = await _load_market_calendar(
-            db, session_date, now, calendar_source_rows)
+            db, session_date, now, calendar_source_rows,
+            pinned=session is not None)
     except Exception:
         logger.warning("market calendar unavailable for symbol detail",
                        exc_info=False)

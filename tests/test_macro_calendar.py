@@ -215,3 +215,59 @@ class TestNoStrategyInfluence:
         # rather than in a screenshot.
         assert sv.ATTENTION_TIERS == ("high_attention", "developing",
                                       "low_attention", "no_read", "not_ready")
+
+
+class TestDisplayAnchor:
+    """Proximity must be counted from the READER's session, not a stale scan.
+
+    This is the same asymmetry the external-signal layer already handles, and
+    it bites harder here: a calendar is entirely about "when". Counting the
+    days to an FOMC meeting from a scan that is five days old does not produce
+    a cautious answer — it produces a wrong one, on a screen whose whole
+    content is a number of days.
+    """
+
+    NOW = datetime(2026, 8, 30, 12, 0, tzinfo=UTC)   # a Sunday
+
+    def test_a_stale_scan_does_not_drag_the_calendar_backwards(self):
+        anchor = mc.resolve_anchor_session(date(2026, 8, 25), now=self.NOW,
+                                           pinned=False)
+        assert anchor == date(2026, 8, 31)           # the next trading session
+
+    def test_a_pinned_session_is_honoured_strictly(self):
+        # A historical view must not learn about a meeting announced later.
+        assert mc.resolve_anchor_session(date(2026, 8, 25), now=self.NOW,
+                                         pinned=True) == date(2026, 8, 25)
+
+    def test_a_current_scan_is_left_alone(self):
+        assert mc.resolve_anchor_session(date(2026, 9, 30), now=self.NOW,
+                                         pinned=False) == date(2026, 9, 30)
+
+    def test_no_scan_stays_none(self):
+        assert mc.resolve_anchor_session(None, now=self.NOW,
+                                         pinned=False) is None
+
+    def test_the_block_reports_both_sessions_when_they_differ(self):
+        ctx = mc.build_market_calendar_context(
+            [event(scheduled=date(2026, 9, 1))],
+            as_of_session=date(2026, 8, 31), scan_session=date(2026, 8, 25),
+            freshness=FRESH)
+        assert ctx["as_of_session"] == "2026-08-31"
+        assert ctx["scan_session"] == "2026-08-25"
+        assert ctx["anchor_is_scan_session"] is False
+
+    def test_the_flag_is_true_when_they_agree(self):
+        ctx = mc.build_market_calendar_context(
+            [], as_of_session=date(2026, 8, 31),
+            scan_session=date(2026, 8, 31), freshness=FRESH)
+        assert ctx["anchor_is_scan_session"] is True
+
+    def test_the_point_in_time_gate_still_applies_to_the_anchor(self):
+        # An event we only observed on 2026-09-02 is invisible to a reader
+        # standing in 2026-08-31, however current that anchor is.
+        late = event(scheduled=date(2026, 9, 16),
+                     observed=datetime(2026, 9, 2, tzinfo=UTC))
+        ctx = mc.build_market_calendar_context(
+            [late], as_of_session=date(2026, 8, 31),
+            scan_session=date(2026, 8, 25), freshness=FRESH)
+        assert ctx["upcoming"] == []

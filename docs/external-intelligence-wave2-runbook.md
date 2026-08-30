@@ -209,12 +209,28 @@ a count:
 | Layer | Gate | Why |
 |---|---|---|
 | Macro events | `first_observed_at <= session close` | the schedule is public, but we only know what we actually read; a meeting added on Tuesday must not appear in Monday's context |
+| Macro **display anchor** | the later of the scan session and the reader's session, unless a session is pinned | see below |
 | Analyst grades | `session_date` = first trading session **strictly after** the event date | the provider publishes a date and no clock, so same-session actionability cannot be established and is never assumed |
 | Discovery | `session_date` from the shared market clock | unchanged from Wave 1 |
 
 The analyst rule forfeits up to a day of edge on purpose, in exchange for a
 guarantee: no measurement built on those rows can be reading an outcome it
 could not have traded.
+
+**The display anchor is separate from the gate, and it matters here more than
+anywhere else.** A calendar's entire content is a number of days. Counting the
+days to an FOMC meeting from a scan that ran five sessions ago does not produce
+a cautious answer — it produces a wrong one, and it would sit on screen next to
+a correct one. So proximity is counted from the session the READER is in
+(`mcal.resolve_anchor_session`, the same rule `external_signals` already uses),
+a pinned historical view anchors strictly on the session asked for, and the
+block reports `scan_session` and `anchor_is_scan_session` so the UI can say
+"counted from today, not from the scan below". The visibility gate above is
+unchanged by this: an event is still invisible unless we had observed it by the
+ANCHOR session's close.
+
+This was found by looking at the live staging response rather than by reading
+the code, which is the argument for having deployed it.
 
 ---
 
