@@ -12,8 +12,12 @@ import app.external_discovery as ed
 from app.source_licensing import LICENSING_INTERNAL_ONLY
 
 UTC = timezone.utc
-NOW = datetime(2026, 8, 28, 17, 0, tzinfo=UTC)
-SESSION = date(2026, 8, 28)
+NOW = datetime(2026, 8, 30, 14, 34, tzinfo=UTC)   # a Sunday fetch
+#: The market session the snapshot describes (Friday) …
+REFERENCE = date(2026, 8, 28)
+#: … and the first session it could be acted upon (Monday). Different dates,
+#: deliberately, and the whole point of the corrective mission.
+SESSION = date(2026, 8, 31)
 
 
 def candidate(symbol, list_kind, rank=1, change=5.0, inside=False):
@@ -77,6 +81,9 @@ class TestProvenance:
                                         observed_at=NOW, session_date=SESSION)
         assert stored["licensing_visibility"] == LICENSING_INTERNAL_ONLY
         assert stored["source_metadata"]["changesPercentage"] == 10.0
+        # A Sunday fetch describes Friday and is actionable on Monday.
+        assert stored["reference_session_date"] == REFERENCE
+        assert stored["session_date"] == SESSION
 
 
 class FakeConn:
@@ -87,7 +94,7 @@ class FakeConn:
         self.bars = bars
 
     async def fetchrow(self, sql, *args):
-        return {"session_date": SESSION}
+        return {"reference_session_date": REFERENCE}
 
     async def fetch(self, sql, *args):
         if "external_discovery_current" in sql:
@@ -99,11 +106,15 @@ class FakeConn:
 
 
 def view_row(symbol, reasons, inside, rank=1):
-    return {"session_date": SESSION, "symbol": symbol,
+    return {"reference_session_date": REFERENCE, "symbol": symbol,
             "company_name": None, "exchange": None,
             "in_scanner_universe": inside, "reasons": reasons,
             "reason_count": len(reasons), "best_rank": rank,
             "max_abs_change_percent": 10.0, "observed_at": NOW,
+            # The two dates the audit proved must stay apart: the tape these
+            # numbers came from, and the first session anybody could act.
+            "first_actionable_session": SESSION,
+            "reference_session_basis": ed.BASIS_INFERRED_FROM_OBSERVATION_TIME,
             "licensing_visibility": LICENSING_INTERNAL_ONLY}
 
 
@@ -137,13 +148,21 @@ class TestCrossReference:
     def test_an_empty_store_returns_an_empty_report_not_an_error(self):
         class Empty:
             async def fetchrow(self, sql, *args):
-                return {"session_date": None}
+                return {"reference_session_date": None}
 
             async def fetch(self, sql, *args):
                 return []
 
         report = asyncio.run(ed.cross_reference_universe(Empty()))
-        assert report["session_date"] is None and report["discovered"] == 0
+        assert report["reference_session_date"] is None
+        assert report["discovered"] == 0
+
+    def test_the_report_names_both_sessions(self):
+        report = self._report()
+        # Never one field doing both jobs again.
+        assert report["reference_session_date"] == REFERENCE.isoformat()
+        assert report["first_actionable_session"] == SESSION.isoformat()
+        assert report["reference_session_date"] != report["first_actionable_session"]
 
 
 class TestExperimentBoundary:

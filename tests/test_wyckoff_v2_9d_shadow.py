@@ -446,7 +446,10 @@ class TestMigration013:
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("024_*"))] == [
             "024_market_calendar_and_analyst.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("025_*"))
+        assert [p.name for p in sorted(MIGRATIONS_DIR.glob("025_*"))] == [
+            "025_discovery_reference_session.sql"
+        ]
+        assert not list(MIGRATIONS_DIR.glob("026_*"))
 
     def test_arm_codes_in_sync_with_registry(self):
         sql = MIGRATION_013.read_text(encoding="utf-8")

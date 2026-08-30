@@ -91,7 +91,10 @@ class TestMigration009:
         assert [p.name for p in sorted(MIGRATIONS.glob("024_*"))] == [
             "024_market_calendar_and_analyst.sql"
         ]
-        assert not list(MIGRATIONS.glob("025_*"))
+        assert [p.name for p in sorted(MIGRATIONS.glob("025_*"))] == [
+            "025_discovery_reference_session.sql"
+        ]
+        assert not list(MIGRATIONS.glob("026_*"))
     def test_migration_is_additive_and_idempotent(self):
         sql = self._statements()
         assert sql.count("ADD COLUMN IF NOT EXISTS") == 3

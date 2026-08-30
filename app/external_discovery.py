@@ -245,6 +245,7 @@ def normalize_symbol(value: Any) -> Optional[str]:
 
 def normalize_candidate(row: Dict[str, Any], *, list_kind: str, rank: int,
                         observed_at: datetime, session_date: date,
+                        reference_session_date: Optional[date] = None,
                         universe: Optional[Set[str]] = None,
                         ) -> Optional[Dict[str, Any]]:
     """One feed entry -> one storable row, or None if the symbol is unusable."""
@@ -266,8 +267,18 @@ def normalize_candidate(row: Dict[str, Any], *, list_kind: str, rank: int,
         "change_percent": _number(row.get("changesPercentage")
                                   if row.get("changesPercentage") is not None
                                   else row.get("changePercentage")),
+        # THE FETCH CLOCK — the only timestamp with an authority behind it.
         "observed_at": observed_at,
+        # WHEN IT COULD FIRST BE ACTED UPON. Forward-rolling.
         "session_date": session_date,
+        # WHICH SESSION THE NUMBERS DESCRIBE. Inferred, and labelled as
+        # inferred. Falls back to the observation itself rather than to
+        # `session_date`, so a caller that forgets to pass it can never make
+        # the row claim the numbers came from a session that had not happened.
+        "reference_session_date": (reference_session_date
+                                   if reference_session_date is not None
+                                   else infer_reference_session(observed_at)),
+        "reference_session_basis": BASIS_INFERRED_FROM_OBSERVATION_TIME,
         "in_scanner_universe": bool(universe and symbol in universe),
         # The provider's own row, bounded. Kept because a rank means nothing
         # without the numbers it was assigned from, and because a feed that
@@ -301,6 +312,7 @@ def bound_source_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def normalize_list(rows: Sequence[Dict[str, Any]], *, list_kind: str,
                    observed_at: datetime, session_date: date,
+                   reference_session_date: Optional[date] = None,
                    universe: Optional[Set[str]] = None,
                    limit: int = DEFAULT_LIST_LIMIT) -> List[Dict[str, Any]]:
     """A whole feed -> bounded, ranked, de-duplicated rows.
@@ -318,7 +330,7 @@ def normalize_list(rows: Sequence[Dict[str, Any]], *, list_kind: str,
         candidate = normalize_candidate(
             row, list_kind=list_kind, rank=len(out) + 1,
             observed_at=observed_at, session_date=session_date,
-            universe=universe)
+            reference_session_date=reference_session_date, universe=universe)
         if candidate is None or candidate["symbol"] in seen:
             continue
         seen.add(candidate["symbol"])
@@ -326,13 +338,79 @@ def normalize_list(rows: Sequence[Dict[str, Any]], *, list_kind: str,
     return out
 
 
-def resolve_session(observed_at: datetime) -> Optional[date]:
-    """The trading session this observation belongs to.
+# --------------------------------------------------------------------------- #
+# TWO DATES, TWO QUESTIONS. They are not interchangeable and one cannot be
+# derived from the other.
+#
+#   session_date            "when could this observation FIRST BE ACTED UPON?"
+#                           Forward-rolling: a Sunday fetch is actionable on
+#                           Monday. This is the conservative anchor.
+#
+#   reference_session_date  "which market session do these NUMBERS describe?"
+#                           Backward-looking: a Sunday fetch is describing
+#                           Friday's tape.
+#
+# They differ by a session whenever the fetch happens outside a live session,
+# which is most of the time. Before this existed, only the first was stored,
+# and a snapshot of Friday's closing movers was labelled 2026-08-31 — a
+# session that had not happened.
+# --------------------------------------------------------------------------- #
 
-    Borrowed from `app.news` so discovery cannot disagree with the catalyst and
-    external layers about when a session ends.
+#: How `reference_session_date` was arrived at. A bounded vocabulary with ONE
+#: value today, and that value says exactly what it is: our inference from our
+#: own fetch clock against the US equity calendar.
+#:
+#: It exists because FMP's movers feeds carry NO provider timestamp — measured,
+#: and stated in migration 023. Naming the column `describes_session` with no
+#: basis beside it would read as though the provider had declared the session,
+#: which would be a claim we cannot support.
+BASIS_INFERRED_FROM_OBSERVATION_TIME = "inferred_from_observation_time"
+REFERENCE_SESSION_BASES = (BASIS_INFERRED_FROM_OBSERVATION_TIME,)
+
+
+def resolve_session(observed_at: datetime) -> Optional[date]:
+    """The first trading session this observation could be ACTED UPON.
+
+    Forward-rolling, and borrowed from `app.news` so discovery cannot disagree
+    with the catalyst and external layers about when a session ends. A fetch at
+    11:00 on a Sunday returns the following Monday: that is the first moment
+    anybody could trade on it, and it is deliberately NOT a claim about which
+    session the data describes — see `infer_reference_session` for that.
     """
     return effective_session(observed_at)
+
+
+def infer_reference_session(observed_at: datetime) -> Optional[date]:
+    """The market session these numbers are inferred to describe.
+
+    INFERENCE, not provider metadata. The feeds carry no timestamp, so the
+    honest reconstruction is our own fetch clock read against the US equity
+    calendar:
+
+        before 09:30 ET on a trading day  -> the latest COMPLETED session
+                                             (the tape has not moved yet today)
+        09:30-16:00 ET on a trading day   -> that session, in progress
+        after 16:00 ET on a trading day   -> that session, just completed
+        weekend or market holiday         -> the latest COMPLETED session
+
+    The two boundary cases are the ones that were previously wrong and are the
+    ones worth stating: a pre-open fetch describes YESTERDAY, and a weekend
+    fetch describes FRIDAY. Both were being labelled with the next session.
+    """
+    from app.prospective_session import (REGULAR_OPEN, EXCHANGE_TZ,
+                                         is_trading_day,
+                                         resolve_latest_completed_session)
+    from zoneinfo import ZoneInfo
+
+    moment = (observed_at if observed_at.tzinfo
+              else observed_at.replace(tzinfo=timezone.utc))
+    local = moment.astimezone(ZoneInfo(EXCHANGE_TZ))
+    if is_trading_day(local.date()) and local.time() >= REGULAR_OPEN:
+        # In progress, or closed a few hours ago. Either way the numbers are
+        # this session's, and this session is the one being described.
+        return local.date()
+    # Pre-open, weekend or holiday: nothing has traded since the last close.
+    return resolve_latest_completed_session(moment)
 
 
 # --------------------------------------------------------------------------- #
@@ -343,9 +421,18 @@ UPSERT_SQL = """
 INSERT INTO public.external_discovery_candidates (
     source, list_kind, symbol, company_name, exchange, rank, price,
     change_amount, change_percent, observed_at, session_date,
+    reference_session_date, reference_session_basis,
     in_scanner_universe, source_metadata, licensing_visibility)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
-ON CONFLICT (source, list_kind, symbol, session_date) DO UPDATE SET
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16)
+-- Identity WIDENED by reference_session_date, not changed. Adding a column to
+-- a unique key can only ever permit more rows, never merge existing ones — so
+-- this cannot lose data, and it restores what migration 023's comment always
+-- said the key meant ("a second fetch on the same session updates the rank").
+-- Without it, a pre-open fetch describing Thursday and an in-session fetch
+-- describing Friday collide on one actionable session and the second silently
+-- overwrites the first's provenance.
+ON CONFLICT (source, list_kind, symbol, session_date, reference_session_date)
+DO UPDATE SET
     company_name = COALESCE(EXCLUDED.company_name,
                             external_discovery_candidates.company_name),
     exchange = COALESCE(EXCLUDED.exchange,
@@ -396,6 +483,8 @@ async def upsert_candidates(conn, candidates: Iterable[Dict[str, Any]],
             candidate["rank"], candidate.get("price"),
             candidate.get("change_amount"), candidate.get("change_percent"),
             candidate["observed_at"], candidate["session_date"],
+            candidate["reference_session_date"],
+            candidate["reference_session_basis"],
             candidate["in_scanner_universe"],
             json.dumps(candidate.get("source_metadata") or {}),
             candidate.get("licensing_visibility") or LICENSING_INTERNAL_ONLY)
@@ -434,9 +523,15 @@ async def refresh_discovery_candidates(
     """
     moment = now or datetime.now(timezone.utc)
     session = resolve_session(moment)
-    summary: Dict[str, Any] = {"source": SOURCE_STATE_FMP_DISCOVERY,
-                               "session_date": session.isoformat() if session else None,
-                               "lists": {}}
+    reference = infer_reference_session(moment)
+    summary: Dict[str, Any] = {
+        "source": SOURCE_STATE_FMP_DISCOVERY,
+        # BOTH reported, because a summary that showed one would be the same
+        # ambiguity in a log line instead of in a column.
+        "session_date": session.isoformat() if session else None,
+        "reference_session_date": reference.isoformat() if reference else None,
+        "reference_session_basis": BASIS_INFERRED_FROM_OBSERVATION_TIME,
+        "lists": {}}
 
     if client is None:
         await record_source_state(conn, STATE_UNAVAILABLE,
@@ -462,7 +557,8 @@ async def refresh_discovery_candidates(
             rows = await client.get_list(path)
             candidates = normalize_list(
                 rows, list_kind=kind, observed_at=moment, session_date=session,
-                universe=universe, limit=limit)
+                reference_session_date=reference, universe=universe,
+                limit=limit)
             stats = await upsert_candidates(conn, candidates)
             for candidate in candidates:
                 symbols.add(candidate["symbol"])
@@ -500,16 +596,21 @@ async def refresh_discovery_candidates(
 # research reads (ops/analysis only — never the Product API; see the docstring)
 # --------------------------------------------------------------------------- #
 
+#: Counts MARKET SESSIONS, not actionable sessions. "How many sessions did the
+#: market keep noticing this" is a question about the tape; counting
+#: `session_date` answered a different one and, on a weekend, counted a session
+#: that had not happened.
 OUTSIDE_UNIVERSE_SQL = """
 SELECT symbol,
-       count(DISTINCT session_date) AS sessions_seen,
+       count(DISTINCT reference_session_date) AS sessions_seen,
        count(*) AS appearances,
        array_agg(DISTINCT list_kind ORDER BY list_kind) AS lists,
        min(rank) AS best_rank,
-       max(session_date) AS last_seen
+       max(reference_session_date) AS last_seen
 FROM public.external_discovery_candidates
 WHERE in_scanner_universe = false
-  AND session_date >= $1
+  AND reference_session_date IS NOT NULL
+  AND reference_session_date >= $1
 GROUP BY symbol
 ORDER BY sessions_seen DESC, appearances DESC, best_rank ASC
 LIMIT $2
@@ -529,6 +630,82 @@ async def symbols_worth_investigating(conn, *, since: date,
     """
     rows = await conn.fetch(OUTSIDE_UNIVERSE_SQL, since, limit)
     return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# backfill — migration 025
+#
+# Lives here, not in the migration, because the inference needs the US equity
+# trading calendar and that calendar exists exactly once in this repository.
+# A second copy written in SQL could drift from the first without anybody
+# noticing, and a drifting calendar is precisely how a row ends up labelled
+# with a session that did not happen.
+# --------------------------------------------------------------------------- #
+
+BACKFILL_SELECT_SQL = """
+SELECT id, symbol, list_kind, observed_at, session_date
+FROM public.external_discovery_candidates
+WHERE reference_session_date IS NULL
+ORDER BY observed_at, symbol, list_kind
+"""
+
+BACKFILL_UPDATE_SQL = """
+UPDATE public.external_discovery_candidates
+SET reference_session_date = $2, reference_session_basis = $3
+WHERE id = $1 AND reference_session_date IS NULL
+"""
+
+
+async def plan_reference_backfill(conn) -> List[Dict[str, Any]]:
+    """Every unfilled row with the session it WOULD be given. Reads only.
+
+    Returned rather than applied so the mapping can be printed and checked
+    before anything is written. `unsafe` marks a row whose inference would land
+    after its own actionable session — impossible by construction, checked
+    anyway, because a silent bad backfill is worse than the missing column.
+    """
+    rows = []
+    for record in await conn.fetch(BACKFILL_SELECT_SQL):
+        inferred = infer_reference_session(record["observed_at"])
+        rows.append({
+            "id": record["id"],
+            "symbol": record["symbol"],
+            "list_kind": record["list_kind"],
+            "observed_at": record["observed_at"],
+            "session_date": record["session_date"],
+            "reference_session_date": inferred,
+            "basis": BASIS_INFERRED_FROM_OBSERVATION_TIME,
+            "unsafe": inferred is None or inferred > record["session_date"],
+        })
+    return rows
+
+
+async def backfill_reference_sessions(conn, *, dry_run: bool = True,
+                                      ) -> Dict[str, Any]:
+    """Apply the planned mapping. Idempotent: only ever fills NULLs.
+
+    Refuses to write anything at all if ANY row plans an unsafe value — a
+    partial backfill would leave the table in a state where some rows are
+    trustworthy and some are not, which is harder to reason about than none.
+    """
+    plan = await plan_reference_backfill(conn)
+    unsafe = [r for r in plan if r["unsafe"]]
+    summary: Dict[str, Any] = {
+        "candidates": len(plan),
+        "unsafe": len(unsafe),
+        "dry_run": dry_run,
+        "updated": 0,
+        "distinct_mappings": sorted({
+            (str(r["observed_at"]), str(r["reference_session_date"]),
+             str(r["session_date"])) for r in plan}),
+    }
+    if unsafe or dry_run:
+        return summary
+    for row in plan:
+        await conn.execute(BACKFILL_UPDATE_SQL, row["id"],
+                           row["reference_session_date"], row["basis"])
+        summary["updated"] += 1
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -563,6 +740,11 @@ def aggregate_discovery(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "best_rank": None,
             "max_abs_change_percent": None,
             "observed_at": None,
+            # Both dates survive the rollup. Collapsing to one is what the
+            # audit found; a summary that keeps only the actionable session
+            # would reintroduce it one layer up.
+            "reference_session_date": None,
+            "first_actionable_session": None,
         })
         kind = row.get("list_kind")
         if kind and kind not in entry["reasons"]:
@@ -585,6 +767,14 @@ def aggregate_discovery(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             entry["observed_at"] = observed
         entry["company_name"] = entry["company_name"] or row.get("company_name")
         entry["exchange"] = entry["exchange"] or row.get("exchange")
+        reference = row.get("reference_session_date")
+        if reference is not None and (entry["reference_session_date"] is None
+                                      or reference > entry["reference_session_date"]):
+            entry["reference_session_date"] = reference
+        actionable = row.get("session_date")
+        if actionable is not None and (entry["first_actionable_session"] is None
+                                       or actionable < entry["first_actionable_session"]):
+            entry["first_actionable_session"] = actionable
 
     out = list(grouped.values())
     for entry in out:
@@ -597,29 +787,40 @@ def aggregate_discovery(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 CURRENT_DISCOVERY_SQL = """
-SELECT session_date, symbol, company_name, exchange, in_scanner_universe,
-       reasons, reason_count, best_rank, max_abs_change_percent, observed_at,
-       licensing_visibility
+SELECT reference_session_date, symbol, company_name, exchange,
+       in_scanner_universe, reasons, reason_count, best_rank,
+       max_abs_change_percent, observed_at, first_actionable_session,
+       reference_session_basis, licensing_visibility
 FROM public.external_discovery_current
-WHERE session_date = $1
+WHERE reference_session_date = $1
 ORDER BY reason_count DESC, best_rank ASC, symbol
 """
 
-LATEST_SESSION_SQL = """
-SELECT max(session_date) AS session_date
+#: The latest MARKET SESSION any snapshot describes. Deliberately not
+#: `max(session_date)`: that is the latest session something became
+#: ACTIONABLE in, which on a weekend is a session that has not happened, and
+#: reporting it as "the latest discovery session" was the audit's finding.
+LATEST_REFERENCE_SESSION_SQL = """
+SELECT max(reference_session_date) AS reference_session_date
 FROM public.external_discovery_candidates
 """
 
 
-async def latest_discovery_session(conn) -> Optional[date]:
-    row = await conn.fetchrow(LATEST_SESSION_SQL)
-    return row["session_date"] if row else None
+async def latest_reference_session(conn) -> Optional[date]:
+    """The most recent market session we hold a snapshot FOR.
+
+    Never a future date: `reference_session_date` is inferred backwards from
+    the fetch clock, so the worst case is the session currently in progress.
+    """
+    row = await conn.fetchrow(LATEST_REFERENCE_SESSION_SQL)
+    return row["reference_session_date"] if row else None
 
 
-async def current_discovery(conn, *, session_date: Optional[date] = None,
+async def current_discovery(conn, *,
+                            reference_session_date: Optional[date] = None,
                             ) -> List[Dict[str, Any]]:
-    """The deterministic current-discovery view for one session."""
-    session = session_date or await latest_discovery_session(conn)
+    """The deterministic current-discovery view for one MARKET session."""
+    session = reference_session_date or await latest_reference_session(conn)
     if session is None:
         return []
     rows = await conn.fetch(CURRENT_DISCOVERY_SQL, session)
@@ -647,7 +848,8 @@ GROUP BY symbol
 """
 
 
-async def cross_reference_universe(conn, *, session_date: Optional[date] = None,
+async def cross_reference_universe(conn, *,
+                                   reference_session_date: Optional[date] = None,
                                    ) -> Dict[str, Any]:
     """What one discovery session found, sorted against what we actually hold.
 
@@ -655,14 +857,15 @@ async def cross_reference_universe(conn, *, session_date: Optional[date] = None,
     with 0 local bars is a research question — "the market noticed this four
     sessions running and we cannot even chart it" — never an enqueue.
     """
-    session = session_date or await latest_discovery_session(conn)
+    session = reference_session_date or await latest_reference_session(conn)
     if session is None:
-        return {"session_date": None, "discovered": 0, "inside_universe": [],
+        return {"reference_session_date": None, "first_actionable_session": None,
+                "discovered": 0, "inside_universe": [],
                 "outside_universe": [], "multi_category": [],
                 "with_local_history": [], "insufficient_local_history": [],
                 "min_local_bars": MIN_LOCAL_BARS}
 
-    rows = await current_discovery(conn, session_date=session)
+    rows = await current_discovery(conn, reference_session_date=session)
     symbols = [r["symbol"] for r in rows]
     history: Dict[str, Dict[str, Any]] = {}
     if symbols:
@@ -680,8 +883,15 @@ async def cross_reference_universe(conn, *, session_date: Optional[date] = None,
             multi.append(entry)
         (has_history if bars >= MIN_LOCAL_BARS else thin).append(entry)
 
+    actionable = [r["first_actionable_session"] for r in rows
+                  if r.get("first_actionable_session") is not None]
     return {
-        "session_date": session.isoformat(),
+        # The session the snapshot DESCRIBES...
+        "reference_session_date": session.isoformat(),
+        # ...and the earliest session anybody could have acted on it. Both,
+        # always, so a report can never imply they are the same day.
+        "first_actionable_session": (min(actionable).isoformat()
+                                     if actionable else None),
         "discovered": len(rows),
         "min_local_bars": MIN_LOCAL_BARS,
         "inside_universe": inside,
@@ -700,8 +910,10 @@ __all__ = [
     "STATE_OK", "STATE_UNAVAILABLE", "STATE_ERROR", "STATE_NEVER_RUN",
     "DiscoverySourceUnavailable", "FmpDiscoveryClient", "FmpStableClient",
     "normalize_symbol", "normalize_candidate", "normalize_list",
-    "resolve_session", "upsert_candidates", "record_source_state",
+    "resolve_session", "infer_reference_session",
+    "BASIS_INFERRED_FROM_OBSERVATION_TIME", "REFERENCE_SESSION_BASES", "upsert_candidates", "record_source_state",
     "refresh_discovery_candidates", "symbols_worth_investigating",
-    "bound_source_row", "aggregate_discovery", "latest_discovery_session",
+    "bound_source_row", "aggregate_discovery", "latest_reference_session",
     "current_discovery", "cross_reference_universe", "MIN_LOCAL_BARS",
+    "plan_reference_backfill", "backfill_reference_sessions",
 ]

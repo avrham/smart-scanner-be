@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 MARKET_CALENDAR_VERSION = "us_market_calendar.v1"
 EXCHANGE_TZ = "America/New_York"
+REGULAR_OPEN = time(9, 30)
 REGULAR_CLOSE = time(16, 0)
 
 
@@ -118,7 +119,7 @@ def resolve_snapshot(now_utc: datetime) -> dict:
 
 
 __all__ = [
-    "MARKET_CALENDAR_VERSION", "EXCHANGE_TZ", "REGULAR_CLOSE",
+    "MARKET_CALENDAR_VERSION", "EXCHANGE_TZ", "REGULAR_OPEN", "REGULAR_CLOSE",
     "us_market_holidays", "is_trading_day",
     "resolve_latest_completed_session", "session_cutoff_utc", "resolve_snapshot",
 ]

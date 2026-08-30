@@ -484,19 +484,23 @@ async def _load_market_calendar(
     only — the scan, attention, market context, catalysts and external signals
     must all keep working when a government web page changes its markup.
 
-    The DISPLAY anchor is resolved the same way external signals resolve
-    theirs: unless the caller pinned a past session, proximity is counted from
-    the session the READER is in, not from a scan that may be days old.
-    Counting "days until the Fed meets" from a stale scan does not produce a
-    cautious answer, it produces a wrong one.
+    Unless the caller pinned a past session, the frame is the READER's, not the
+    scan's: counting "days until the Fed meets" from a scan that may be days
+    old does not produce a cautious answer, it produces a wrong one. And the
+    day count comes from the WALL CALENDAR, not from the next trading session
+    — otherwise every weekend and every evening reports one day too few, and
+    an event that is tomorrow reads as "today".
     """
     if session_date is None:
         return mcal.empty_market_calendar_context()
-    anchor = mcal.resolve_anchor_session(session_date, now=now, pinned=pinned)
-    if anchor is None:
+    # Four dates, resolved once. The query window is CALENDAR days, so it is
+    # bounded by the wall date; the visibility gate downstream is bounded by
+    # the session. Using one for both is the defect this replaced.
+    frame = mcal.resolve_calendar_frame(session_date, now=now, pinned=pinned)
+    if frame["as_of_session"] is None or frame["as_of_date"] is None:
         return mcal.empty_market_calendar_context()
-    lower = anchor - timedelta(days=_MACRO_QUERY_BACK_DAYS)
-    upper = anchor + timedelta(days=_MACRO_QUERY_FORWARD_DAYS)
+    lower = frame["as_of_date"] - timedelta(days=_MACRO_QUERY_BACK_DAYS)
+    upper = frame["as_of_date"] + timedelta(days=_MACRO_QUERY_FORWARD_DAYS)
     rows = [dict(r) for r in await db.fetch(MACRO_EVENTS_SQL, lower, upper)]
     state = await _fetch_catalyst_freshness(db)
     per_source = {
@@ -505,7 +509,12 @@ async def _load_market_calendar(
         for source in mcal.MACRO_SOURCES
     }
     return mcal.build_market_calendar_context(
-        rows, as_of_session=anchor, scan_session=session_date,
+        rows,
+        as_of_session=frame["as_of_session"],
+        as_of_date=frame["as_of_date"],
+        last_completed_session=frame["last_completed_session"],
+        next_session=frame["next_session"],
+        scan_session=session_date,
         freshness=mcal.combine_freshness(per_source), sources=source_rows)
 
 

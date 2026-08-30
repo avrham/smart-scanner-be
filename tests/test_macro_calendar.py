@@ -85,9 +85,12 @@ class TestPointInTime:
     def test_selection_applies_the_gate(self):
         rows = [event(scheduled=date(2026, 9, 16),
                       observed=datetime(2026, 9, 2, tzinfo=UTC))]
-        assert mc.select_visible_events(rows, as_of_session=date(2026, 9, 1)) == []
-        assert len(mc.select_visible_events(rows,
-                                            as_of_session=date(2026, 9, 3))) == 1
+        assert mc.select_visible_events(
+            rows, as_of_session=date(2026, 9, 1),
+            as_of_date=date(2026, 9, 1)) == []
+        assert len(mc.select_visible_events(
+            rows, as_of_session=date(2026, 9, 3),
+            as_of_date=date(2026, 9, 3))) == 1
 
     def test_missing_observation_is_never_visible(self):
         assert not mc.is_visible_to_session(None, SESSION)
@@ -99,14 +102,14 @@ class TestContext:
                 event(mc.EVENT_PCE, scheduled=date(2026, 9, 1),
                       source="bea", title="Personal Income and Outlays")]
         ctx = mc.build_market_calendar_context(
-            rows, as_of_session=SESSION, freshness=FRESH)
+            rows, as_of_session=SESSION, as_of_date=SESSION, freshness=FRESH)
         assert ctx["headline"]["event_type"] == mc.EVENT_PCE
         assert ctx["proximity"] == mc.PROXIMITY_TOMORROW
         assert len(ctx["upcoming"]) == 2
 
     def test_block_is_market_wide_and_says_so(self):
         ctx = mc.build_market_calendar_context(
-            [event(scheduled=date(2026, 9, 1))], as_of_session=SESSION,
+            [event(scheduled=date(2026, 9, 1))], as_of_session=SESSION, as_of_date=SESSION,
             freshness=FRESH)
         assert ctx["applies_to"] == "market_wide"
         assert ctx["contract_version"] == mc.MARKET_CALENDAR_CONTRACT_VERSION
@@ -115,7 +118,7 @@ class TestContext:
         ctx = mc.build_market_calendar_context(
             [event(scheduled=date(2026, 9, 1)),
              event(mc.EVENT_GDP, scheduled=date(2026, 8, 29), source="bea")],
-            as_of_session=SESSION, freshness=FRESH)
+            as_of_session=SESSION, as_of_date=SESSION, freshness=FRESH)
         banned = {"score", "direction", "risk", "impact", "bullish", "bearish",
                   "confidence", "rank", "weight"}
         def walk(node):
@@ -131,20 +134,20 @@ class TestContext:
     def test_recently_released_only_when_nothing_is_near(self):
         rows = [event(mc.EVENT_GDP, scheduled=date(2026, 8, 29), source="bea")]
         ctx = mc.build_market_calendar_context(
-            rows, as_of_session=SESSION, freshness=FRESH)
+            rows, as_of_session=SESSION, as_of_date=SESSION, freshness=FRESH)
         assert ctx["proximity"] == mc.PROXIMITY_RECENTLY_RELEASED
         assert ctx["recent"] and not ctx["upcoming"]
 
     def test_a_distant_event_does_not_headline_as_nearby(self):
         ctx = mc.build_market_calendar_context(
-            [event(scheduled=date(2026, 9, 16))], as_of_session=SESSION,
+            [event(scheduled=date(2026, 9, 16))], as_of_session=SESSION, as_of_date=SESSION,
             freshness=FRESH)
         assert ctx["proximity"] == mc.PROXIMITY_NONE_NEARBY
         assert ctx["upcoming"]           # still available, just not a banner
 
     def test_empty_calendar_is_none_nearby_not_unavailable(self):
         ctx = mc.build_market_calendar_context(
-            [], as_of_session=SESSION, freshness=FRESH)
+            [], as_of_session=SESSION, as_of_date=SESSION, freshness=FRESH)
         assert ctx["status"] == mc.AVAIL_AVAILABLE
         assert ctx["proximity"] == mc.PROXIMITY_NONE_NEARBY
         assert ctx["headline"] is None
@@ -156,7 +159,7 @@ class TestUnavailable:
                  "reason": mc.REASON_SOURCE_UNAVAILABLE, "age_hours": None,
                  "per_source": {}}
         ctx = mc.build_market_calendar_context(
-            [event(scheduled=date(2026, 9, 1))], as_of_session=SESSION,
+            [event(scheduled=date(2026, 9, 1))], as_of_session=SESSION, as_of_date=SESSION,
             freshness=stale)
         assert ctx["status"] == mc.AVAIL_UNAVAILABLE
         assert ctx["upcoming"] == [] and ctx["headline"] is None
@@ -250,15 +253,15 @@ class TestDisplayAnchor:
     def test_the_block_reports_both_sessions_when_they_differ(self):
         ctx = mc.build_market_calendar_context(
             [event(scheduled=date(2026, 9, 1))],
-            as_of_session=date(2026, 8, 31), scan_session=date(2026, 8, 25),
-            freshness=FRESH)
+            as_of_session=date(2026, 8, 31), as_of_date=date(2026, 8, 31),
+            scan_session=date(2026, 8, 25), freshness=FRESH)
         assert ctx["as_of_session"] == "2026-08-31"
         assert ctx["scan_session"] == "2026-08-25"
         assert ctx["anchor_is_scan_session"] is False
 
     def test_the_flag_is_true_when_they_agree(self):
         ctx = mc.build_market_calendar_context(
-            [], as_of_session=date(2026, 8, 31),
+            [], as_of_session=date(2026, 8, 31), as_of_date=date(2026, 8, 31),
             scan_session=date(2026, 8, 31), freshness=FRESH)
         assert ctx["anchor_is_scan_session"] is True
 
@@ -268,6 +271,6 @@ class TestDisplayAnchor:
         late = event(scheduled=date(2026, 9, 16),
                      observed=datetime(2026, 9, 2, tzinfo=UTC))
         ctx = mc.build_market_calendar_context(
-            [late], as_of_session=date(2026, 8, 31),
+            [late], as_of_session=date(2026, 8, 31), as_of_date=date(2026, 8, 31),
             scan_session=date(2026, 8, 25), freshness=FRESH)
         assert ctx["upcoming"] == []

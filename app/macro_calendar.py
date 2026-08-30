@@ -292,16 +292,21 @@ def _as_date(value: Any) -> Optional[date]:
 
 
 def build_event_item(row: Dict[str, Any], *,
-                     as_of: Optional[date]) -> Dict[str, Any]:
+                     as_of_date: Optional[date]) -> Dict[str, Any]:
     """One stored row as the product sees it.
 
     Carries the source's own title and the exact page it came from, so any
     claim on the screen can be checked against the publisher.
+
+    `as_of_date` is the WALL-CALENDAR date, never a session. Passing a session
+    here is what produced "today" for an event that was tomorrow: on a Sunday
+    the next session is Monday, and Monday minus Monday is zero.
     """
     scheduled = _as_date(row.get("scheduled_date"))
-    days_until = (scheduled - as_of).days if (scheduled and as_of) else None
+    days_until = ((scheduled - as_of_date).days
+                  if (scheduled and as_of_date) else None)
     status = event_status(scheduled, listing=row.get("source_listing"),
-                          as_of=as_of)
+                          as_of=as_of_date)
     local_time = row.get("scheduled_time_local")
     return {
         "event_type": row.get("event_type"),
@@ -341,8 +346,16 @@ def _sort_key(item: Dict[str, Any]) -> Any:
 
 
 def select_visible_events(rows: Sequence[Dict[str, Any]], *,
-                          as_of_session: date) -> List[Dict[str, Any]]:
-    """Rows this session was allowed to know about, inside the display window."""
+                          as_of_session: date,
+                          as_of_date: date) -> List[Dict[str, Any]]:
+    """Rows this session was allowed to know about, inside the display window.
+
+    Two different dates doing two different jobs, deliberately: the GATE is the
+    session (could this session have known?) and the WINDOW is the calendar
+    (is it near, in days?). `WINDOW_FORWARD_DAYS` is declared in calendar days,
+    so measuring it against a session would quietly shift the window by a day
+    every weekend.
+    """
     out: List[Dict[str, Any]] = []
     for row in rows:
         if not is_visible_to_session(row.get("first_observed_at"),
@@ -351,7 +364,7 @@ def select_visible_events(rows: Sequence[Dict[str, Any]], *,
         scheduled = _as_date(row.get("scheduled_date"))
         if scheduled is None:
             continue
-        delta = (scheduled - as_of_session).days
+        delta = (scheduled - as_of_date).days
         if delta > WINDOW_FORWARD_DAYS or delta < -WINDOW_BACK_DAYS:
             continue
         out.append(row)
@@ -366,6 +379,78 @@ def live_anchor_session(now: datetime) -> Optional[date]:
     """The session a reader looking at the screen RIGHT NOW is standing in."""
     from app.news import effective_session as news_effective_session
     return news_effective_session(now)
+
+
+#: The four dates this block needs, and the four different questions they
+#: answer. They are computed together and reported separately because the last
+#: version of this code used ONE field for two of them and shipped a wrong
+#: number: on a Sunday the anchor was the next TRADING SESSION, and counting
+#: calendar days from it told a reader that tomorrow's event was "today".
+#:
+#:   as_of_date              what day is it (wall calendar, ET) -> PROXIMITY
+#:   as_of_session           which session may see this        -> VISIBILITY
+#:   last_completed_session  the last fully-closed session      -> what we know
+#:   next_session            the next session to trade          -> what is next
+#:
+#: Only `as_of_date` may drive day arithmetic, and only `as_of_session` may
+#: drive the point-in-time gate. Nothing else may substitute for either.
+CALENDAR_FRAME_KEYS = ("as_of_date", "as_of_session",
+                       "last_completed_session", "next_session")
+
+
+def next_trading_session(after: date, *, cap_days: int = 10) -> Optional[date]:
+    """The first trading session STRICTLY after `after`."""
+    from app.prospective_session import is_trading_day
+    cursor = after
+    for _ in range(cap_days):
+        cursor = cursor + timedelta(days=1)
+        if is_trading_day(cursor):
+            return cursor
+    return None
+
+
+def resolve_calendar_frame(scan_session: Optional[date], *, now: datetime,
+                           pinned: bool) -> Dict[str, Optional[date]]:
+    """All four dates, resolved once, from one clock.
+
+    LIVE view: the reader is standing in real time, so `as_of_date` is the ET
+    wall-calendar date — the only thing "tomorrow" can honestly be measured
+    from — while `as_of_session` remains the session whose close gates
+    visibility.
+
+    PINNED view: the caller asked for a specific past session, so all four
+    collapse onto that session's own frame and the answer is deterministic
+    forever. `last_completed_session` falls back to the live one if somebody
+    pins a session that has not closed yet, because claiming a session is
+    complete before its close would be the same class of error this whole
+    function exists to remove.
+    """
+    from app.prospective_session import (is_trading_day,
+                                         resolve_latest_completed_session,
+                                         session_cutoff_utc)
+
+    if pinned and scan_session is not None:
+        completed = (scan_session
+                     if (is_trading_day(scan_session)
+                         and session_cutoff_utc(scan_session) <= _aware(now))
+                     else resolve_latest_completed_session(now))
+        return {"as_of_date": scan_session,
+                "as_of_session": scan_session,
+                "last_completed_session": completed,
+                "next_session": next_trading_session(completed)}
+
+    anchor = resolve_anchor_session(scan_session, now=now, pinned=False)
+    completed = resolve_latest_completed_session(now)
+    return {"as_of_date": _market_date(now),
+            "as_of_session": anchor,
+            "last_completed_session": completed,
+            "next_session": next_trading_session(completed)}
+
+
+def _market_date(now: datetime) -> date:
+    """The ET wall-calendar date. Not a session — a day on a calendar."""
+    from zoneinfo import ZoneInfo
+    return _aware(now).astimezone(ZoneInfo("America/New_York")).date()
 
 
 def resolve_anchor_session(scan_session: Optional[date], *, now: datetime,
@@ -396,9 +481,12 @@ def build_market_calendar_context(
     rows: Sequence[Dict[str, Any]],
     *,
     as_of_session: Optional[date],
+    as_of_date: Optional[date],
     freshness: Dict[str, Any],
     sources: Sequence[Dict[str, Any]] = (),
     scan_session: Optional[date] = None,
+    last_completed_session: Optional[date] = None,
+    next_session: Optional[date] = None,
     limit: int = MAX_ITEMS,
 ) -> Dict[str, Any]:
     """The market-wide calendar block.
@@ -407,17 +495,35 @@ def build_market_calendar_context(
     is served on the symbol screen, and a reader must never be able to take
     "FOMC tomorrow" on a symbol page as a statement about that company.
 
-    `as_of_session` is the DISPLAY anchor (see `resolve_anchor_session`) and
-    `scan_session` is the session the scanner result belongs to. Both are
-    reported: when they differ, the reader is looking at a current calendar
-    beside an older scan, and the screen has to be able to say so.
+    FOUR DATES, FOUR QUESTIONS, FOUR FIELDS — see `CALENDAR_FRAME_KEYS`. This
+    block previously reported one anchor and used it for both proximity and
+    visibility, which shipped "today" for an event that was tomorrow every
+    time the market was shut. Nothing here may collapse them again:
+
+        as_of_date              drives days_until and every word the UI says
+        as_of_session           drives the point-in-time visibility gate ONLY
+        last_completed_session  the last session that actually closed
+        next_session            the next session that will trade
+
+    `scan_session` is reported alongside because when it differs from the
+    anchor the reader is looking at a current calendar beside an older scan.
     """
     base: Dict[str, Any] = {
         "contract_version": MARKET_CALENDAR_CONTRACT_VERSION,
         "applies_to": "market_wide",
         "status": freshness.get("status"),
         "reason": freshness.get("reason"),
+        # THE WALL CALENDAR. Every day count on the screen comes from this and
+        # from nothing else.
+        "as_of_date": as_of_date.isoformat() if as_of_date else None,
+        # THE VISIBILITY SESSION. Gates what this view was allowed to know.
+        # It is NOT a calendar date and must never be subtracted from one.
         "as_of_session": as_of_session.isoformat() if as_of_session else None,
+        # Stated rather than implied, so a reader on a Sunday can see that the
+        # tape they are looking at closed on Friday and reopens on Monday.
+        "last_completed_session": (last_completed_session.isoformat()
+                                   if last_completed_session else None),
+        "next_session": next_session.isoformat() if next_session else None,
         "scan_session": scan_session.isoformat() if scan_session else None,
         # False means the calendar is counted from a LATER day than the scan.
         # Without it a reader cannot tell that "FOMC tomorrow" is tomorrow for
@@ -442,13 +548,15 @@ def build_market_calendar_context(
         ],
     }
 
-    if freshness.get("status") == AVAIL_UNAVAILABLE or as_of_session is None:
+    if (freshness.get("status") == AVAIL_UNAVAILABLE
+            or as_of_session is None or as_of_date is None):
         base["status"] = AVAIL_UNAVAILABLE
         base["reason"] = base.get("reason") or REASON_NEVER_REFRESHED
         return base
 
-    items = [build_event_item(r, as_of=as_of_session)
-             for r in select_visible_events(rows, as_of_session=as_of_session)]
+    items = [build_event_item(r, as_of_date=as_of_date)
+             for r in select_visible_events(rows, as_of_session=as_of_session,
+                                            as_of_date=as_of_date)]
     items.sort(key=_sort_key)
 
     upcoming = [i for i in items if (i["days_until"] or 0) >= 0][:limit]
@@ -477,7 +585,7 @@ def empty_market_calendar_context(*, reason: str = REASON_NEVER_REFRESHED,
                                   ) -> Dict[str, Any]:
     """A fully-unavailable block, for when the calendar load fails entirely."""
     return build_market_calendar_context(
-        [], as_of_session=None,
+        [], as_of_session=None, as_of_date=None,
         freshness={"status": AVAIL_UNAVAILABLE, "reason": reason,
                    "last_refresh_at": None, "last_success_at": None,
                    "age_hours": None, "detail": None, "per_source": {}})
@@ -502,6 +610,7 @@ __all__ = [
     "REASON_NEVER_REFRESHED", "REASON_STALE_REFRESH",
     "FRESHNESS_MAX_AGE_HOURS", "evaluate_freshness", "combine_freshness",
     "is_visible_to_session", "live_anchor_session", "resolve_anchor_session",
+    "resolve_calendar_frame", "next_trading_session", "CALENDAR_FRAME_KEYS",
     "build_event_item", "select_visible_events",
     "build_market_calendar_context", "empty_market_calendar_context",
 ]

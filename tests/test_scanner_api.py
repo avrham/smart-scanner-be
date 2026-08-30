@@ -1703,6 +1703,41 @@ class TestMarketCalendarBlock:
         assert block["anchor_is_scan_session"] == (
             block["as_of_session"] == block["scan_session"])
 
+    def test_the_four_dates_are_four_separate_fields(self, client, monkeypatch):
+        body = self._get(client, monkeypatch, pinned=False,
+                         macro_rows=[_macro_row(scheduled=date(2099, 1, 5))],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        block = body["market_calendar_context"]
+        # None of these may be derived from another by the reader.
+        for field in ("as_of_date", "as_of_session", "last_completed_session",
+                      "next_session", "scan_session"):
+            assert field in block, field
+        assert block["next_session"] > block["last_completed_session"]
+        # The wall date is a DAY; the session is a SESSION. On any non-session
+        # moment they differ, and the day count must come from the day.
+        assert block["as_of_date"] <= block["next_session"]
+
+    def test_day_counts_come_from_the_wall_date_not_the_session(
+            self, client, monkeypatch):
+        # Two passes so the test is not pinned to a calendar: ask the API what
+        # day it thinks it is, then place an event two days later and require
+        # it to say two. If day counts ever came off `as_of_session` again,
+        # this reads 1 on any evening and any weekend.
+        from datetime import date as _d
+        first = self._get(client, monkeypatch, pinned=False,
+                          macro_rows=[], catalyst_state=_HEALTHY_MACRO_STATE,
+                          source_rows=_REGISTRY_ROWS)
+        wall = _d.fromisoformat(first["market_calendar_context"]["as_of_date"])
+        target = wall + timedelta(days=2)
+        body = self._get(client, monkeypatch, pinned=False,
+                         macro_rows=[_macro_row(scheduled=target)],
+                         catalyst_state=_HEALTHY_MACRO_STATE,
+                         source_rows=_REGISTRY_ROWS)
+        block = body["market_calendar_context"]
+        assert block["headline"]["days_until"] == 2
+        assert block["headline"]["proximity"] == mcal.PROXIMITY_WITHIN_3_DAYS
+
     def test_a_pinned_view_anchors_strictly_on_that_session(
             self, client, monkeypatch):
         body = self._get(client, monkeypatch, macro_rows=[_macro_row()],
@@ -1710,6 +1745,11 @@ class TestMarketCalendarBlock:
                          source_rows=_REGISTRY_ROWS)
         block = body["market_calendar_context"]
         assert block["as_of_session"] == "2026-08-25"
+        # A pinned historical view collapses the frame onto that session, so
+        # the answer is the same today and in a year.
+        assert block["as_of_date"] == "2026-08-25"
+        assert block["last_completed_session"] == "2026-08-25"
+        assert block["next_session"] == "2026-08-26"
         assert block["anchor_is_scan_session"] is True
 
     def test_no_scan_yet_reports_no_calendar_rather_than_a_broken_one(

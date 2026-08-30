@@ -178,6 +178,10 @@ python -m ops.analysis.refresh_macro_calendar   --refresh --report
 python -m ops.analysis.refresh_analyst_grades   --refresh --lookback-days 730
 python -m ops.analysis.refresh_analyst_grades   --report --days 30
 python -m ops.analysis.refresh_discovery_candidates --refresh --cross-reference
+# migration 025 backfill — prints the mapping first, writes nothing without --no-dry-run
+python -m ops.analysis.refresh_discovery_candidates \
+    --backfill-reference-sessions --dry-run
+python -m ops.analysis.refresh_discovery_candidates --backfill-reference-sessions
 python -m ops.analysis.wave2_descriptive --analyst --macro --discovery
 ```
 
@@ -206,6 +210,44 @@ a count:
 
 ## 7. Point-in-time
 
+### The four dates the macro block reports, and why they are four fields
+
+| Field | Question it answers | Used for |
+|---|---|---|
+| `as_of_date` | what day is it (ET wall calendar) | **every day count and every word** |
+| `as_of_session` | which session may see this | the point-in-time gate, and nothing else |
+| `last_completed_session` | what tape last closed | context |
+| `next_session` | what trades next | context |
+
+They were briefly **one** field. That field was a trading *session*, and the
+proximity vocabulary is declared in *calendar days* — so every weekend and
+every evening it reported one day too few, and an event that was tomorrow read
+as **"today"** (the next session on a Sunday is Monday, and Monday minus Monday
+is zero). Nothing may collapse them again; `tests/test_temporal_semantics.py`
+fails if anything does.
+
+A **pinned** historical view collapses all four onto that session's own frame,
+so the answer is identical today and in a year.
+
+### Discovery stores two dates, because it is answering two questions
+
+| Field | Question | Direction |
+|---|---|---|
+| `observed_at` | when did WE look | the fetch clock, the only one with authority |
+| `reference_session_date` | which market session do these numbers describe | **backwards** — a Sunday fetch describes Friday |
+| `session_date` | when could this first be ACTED upon | **forwards** — a Sunday fetch is actionable Monday |
+
+`reference_session_basis` is stored beside the date and its only value is
+`inferred_from_observation_time`, because **FMP's movers feeds carry no
+timestamp**. The session is our inference from our own clock against the US
+equity calendar, and the column says so rather than implying the provider
+declared it.
+
+    before 09:30 ET on a trading day  -> the latest COMPLETED session
+    09:30-16:00 ET on a trading day   -> that session, in progress
+    after 16:00 ET on a trading day   -> that session, just completed
+    weekend or market holiday         -> the latest COMPLETED session
+
 | Layer | Gate | Why |
 |---|---|---|
 | Macro events | `first_observed_at <= session close` | the schedule is public, but we only know what we actually read; a meeting added on Tuesday must not appear in Monday's context |
@@ -231,6 +273,25 @@ ANCHOR session's close.
 
 This was found by looking at the live staging response rather than by reading
 the code, which is the argument for having deployed it.
+
+**And the same live response found the next one.** The anchor was a trading
+session, so on a Sunday the calendar counted days from Monday: the FOMC meeting
+that is 17 calendar days away shipped as `days_until: 16`, and an event on the
+Monday itself would have rendered as "today". Migration 025 and the four-field
+frame above are the correction; see `tests/test_temporal_semantics.py` for the
+boundary cases (pre-open, mid-session, after close, weekend, market holiday).
+
+### Three concepts in the descriptive analysis, never collapsed
+
+    EVIDENCE PROVENANCE   observed_at + reference_session_date
+    ACTIONABILITY         session_date
+    OUTCOME ANCHOR        session_date, and only once that session has CLOSED
+
+The anchor is the actionable session and never the reference session, on
+purpose: anchoring a weekend snapshot on the Friday it describes would measure
+a move we only learned about on Sunday. `_completed_anchor` states the rule
+explicitly and `forward_returns` refuses a session with no bar, so an
+uncompleted session cannot become a `t0` by either route.
 
 ---
 

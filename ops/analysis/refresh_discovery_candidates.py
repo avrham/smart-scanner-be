@@ -3,6 +3,8 @@
     python -m ops.analysis.refresh_discovery_candidates --refresh
     python -m ops.analysis.refresh_discovery_candidates --report --days 10
     python -m ops.analysis.refresh_discovery_candidates --cross-reference
+    python -m ops.analysis.refresh_discovery_candidates \
+        --backfill-reference-sessions --dry-run
 
 WHAT QUESTION THIS ANSWERS
 --------------------------
@@ -89,7 +91,21 @@ async def run_report(days: int, limit: int) -> list:
 
 async def run_cross_reference(session: Optional[date]) -> dict:
     async with intel_connection() as conn:
-        return await ed.cross_reference_universe(conn, session_date=session)
+        return await ed.cross_reference_universe(
+            conn, reference_session_date=session)
+
+
+async def run_backfill(dry_run: bool) -> dict:
+    """Migration 025's backfill, using the ONE canonical trading calendar.
+
+    Deliberately not SQL inside the migration: the inference needs weekends,
+    the federal market holidays, Good Friday and the observed-day rules, and
+    that calendar exists once in this repository. A second copy in SQL could
+    drift, and a drifting calendar is exactly how a row gets labelled with a
+    session that never happened.
+    """
+    async with intel_connection() as conn:
+        return await ed.backfill_reference_sessions(conn, dry_run=dry_run)
 
 
 def main() -> None:
@@ -99,18 +115,48 @@ def main() -> None:
     parser.add_argument("--report", action="store_true",
                         help="symbols outside the frozen universe, by persistence")
     parser.add_argument("--cross-reference", action="store_true",
-                        help="one session, sorted against what we actually hold")
+                        help="one market session, sorted against what we hold")
     parser.add_argument("--session", type=date.fromisoformat, default=None,
-                        help="ISO session date for --cross-reference "
-                             "(default: the latest stored)")
+                        help="ISO REFERENCE session date for --cross-reference "
+                             "(default: the latest market session stored)")
+    parser.add_argument("--backfill-reference-sessions", action="store_true",
+                        help="migration 025: fill reference_session_date from "
+                             "observed_at and the trading calendar")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --backfill-reference-sessions: print the "
+                             "proposed mapping and write nothing")
     parser.add_argument("--days", type=int, default=10,
                         help="report lookback in calendar days (default 10)")
     parser.add_argument("--limit", type=int, default=ed.DEFAULT_LIST_LIMIT,
                         help=f"ranks to keep per list (default {ed.DEFAULT_LIST_LIMIT})")
     args = parser.parse_args()
 
-    if not (args.refresh or args.report or args.cross_reference):
-        parser.error("choose --refresh, --report, --cross-reference, or several")
+    if not (args.refresh or args.report or args.cross_reference
+            or args.backfill_reference_sessions):
+        parser.error("choose --refresh, --report, --cross-reference, "
+                     "--backfill-reference-sessions, or several")
+
+    if args.backfill_reference_sessions:
+        summary = asyncio.run(run_backfill(args.dry_run))
+        print("\nMigration 025 backfill "
+              f"({'DRY RUN — nothing written' if summary['dry_run'] else 'APPLIED'}):\n")
+        print(f"  rows needing a reference session : {summary['candidates']}")
+        print(f"  rows with an UNSAFE inference    : {summary['unsafe']}")
+        print(f"  rows updated                     : {summary['updated']}")
+        if summary["distinct_mappings"]:
+            print("\n  Proposed mapping — one line per distinct fetch:\n")
+            print(f"    {'OBSERVED_AT (UTC)':<34} {'REFERENCE (describes)':<22} "
+                  f"ACTIONABLE (session_date)")
+            for observed, reference, actionable in summary["distinct_mappings"]:
+                print(f"    {observed:<34} {reference:<22} {actionable}")
+        if summary["unsafe"]:
+            print("\n  REFUSED: an inference landed after its own actionable "
+                  "session. Nothing was written — a partial backfill is worse "
+                  "than none.")
+        print("\n  Inference is from observed_at + the US equity trading "
+              "calendar. It is NOT a provider timestamp: FMP's movers feeds "
+              "carry none, which is why every row also stores the basis "
+              "'inferred_from_observation_time'.")
 
     if args.refresh:
         summary = asyncio.run(run_refresh(args.limit))
@@ -128,17 +174,21 @@ def main() -> None:
             lists = ",".join(row["lists"])
             print(f"  {row['symbol']:<10} {row['sessions_seen']:>8} "
                   f"{row['appearances']:>5} {row['best_rank']:>5}  {lists}")
+        print("\nSessions counted are MARKET sessions the symbol appeared in, "
+              "not sessions it became actionable in.")
         print("\nPersistence first, not the size of any single move: a stock "
               "that gapped once is noise, one in the cohort four sessions "
               "running is a question. Nothing here enters the frozen universe.")
 
     if args.cross_reference:
         report = asyncio.run(run_cross_reference(args.session))
-        if report["session_date"] is None:
+        if report["reference_session_date"] is None:
             print("\nNo discovery candidates stored yet.")
             return
-        print(f"\nDiscovery cross-reference for session "
-              f"{report['session_date']} — {report['discovered']} symbols:\n")
+        print(f"\nDiscovery cross-reference — market session "
+              f"{report['reference_session_date']} "
+              f"(first actionable {report['first_actionable_session']}) — "
+              f"{report['discovered']} symbols:\n")
         print(f"  inside the frozen 25 .............. "
               f"{len(report['inside_universe'])}")
         print(f"  OUTSIDE the frozen 25 ............. "
@@ -167,6 +217,9 @@ def main() -> None:
         print("\nThis is the blind spot, stated: every symbol in the OUTSIDE "
               "list is one the scanner structurally cannot see. None of them "
               "is added to any universe by this or any other script.")
+        print("The market session above is the tape these numbers came from; "
+              "the actionable session is the earliest anybody could have done "
+              "something about it. They are different dates on purpose.")
 
 
 if __name__ == "__main__":

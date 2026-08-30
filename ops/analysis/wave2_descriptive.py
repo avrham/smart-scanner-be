@@ -25,13 +25,32 @@ to anything. Specifically, and on purpose:
   * NO strategy mutation. No verdict, threshold, universe or pattern flag is
     read or written by this script.
 
-POINT IN TIME
--------------
-Every cohort is anchored on the session the event became ACTIONABLE, never on
-the session it happened. For analyst grades that is `session_date`, which the
-ingestion already set to the first session strictly after the event date,
-because the provider publishes no clock. The t0 close is the anchor session's
-close, so a return at 1D is measured from a price that was genuinely available.
+POINT IN TIME — THREE CONCEPTS, NAMED, NEVER COLLAPSED
+-------------------------------------------------------
+    EVIDENCE PROVENANCE   `observed_at`, plus `reference_session_date` for
+                          discovery: when we looked, and which market session
+                          the numbers we saw came from. This is what the row
+                          IS. It is never an anchor.
+
+    ACTIONABILITY         `session_date`: the first session anybody could have
+                          acted on the observation. Forward-rolling — a Sunday
+                          fetch is actionable on Monday, a grade dated Tuesday
+                          is actionable Wednesday.
+
+    OUTCOME ANCHOR        `session_date`, and only once that session has
+                          actually closed.
+
+The anchor is the ACTIONABLE session, never the reference session, and that
+choice costs us a day on purpose. Anchoring a weekend discovery snapshot on the
+Friday it describes would measure a move we only learned about on Sunday: that
+is lookahead, and it is the single most tempting mistake this file could make.
+Anchoring on Monday forfeits Friday's move and can only ever understate.
+
+`forward_returns` refuses to measure at all unless the anchor session is
+present in `daily_bars`, and a session that has not closed has no bar — so an
+uncompleted session cannot become a t0 by construction. `_completed_anchor`
+states the same rule explicitly rather than relying on that side effect, so
+the guarantee survives someone changing how bars are loaded.
 
 COVERAGE IS THE HONEST HALF OF THE ANSWER
 -----------------------------------------
@@ -50,6 +69,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import app.analyst_events as ae
 import app.macro_calendar as mc
+from app.prospective_session import resolve_latest_completed_session
 from app.reference_market import PRIMARY_BENCHMARK
 from ops.analysis.intel_connection import intel_connection
 
@@ -81,12 +101,16 @@ WHERE scheduled_date >= $1
 ORDER BY scheduled_date
 """
 
+#: Grouped by BOTH dates. The reference session is what the appearance was;
+#: the actionable session is what we may measure from. A cohort keyed on one
+#: of them alone would silently answer the other question.
 DISCOVERY_COHORT_SQL = """
-SELECT symbol, session_date, array_agg(DISTINCT list_kind ORDER BY list_kind) AS reasons
+SELECT symbol, session_date, reference_session_date,
+       array_agg(DISTINCT list_kind ORDER BY list_kind) AS reasons
 FROM public.external_discovery_candidates
 WHERE session_date >= $1
-GROUP BY symbol, session_date
-ORDER BY session_date
+GROUP BY symbol, session_date, reference_session_date
+ORDER BY reference_session_date, session_date
 """
 
 
@@ -100,6 +124,19 @@ async def _load_series(conn, symbols: Sequence[str],
         series.setdefault(row["symbol"], []).append(
             (row["trading_date"], float(row["close"])))
     return series
+
+
+def _completed_anchor(anchor: Optional[date], *,
+                      latest_completed: date) -> Optional[date]:
+    """The anchor, or None if that session has not closed yet.
+
+    Stated as its own rule rather than left to `forward_returns` finding no
+    bar. Both guards agree today; this one keeps agreeing if the bar loader
+    ever changes, and it is the guarantee somebody will want to read.
+    """
+    if anchor is None or anchor > latest_completed:
+        return None
+    return anchor
 
 
 def forward_returns(series: List[Tuple[date, float]], anchor: date,
@@ -174,6 +211,8 @@ def _print_table(title: str, groups: Dict[str, Dict[str, Any]],
 
 
 async def run_analyst(days: int) -> None:
+    latest_completed = resolve_latest_completed_session(
+        datetime.now(timezone.utc))
     async with intel_connection() as conn:
         since = datetime.now(timezone.utc).date() - timedelta(days=days)
         rows = [dict(r) for r in await conn.fetch(
@@ -183,8 +222,10 @@ async def run_analyst(days: int) -> None:
     groups: Dict[str, List[Dict[int, Optional[float]]]] = {}
     measured = unmeasured = 0
     for row in rows:
-        returns = forward_returns(series.get(row["symbol"], []),
-                                  row["session_date"])
+        anchor = _completed_anchor(row["session_date"],
+                                   latest_completed=latest_completed)
+        returns = (forward_returns(series.get(row["symbol"], []), anchor)
+                   if anchor else None)
         if returns is None:
             unmeasured += 1
             continue
@@ -198,6 +239,8 @@ async def run_analyst(days: int) -> None:
 
 
 async def run_macro(days: int) -> None:
+    latest_completed = resolve_latest_completed_session(
+        datetime.now(timezone.utc))
     async with intel_connection() as conn:
         today = datetime.now(timezone.utc).date()
         rows = [dict(r) for r in await conn.fetch(
@@ -208,7 +251,9 @@ async def run_macro(days: int) -> None:
     groups: Dict[str, List[Dict[int, Optional[float]]]] = {}
     measured = unmeasured = 0
     for row in rows:
-        returns = forward_returns(bars, row["scheduled_date"])
+        anchor = _completed_anchor(row["scheduled_date"],
+                                   latest_completed=latest_completed)
+        returns = forward_returns(bars, anchor) if anchor else None
         if returns is None:
             # A scheduled date that is not a trading day, or one before our
             # benchmark history begins. Counted, never nudged to a neighbour.
@@ -227,6 +272,8 @@ async def run_macro(days: int) -> None:
 
 
 async def run_discovery(days: int) -> None:
+    latest_completed = resolve_latest_completed_session(
+        datetime.now(timezone.utc))
     async with intel_connection() as conn:
         since = datetime.now(timezone.utc).date() - timedelta(days=days)
         rows = [dict(r) for r in await conn.fetch(DISCOVERY_COHORT_SQL, since)]
@@ -235,8 +282,11 @@ async def run_discovery(days: int) -> None:
     groups: Dict[str, List[Dict[int, Optional[float]]]] = {}
     measured = unmeasured = 0
     for row in rows:
-        returns = forward_returns(series.get(row["symbol"], []),
-                                  row["session_date"])
+        # ACTIONABLE session, never the reference session it describes.
+        anchor = _completed_anchor(row["session_date"],
+                                   latest_completed=latest_completed)
+        returns = (forward_returns(series.get(row["symbol"], []), anchor)
+                   if anchor else None)
         if returns is None:
             unmeasured += 1
             continue
@@ -247,6 +297,9 @@ async def run_discovery(days: int) -> None:
         f"Discovered movers, forward behaviour (last {days} days)",
         {k: summarise(v) for k, v in sorted(groups.items())},
         measured, unmeasured)
+    print("  Anchored on the ACTIONABLE session, not the market session the "
+          "snapshot describes — anchoring on the latter would measure a move "
+          "we only learned about afterwards.")
     print("  The unmeasurable count is the real finding here: `daily_bars` "
           "holds the frozen 25 and the reference market, so a symbol the "
           "market noticed and we do not hold cannot be studied at all.")
