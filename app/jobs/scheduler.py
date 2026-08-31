@@ -192,11 +192,18 @@ def _schedule_is_ownable(schedule: Dict[str, Any]) -> bool:
     having to carry a list of the schedules it must ignore.
     """
     owner = (_template(schedule).get("scheduler_owner") or "").strip()
-    if not owner:
-        return True
-    mine = ((settings.JOB_SCHEDULER_OWNER or "").strip()
-            or (getattr(settings, "JOB_WORKER_TYPE", "") or "").strip())
-    return owner == mine
+    mine = (settings.JOB_SCHEDULER_OWNER or "").strip()
+    if mine:
+        # A SCOPED leader. Declaring an owner identity means "I materialise my
+        # own schedules and nothing else". Without this the research worker
+        # would also try to materialise the canonical daily pipeline, whose
+        # queue its role cannot write — a warning every tick, forever, and an
+        # occurrence nobody advances. A leader must never be able to take work
+        # it could not carry out.
+        return owner == mine
+    # The GENERAL leader: everything that has not been claimed by name. This is
+    # the pre-existing behaviour for every schedule that predates ownership.
+    return not owner
 
 
 async def _tick_as_leader(conn: asyncpg.Connection, *, worker_id: str,

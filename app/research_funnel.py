@@ -427,13 +427,19 @@ FROM public.research_symbols
 
 
 async def load_funnel(conn, *, provider_calls_used: int = 0,
-                      provider_calls_avoided: int = 0) -> Dict[str, Any]:
+                      provider_calls_avoided: Optional[int] = None,
+                      ) -> Dict[str, Any]:
     """The whole research pool, partitioned. One query, one pass, no FILTERs.
 
     Reading the rows and partitioning in code rather than writing nine
     `count(*) FILTER (...)` expressions is the point: SQL filters cannot be
     proven disjoint, and a function that returns one string per row is disjoint
     by construction.
+
+    `provider_calls_avoided` defaults to None — NOT MEASURED — because a
+    read-only dump of the pool has not observed a run's provider cost. A zero
+    default made a standalone `--summary` report a conservation violation
+    against its own invented measurement.
     """
     rows = [dict(r) for r in await conn.fetch(FUNNEL_ROW_SQL)]
     return summarise(rows, provider_calls_used=provider_calls_used,

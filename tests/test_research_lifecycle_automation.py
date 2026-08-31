@@ -154,6 +154,20 @@ class TestFunnelConservation:
         violated = {v["invariant"] for v in summary["conservation"]["violations"]}
         assert "avoided_calls_equal_rejections" in violated
 
+    def test_a_read_only_dump_does_not_invent_a_provider_measurement(self):
+        # Regression, found live: `--summary` reported a conservation VIOLATION
+        # because it defaulted avoided-calls to 0 and then compared that zero
+        # to 36 real rejections. Not measuring is not measuring zero.
+        import inspect
+        sig = inspect.signature(rf.load_funnel)
+        assert sig.parameters["provider_calls_avoided"].default is None
+        summary = rf.summarise(
+            [_row("R", admission=ra.ADMISSION_REJECTED)])
+        assert summary["provider"]["calls_avoided"] is None
+        assert summary["conservation"]["ok"]
+        names = {c["invariant"] for c in summary["conservation"]["checks"]}
+        assert "avoided_calls_equal_rejections" not in names
+
     def test_conservation_error_is_not_swallowed_by_a_broad_except(self):
         # It subclasses AssertionError precisely so an `except Exception` that
         # was written to absorb provider failures cannot hide it.
@@ -593,6 +607,21 @@ class TestScheduleOwnership:
         monkeypatch.setattr(settings, "JOB_SCHEDULER_OWNER",
                             "research_lifecycle", raising=False)
         assert _schedule_is_ownable(owned)
+
+    def test_a_scoped_leader_refuses_work_it_could_not_carry_out(self, monkeypatch):
+        # A leader that declares an owner identity takes ONLY its own
+        # schedules. Otherwise the research worker would also try to
+        # materialise the canonical daily pipeline, whose queue its role cannot
+        # write — a warning every tick and an occurrence nobody advances.
+        from app.config import settings
+        from app.jobs.scheduler import _schedule_is_ownable
+        monkeypatch.setattr(settings, "JOB_SCHEDULER_OWNER",
+                            "research_lifecycle", raising=False)
+        assert not _schedule_is_ownable({"payload_template": {}})
+        assert not _schedule_is_ownable(
+            {"payload_template": {"stages": ["catalyst_refresh.v1"]}})
+        assert _schedule_is_ownable(
+            {"payload_template": {"scheduler_owner": "research_lifecycle"}})
 
     def test_skipping_does_not_consume_the_occurrence(self):
         # A leader that is not the owner must leave next_run_at alone, or the
