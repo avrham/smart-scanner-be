@@ -71,7 +71,10 @@ class TestNoDecisionModuleKnowsAboutCatalysts:
             reached = {m for m in imported_names(APP / name)
                        if m.startswith("app.")}
             assert reached <= {"app.catalyst", "app.prospective_session",
-                               "app.workers.massive_client"}, \
+                               "app.workers.massive_client",
+                               # Pure cohort vocabulary (028): constants and two
+                               # predicates, no DB, no strategy, no decision code.
+                               "app.source_scope"}, \
                 f"{name} imports decision code: {sorted(reached)}"
 
 

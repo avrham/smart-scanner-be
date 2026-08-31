@@ -1,0 +1,103 @@
+# fly.research-lifecycle.toml — smart-scanner-be-research-lifecycle-staging
+#
+# DEDICATED NON-HTTP worker for the STAGING research lifecycle. Runs
+# `python -m app.jobs.worker` continuously (NO http_service / NO TCP service ->
+# no Fly Proxy, no autostart/autostop, nothing internet-facing).
+#
+# WHY ITS OWN APP AND NOT A QUEUE ON AN EXISTING ONE
+# --------------------------------------------------
+# The lifecycle spends provider requests, writes research tables, and refreshes
+# RESEARCH-SCOPED catalyst freshness. No existing component should be able to do
+# all three: the pipeline-driver deliberately cannot see a research table, the
+# history-refresh worker exists to refresh the FROZEN universe's bars, and the
+# Product API holds no credential at all. So this app claims ONLY
+# queue_name='research_lifecycle' and connects as the least-privilege
+# smart_scanner_research_lifecycle role (JOB_WORKER_DATABASE_URL, a SECRET),
+# whose RLS confines its daily_bars writes to research symbols and its
+# catalyst_source_state writes to scope='research'.
+#
+# SCHEDULER LEADERSHIP IS SCOPED, NOT SHARED
+# ------------------------------------------
+# This app IS a scheduler leader, but only for the schedule it OWNS:
+# JOB_SCHEDULER_OWNER='research_lifecycle' matches
+# payload_template.scheduler_owner on SMART-SCANNER-RESEARCH-LIFECYCLE, and a
+# schedule without that key stays unowned and is left to the existing leader.
+# It uses its OWN advisory lock key ("RSCH" = 0x52534348) so it and the
+# pipeline-driver can both be leaders of their own domains concurrently rather
+# than one starving the other. Its DB policy also refuses an UPDATE to any
+# schedule it does not own, so scoped leadership is enforced twice.
+#
+# CREDENTIALS
+# -----------
+# MASSIVE_API_KEY (history warmup + news/earnings enrichment) and FMP_API_KEY
+# (movers discovery) are SECRETS set with `fly secrets set`. SEC_USER_AGENT is a
+# contact string, not a credential. No shared Supabase credential is installed
+# and nothing here is reachable from the internet.
+#
+# BOUNDED BY CONSTRUCTION
+# -----------------------
+# The provider budget lives in the schedule's payload_template and is CLAMPED in
+# app/jobs/research_lifecycle.py, so a mistyped template can lower the ceiling
+# and never raise it.
+#
+# Git SHA is supplied at deploy via --build-arg APP_GIT_SHA.
+
+app = 'smart-scanner-be-research-lifecycle-staging'
+primary_region = 'fra'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  APP_ENVIRONMENT = 'research-lifecycle-staging'
+  # Not an HTTP-mode app — every HTTP-mode flag is false.
+  PROSPECTIVE_CAMPAIGN_ONLY_MODE = 'false'
+  AUDIT_ONLY_MODE = 'false'
+  MAINTENANCE_ONLY_MODE = 'false'
+  HISTORY_WARMUP_ONLY_MODE = 'false'
+  # The legacy in-process HTTP scheduler stays off; the durable-queue scheduler
+  # below is a different, scoped mechanism.
+  ENABLE_SCHEDULER = 'false'
+
+  JOB_WORKER_ENABLED = 'true'
+  JOB_WORKER_TYPE = 'research_lifecycle'
+  JOB_WORKER_QUEUES = 'research_lifecycle'
+  # One. The lifecycle takes the machine-wide history-warmup advisory lock and
+  # the provider allows five requests a minute; a second concurrent run would
+  # spend its life colliding with the first.
+  JOB_WORKER_CONCURRENCY = '1'
+
+  # Scheduler leader for its OWN schedule only.
+  JOB_SCHEDULER_ENABLED = 'true'
+  JOB_SCHEDULER_OWNER = 'research_lifecycle'
+  # "RSCH" — distinct from the pipeline-driver's "JBSC" (0x4A425343) so the two
+  # leaders never contend for one lock and starve each other's domain.
+  JOB_SCHEDULER_ADVISORY_LOCK_KEY = '1381188424'
+
+  JOB_ALLOW_TEST_HANDLERS = 'false'
+  REQUIRE_WORKER_TOKEN = 'true'
+  # Non-HTTP worker: the token is never used for auth; present only to satisfy
+  # the required Settings field at boot. NOT a secret; carries no privilege.
+  WORKER_TOKEN = 'unused-placeholder-non-http-worker'
+  JOB_WORKER_EXPECTED_DB_ROLE = 'smart_scanner_research_lifecycle'
+
+  # Provider NAME only; MASSIVE_API_KEY / FMP_API_KEY are SECRETS.
+  MARKET_DATA_PROVIDER = 'massive'
+  # The SEC asks automated clients to identify themselves. A contact string, not
+  # a credential; without it the SEC enrichment source reports `unavailable`,
+  # which is honest rather than a failure.
+  SEC_USER_AGENT = 'Smart Scanner research (aneeman2010@gmail.com)'
+  LOG_FORMAT = 'json'
+
+# No [http_service] and no [[services]] — no exposed port, never started/stopped
+# by inbound traffic, runs continuously.
+[processes]
+  worker = 'python -m app.jobs.worker'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 512
+  processes = ['worker']

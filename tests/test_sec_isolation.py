@@ -68,7 +68,9 @@ class TestNoDecisionModuleKnowsAboutSecFilings:
         for name in ("sec_events.py", "sec_ingest.py"):
             reached = {m for m in imported_names(APP / name) if m.startswith("app.")}
             assert reached <= {"app.sec_events", "app.news", "app.catalyst",
-                               "app.prospective_session"}, \
+                               "app.prospective_session",
+                               # Pure cohort vocabulary (028): constants only.
+                               "app.source_scope"}, \
                 f"{name} imports decision code: {sorted(reached)}"
 
     def test_the_two_closed_layers_are_unchanged_by_the_arrival_of_sec(self):

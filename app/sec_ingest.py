@@ -49,6 +49,7 @@ import httpx
 # ---- shared vocabulary ------------------------------------------------------ #
 # Imported, not redeclared: `app/sec_events.py` owns these words, so what we
 # persist and what the product says can never drift apart.
+from app.source_scope import normalise_scope
 from app.sec_events import (  # noqa: F401
     ACCEPTED_FORM_PREFIX, SEC_TAXONOMY_VERSION, SOURCE_SEC_EDGAR,
     classify_event_types, is_amendment, is_primary_event, parse_item_codes,
@@ -372,9 +373,9 @@ ON CONFLICT (symbol, filing_id) DO NOTHING
 SOURCE_STATE_SQL = """
 INSERT INTO public.catalyst_source_state (
     source, status, last_refresh_at, last_success_at,
-    symbols_covered, events_upserted, detail, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-ON CONFLICT (source) DO UPDATE SET
+    symbols_covered, events_upserted, detail, scope, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+ON CONFLICT (source, scope) DO UPDATE SET
     status = EXCLUDED.status,
     last_refresh_at = EXCLUDED.last_refresh_at,
     last_success_at = COALESCE(EXCLUDED.last_success_at,
@@ -429,31 +430,46 @@ async def upsert_filings(conn, filings: Iterable[Dict[str, Any]], *,
 
 async def record_source_state(conn, status: str, *, symbols_covered: int = 0,
                               filings_written: int = 0, detail: str = "",
-                              now: Optional[datetime] = None) -> None:
-    """One row in `catalyst_source_state`, so an empty filings table can never
-    be misread as 'no company disclosed anything'."""
+                              now: Optional[datetime] = None,
+                              scope: Optional[str] = None) -> None:
+    """One row per (source, cohort), so an empty filings table can never be
+    misread as 'no company disclosed anything'.
+
+    This is the function whose scope-blindness the research lifecycle found:
+    refreshing EDGAR for one discovered symbol used to overwrite the freshness
+    row the Product API reads for the frozen 25.
+    """
     moment = now or datetime.now(timezone.utc)
     await conn.execute(
         SOURCE_STATE_SQL, SOURCE_SEC_EDGAR, status, moment,
         moment if status == STATE_OK else None,
-        symbols_covered, filings_written, detail[:400] or None)
+        symbols_covered, filings_written, detail[:400] or None,
+        normalise_scope(scope))
 
 
 async def refresh_sec_filings(conn, client: SecClient, symbols: Sequence[str], *,
                               now: Optional[datetime] = None,
                               lookback_days: int = DEFAULT_LOOKBACK_DAYS,
                               cik_map: Optional[Dict[str, str]] = None,
+                              scope: Optional[str] = None,
                               ) -> Dict[str, Any]:
     """One idempotent refresh over a bounded symbol list.
 
     A source failure is absorbed into `catalyst_source_state` and reported,
     never raised: an EDGAR outage must cost the product its SEC dimension and
     nothing else.
+
+    `scope` names the COHORT this refresh describes and is threaded down to the
+    freshness row rather than assumed. It defaults to the product cohort so
+    every existing caller is unchanged; the research lifecycle passes
+    `SCOPE_RESEARCH` so its refresh can never be read as the product's.
     """
+    scope = normalise_scope(scope)
     moment = now or datetime.now(timezone.utc)
     cleaned = [s.strip().upper() for s in symbols if s and s.strip()]
     universe = set(cleaned)
-    summary: Dict[str, Any] = {"symbols": len(cleaned), "source": SOURCE_SEC_EDGAR}
+    summary: Dict[str, Any] = {"symbols": len(cleaned),
+                               "source": SOURCE_SEC_EDGAR, "scope": scope}
 
     try:
         fetched = await fetch_filings(client, cleaned, observed_at=moment,
@@ -463,17 +479,19 @@ async def refresh_sec_filings(conn, client: SecClient, symbols: Sequence[str], *
                                      links=fetched["links"], universe=universe)
         await record_source_state(conn, STATE_OK, symbols_covered=len(cleaned),
                                   filings_written=stats["filings_inserted"],
-                                  now=moment)
+                                  now=moment, scope=scope)
         summary.update({"status": STATE_OK, "issuers": fetched["ciks"],
                         "unresolved_symbols": fetched["unresolved"], **stats})
     except SecSourceUnavailable as exc:
         await record_source_state(conn, STATE_UNAVAILABLE,
                                   symbols_covered=len(cleaned),
-                                  detail=f"{exc.reason}: {exc.detail}", now=moment)
+                                  detail=f"{exc.reason}: {exc.detail}",
+                                  now=moment, scope=scope)
         summary.update({"status": STATE_UNAVAILABLE, "reason": exc.reason})
     except Exception as exc:
         await record_source_state(conn, STATE_ERROR, symbols_covered=len(cleaned),
-                                  detail=type(exc).__name__, now=moment)
+                                  detail=type(exc).__name__, now=moment,
+                                  scope=scope)
         summary.update({"status": STATE_ERROR, "reason": type(exc).__name__})
 
     return summary

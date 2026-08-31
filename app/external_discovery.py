@@ -74,6 +74,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
 import httpx
 
+from app.source_scope import SCOPE_PRODUCT
 from app.news import effective_session
 from app.source_licensing import LICENSING_INTERNAL_ONLY, resolve_visibility
 
@@ -451,9 +452,9 @@ RETURNING (xmax = 0) AS inserted
 SOURCE_STATE_SQL = """
 INSERT INTO public.catalyst_source_state (
     source, status, last_refresh_at, last_success_at,
-    symbols_covered, events_upserted, detail, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-ON CONFLICT (source) DO UPDATE SET
+    symbols_covered, events_upserted, detail, scope, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+ON CONFLICT (source, scope) DO UPDATE SET
     status = EXCLUDED.status,
     last_refresh_at = EXCLUDED.last_refresh_at,
     last_success_at = COALESCE(EXCLUDED.last_success_at,
@@ -501,7 +502,11 @@ async def record_source_state(conn, status: str, *, symbols_covered: int = 0,
     await conn.execute(
         SOURCE_STATE_SQL, SOURCE_STATE_FMP_DISCOVERY, status, moment,
         moment if status == STATE_OK else None,
-        symbols_covered, written, detail[:400] or None)
+        symbols_covered, written, detail[:400] or None,
+        # PINNED. Discovery reads market-wide lists, not a cohort: the feed is
+        # equally fresh (or absent) for everyone, so splitting it per cohort
+        # would invent a distinction the source does not have.
+        SCOPE_PRODUCT)
 
 
 async def refresh_discovery_candidates(

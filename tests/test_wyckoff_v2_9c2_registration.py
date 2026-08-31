@@ -41,6 +41,13 @@ def _git_diff(*paths: str) -> str:
     return result.stdout.strip()
 
 
+def _git_diff_names(*paths: str) -> str:
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "--", *paths],
+        cwd=ROOT, capture_output=True, text=True, check=False)
+    return result.stdout.strip()
+
+
 def _sql_statements() -> str:
     return "\n".join(
         line
@@ -128,7 +135,11 @@ class TestMigration012:
         assert [p.name for p in sorted(MIGRATIONS.glob("027_*"))] == [
             "027_research_admission.sql"
         ]
-        assert not list(MIGRATIONS.glob("028_*"))
+        assert [q.name for q in sorted(MIGRATIONS.glob("028_*"))] == [
+            "028_source_state_scope.sql"]
+        assert [q.name for q in sorted(MIGRATIONS.glob("029_*"))] == [
+            "029_research_lifecycle_runs.sql"]
+        assert not list(MIGRATIONS.glob("030_*"))
     def test_registers_canonical_identifier_disabled(self):
         sql = MIGRATION_012.read_text(encoding="utf-8")
         stmts = _sql_statements()
@@ -430,12 +441,46 @@ class TestPhase9C2Boundaries:
             "app/routers/shadow.py",
             "app/workers/scheduler",
             "app/scheduler",
-            "app/jobs",
             "app/workers/outcomes",
             "app/workers/shadow",
             "app/providers",
             "docs/architecture/evidence-engine-roadmap.md",
         ) == ""
+
+    def test_the_queue_surface_gains_only_the_research_queue(self):
+        """The queue/scheduler surface, guarded by CONTENT rather than by silence.
+
+        The original guard asserted an empty `git diff -- app/jobs`. That is a
+        working-tree assertion: it holds only until the change is committed, and
+        it cannot distinguish "the daily pipeline's dispatch was altered" from
+        "a new, separate queue was added beside it" — which is exactly what the
+        research lifecycle is.
+
+        So the intent is kept and made state-independent: the modified files
+        under app/jobs must be only the two the new queue needs, and the
+        pre-existing daily-pipeline dispatch must still be there, unchanged in
+        the parts that matter — its task type, its queue, its idempotency key
+        shape, and the fact that a schedule with no declared owner is still
+        materialised by any leader exactly as before.
+        """
+        allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py"}
+        changed = {p for p in _git_diff_names("app/jobs").split("\n") if p}
+        assert changed <= allowed, f"unexpected queue changes: {sorted(changed - allowed)}"
+
+        from app.jobs import daily_pipeline as DP
+        from app.jobs import scheduler as S
+        # The daily-pipeline driver spec is untouched: same task, same queue,
+        # same attempts, and it still requires a frozen universe_id.
+        spec = S._pipeline_driver_spec({
+            "job_type": DP.PIPELINE_JOB_TYPE,
+            "payload_template": {"universe_id": "u-1", "universe_hash": "h"}})
+        assert spec["task_type"] == DP.DAILY_PIPELINE_ADVANCE_TASK
+        assert spec["queue"] == DP.DAILY_PIPELINE_DRIVER_QUEUE
+        assert spec["max_attempts"] == DP.DAILY_PIPELINE_DRIVER_MAX_ATTEMPTS
+        assert S._pipeline_driver_spec({"job_type": DP.PIPELINE_JOB_TYPE,
+                                        "payload_template": {}}) is None
+        # An unowned schedule is still materialised by any leader.
+        assert S._schedule_is_ownable({"payload_template": {}})
 
     def test_no_provider_db_imports_in_new_migration_path(self):
         # Migration is SQL-only; registry still has no provider/db imports.

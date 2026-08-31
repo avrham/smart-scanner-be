@@ -238,6 +238,21 @@ class Settings(BaseSettings):
     # it. SECRET; never committed and never logged.
     MARKET_INTEL_DATABASE_URL: str = ""
     MARKET_INTEL_EXPECTED_DB_ROLE: str = "smart_scanner_market_intel"
+
+    # ---- research lifecycle (dedicated execution identity) ------------------
+    # The research lifecycle runs on its OWN Fly app under its OWN least-
+    # privilege role. It is deliberately not the market-intel identity: that one
+    # can write the PRODUCT freshness rows, and the whole point of the research
+    # boundary is that a research run cannot. Empty by default, in which case
+    # the ops entry point falls back to the market-intel connection exactly as
+    # before. SECRET; never committed, never logged.
+    RESEARCH_LIFECYCLE_DATABASE_URL: str = ""
+    RESEARCH_LIFECYCLE_EXPECTED_DB_ROLE: str = "smart_scanner_research_lifecycle"
+    # The SEC asks automated clients to identify themselves. Enrichment refuses
+    # to call EDGAR without one rather than sending a generic default, so an
+    # empty value makes the SEC source report `unavailable` — which is honest,
+    # and is not a failure. Not a credential: a contact string.
+    SEC_USER_AGENT: str = ""
     # The shared ingress credential a third party must present. SECRET.
     #
     # It travels in the `X-Smart-Scanner-Token` header when the caller can set
@@ -346,6 +361,13 @@ class Settings(BaseSettings):
     # The scheduler-leader advisory lock key (distinct from the prospective
     # execute lock 0x50524F53). "JBSC" = 0x4A425343.
     JOB_SCHEDULER_ADVISORY_LOCK_KEY: int = 0x4A425343
+    # Schedules this worker's scheduler leader is allowed to materialise, by
+    # `payload_template.scheduler_owner`. A schedule WITHOUT that key is
+    # unowned and may be materialised by any leader — so every existing
+    # schedule behaves exactly as it did and no deployed app needs to change.
+    # A worker only claims ownership of schedules matching its own type.
+    # See app/jobs/scheduler.py::_schedule_is_ownable.
+    JOB_SCHEDULER_OWNER: str = ""
     # Test-only synthetic task handlers (controlled retry/crash tests) are
     # selectable ONLY when this is true. Default false → never in production /
     # never on the live worker. The live worker app never sets this.

@@ -59,4 +59,34 @@ async def intel_connection(*, expected_role: Optional[str] = None,
         await conn.close()
 
 
-__all__ = ["intel_connection", "IntelConnectionRefused"]
+@contextlib.asynccontextmanager
+async def research_connection(*, expected_role: Optional[str] = None,
+                              ) -> AsyncIterator[asyncpg.Connection]:
+    """Yield a connection for the RESEARCH lifecycle, then close it.
+
+    A separate identity from `intel_connection` on purpose. The market-intel
+    role can write the PRODUCT freshness rows; the research lifecycle must not
+    be able to, and the boundary is only real if the two connect as different
+    roles. With RESEARCH_LIFECYCLE_DATABASE_URL unset this falls back to
+    `intel_connection`, so an operator who has not provisioned the role yet is
+    not blocked — but the run then carries the intel identity and says so by
+    the role it verifies.
+    """
+    dsn = (getattr(settings, "RESEARCH_LIFECYCLE_DATABASE_URL", "") or "").strip()
+    if not dsn:
+        async with intel_connection() as conn:
+            yield conn
+        return
+    role = expected_role or settings.RESEARCH_LIFECYCLE_EXPECTED_DB_ROLE
+    conn = await asyncpg.connect(dsn)
+    try:
+        actual = await conn.fetchval("SELECT current_user")
+        if role and actual != role:
+            raise IntelConnectionRefused(
+                f"connected as {actual!r}, expected {role!r}")
+        yield conn
+    finally:
+        await conn.close()
+
+
+__all__ = ["intel_connection", "research_connection", "IntelConnectionRefused"]

@@ -141,6 +141,20 @@ def _install_default_handlers() -> None:
         retry_backoff_schedule=list(settings.DAILY_PIPELINE_DRIVER_BACKOFF_SECONDS),
         production_enabled=True,
     ))
+    from app.jobs.handlers import research_lifecycle_worker as _rlw
+    from app.jobs import research_lifecycle as _rl
+    register(HandlerSpec(
+        task_type=_rl.RESEARCH_LIFECYCLE_TASK,
+        queue_name=_rl.RESEARCH_LIFECYCLE_QUEUE,
+        child_callable=_rlw.run_research_lifecycle_task,
+        probe_fn=_rlw.probe_research_lifecycle_durable_output,
+        # Two, not the global three. The lifecycle is bounded, idempotent and
+        # cheap to repeat tomorrow; a third attempt inside one occurrence would
+        # spend provider requests re-doing work whose likely blocker (stale core
+        # bars, a held warmup lock) has not changed within the retry window.
+        max_attempts=_rl.RESEARCH_LIFECYCLE_MAX_ATTEMPTS,
+        production_enabled=True,
+    ))
     # A safe, synthetic test handler for controlled retry/crash tests. NEVER
     # selectable unless JOB_ALLOW_TEST_HANDLERS=true; performs no strategy math
     # and touches no real campaign data.

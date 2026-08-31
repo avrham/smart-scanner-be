@@ -52,6 +52,7 @@ from app.config import settings
 from app.deps import get_db
 import app.external_ingest as ei
 import app.external_signals as es
+from app.source_scope import SCOPE_PRODUCT
 
 logger = logging.getLogger(__name__)
 
@@ -266,10 +267,11 @@ async def external_ingress_health(db: asyncpg.Connection = Depends(get_db)):
             FROM public.external_signal_sources r
             LEFT JOIN public.catalyst_source_state c
                    ON c.source = $1 || r.source
+                  AND c.scope = $2
             WHERE r.status IN ('live', 'requires_manual_setup')
             ORDER BY r.source
             """,
-            es.SOURCE_STATE_PREFIX,
+            es.SOURCE_STATE_PREFIX, SCOPE_PRODUCT,
         )
         for row in rows:
             last = row["last_success_at"]

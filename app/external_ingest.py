@@ -53,6 +53,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
+from app.source_scope import SCOPE_PRODUCT
 from app.external_adapters import (
     MAX_PAYLOAD_BYTES, PayloadRejected, bound_metadata, normalize, redact,
 )
@@ -242,9 +243,9 @@ RETURNING id
 SOURCE_STATE_SQL = """
 INSERT INTO public.catalyst_source_state (
     source, status, last_refresh_at, last_success_at,
-    symbols_covered, events_upserted, detail, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-ON CONFLICT (source) DO UPDATE SET
+    symbols_covered, events_upserted, detail, scope, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+ON CONFLICT (source, scope) DO UPDATE SET
     status = EXCLUDED.status,
     last_refresh_at = EXCLUDED.last_refresh_at,
     last_success_at = COALESCE(EXCLUDED.last_success_at,
@@ -346,7 +347,11 @@ async def record_source_state(conn, source: str, status: str, *,
     await conn.execute(
         SOURCE_STATE_SQL, source_state_key(source), status, moment,
         moment if status == STATE_OK else None,
-        0, signals_written, detail[:400] or None)
+        0, signals_written, detail[:400] or None,
+        # PINNED, not defaulted. A pushed alert is configured against the
+        # product watchlist; there is no research cohort of external signals
+        # for this row to be about, so the scope is not a caller's choice.
+        SCOPE_PRODUCT)
 
 
 # --------------------------------------------------------------------------- #

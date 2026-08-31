@@ -66,7 +66,9 @@ class TestNoDecisionModuleKnowsAboutNews:
         for name in ("news.py", "news_ingest.py"):
             reached = {m for m in imported_names(APP / name) if m.startswith("app.")}
             assert reached <= {"app.news", "app.catalyst", "app.prospective_session",
-                               "app.workers.massive_client"}, \
+                               "app.workers.massive_client",
+                               # Pure cohort vocabulary (028): constants only.
+                               "app.source_scope"}, \
                 f"{name} imports decision code: {sorted(reached)}"
 
     def test_earnings_context_is_unchanged_by_the_arrival_of_news(self):

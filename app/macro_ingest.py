@@ -51,6 +51,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import httpx
 
+from app.source_scope import SCOPE_PRODUCT
 import app.macro_calendar as mc
 
 # --------------------------------------------------------------------------- #
@@ -435,9 +436,9 @@ WHERE source = $1
 SOURCE_STATE_SQL = """
 INSERT INTO public.catalyst_source_state (
     source, status, last_refresh_at, last_success_at,
-    symbols_covered, events_upserted, detail, updated_at)
-VALUES ($1,$2,$3,$4,0,$5,$6,NOW())
-ON CONFLICT (source) DO UPDATE SET
+    symbols_covered, events_upserted, detail, scope, updated_at)
+VALUES ($1,$2,$3,$4,0,$5,$6,$7,NOW())
+ON CONFLICT (source, scope) DO UPDATE SET
     status = EXCLUDED.status,
     last_refresh_at = EXCLUDED.last_refresh_at,
     last_success_at = COALESCE(EXCLUDED.last_success_at,
@@ -485,7 +486,9 @@ async def record_source_state(conn, source: str, status: str, *,
     await conn.execute(
         SOURCE_STATE_SQL, mc.source_state_key(source), status, moment,
         moment if status == STATE_OK else None, written,
-        detail[:400] or None)
+        detail[:400] or None,
+        # PINNED. An FOMC meeting is not per-cohort; the whole market shares it.
+        SCOPE_PRODUCT)
 
 
 # --------------------------------------------------------------------------- #

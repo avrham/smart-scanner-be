@@ -45,6 +45,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 
+from app.source_scope import SCOPE_PRODUCT
 from app.external_discovery import (DiscoverySourceUnavailable,
                                     FmpStableClient, normalize_symbol)
 from app.prospective_session import is_trading_day
@@ -236,9 +237,9 @@ RETURNING id
 SOURCE_STATE_SQL = """
 INSERT INTO public.catalyst_source_state (
     source, status, last_refresh_at, last_success_at,
-    symbols_covered, events_upserted, detail, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-ON CONFLICT (source) DO UPDATE SET
+    symbols_covered, events_upserted, detail, scope, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+ON CONFLICT (source, scope) DO UPDATE SET
     status = EXCLUDED.status,
     last_refresh_at = EXCLUDED.last_refresh_at,
     last_success_at = COALESCE(EXCLUDED.last_success_at,
@@ -280,7 +281,11 @@ async def record_source_state(conn, status: str, *, symbols_covered: int = 0,
     await conn.execute(
         SOURCE_STATE_SQL, SOURCE_STATE_FMP_GRADES, status, moment,
         moment if status == STATE_OK else None,
-        symbols_covered, written, detail[:400] or None)
+        symbols_covered, written, detail[:400] or None,
+        # PINNED. Analyst grades stay internal_research_only under the FMP
+        # licence and are refreshed for the frozen universe only; a research
+        # cohort row would imply a research entitlement we do not have.
+        SCOPE_PRODUCT)
 
 
 async def refresh_analyst_grades(

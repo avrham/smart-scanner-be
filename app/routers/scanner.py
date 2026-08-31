@@ -54,6 +54,7 @@ import app.catalyst_ingest as ci
 import app.external_signals as ex
 import app.macro_calendar as mcal
 import app.source_licensing as lic
+from app.source_scope import SCOPE_PRODUCT
 import app.market_context as mc
 import app.news as nw
 import app.news_ingest as ni
@@ -295,10 +296,20 @@ async def _fetch_catalyst_events(
 
 async def _fetch_catalyst_freshness(db: asyncpg.Connection) -> Dict[str, Dict[str, Any]]:
     """One row per source — what lets the product distinguish 'nothing
-    scheduled' from 'we cannot see the schedule'."""
+    scheduled' from 'we cannot see the schedule'.
+
+    SCOPED TO THE PRODUCT COHORT, EXPLICITLY. Since migration 028 the table can
+    also hold research-cohort freshness, and a research refresh of one
+    discovered symbol says nothing about the frozen 25's coverage. The filter
+    is stated here AND enforced by the product reader role's RLS predicate, so
+    a forgotten WHERE clause cannot leak the other cohort into a product
+    answer. See app/source_scope.py.
+    """
     rows = await db.fetch(
         "SELECT source, status, last_refresh_at, last_success_at, "
-        "symbols_covered, events_upserted, detail FROM catalyst_source_state"
+        "symbols_covered, events_upserted, detail FROM catalyst_source_state "
+        "WHERE scope = $1",
+        SCOPE_PRODUCT,
     )
     return {r["source"]: dict(r) for r in rows}
 

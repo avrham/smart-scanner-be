@@ -440,7 +440,11 @@ class TestNoBehaviorDrift:
         assert [p.name for p in sorted(migrations.glob("027_*"))] == [
             "027_research_admission.sql"
         ]
-        assert not list(migrations.glob("028_*"))
+        assert [q.name for q in sorted(migrations.glob("028_*"))] == [
+            "028_source_state_scope.sql"]
+        assert [q.name for q in sorted(migrations.glob("029_*"))] == [
+            "029_research_lifecycle_runs.sql"]
+        assert not list(migrations.glob("030_*"))
         sql = (migrations / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
         assert "strategy_shadow" not in sql.lower()
         assert "wyckoff_mtf_v2" in sql

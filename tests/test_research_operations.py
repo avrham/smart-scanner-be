@@ -413,78 +413,79 @@ class TestExhaustionReconciliation:
 # =========================================================================== #
 
 class TestLifecycle:
+    """The lifecycle moved from ops/ to app/ so the CLI and the durable task
+    handler are the SAME code path; the ordering guarantees this milestone
+    established are re-asserted at the new location."""
+
+    SOURCE = open("app/research_lifecycle.py", encoding="utf-8").read()
+
     def test_stale_core_history_BLOCKS_rather_than_continuing(self):
-        import ops.analysis.research_lifecycle as rl
+        import app.research_lifecycle as rl
         assert rl.STATUS_BLOCKED_STALE == "blocked_stale_core_history"
-        source = open("ops/analysis/research_lifecycle.py",
-                      encoding="utf-8").read()
-        # The gate returns before any warmup or scan.
-        gate = source.split("if not freshness[\"fresh\"]:")[1]
+        gate = self.SOURCE.split('if not freshness["fresh"]:')[1]
         assert "return summary" in gate.split("# ---- 2.")[0]
 
     def test_an_unresolvable_canonical_config_blocks_the_run(self):
-        import ops.analysis.research_lifecycle as rl
+        import app.research_lifecycle as rl
         assert rl.STATUS_BLOCKED_CONFIG == "blocked_canonical_config_unavailable"
 
     def test_the_freshness_gate_covers_both_core_universes(self):
-        import ops.analysis.research_lifecycle as rl
+        import app.research_lifecycle as rl
         assert set(rl.CORE_UNIVERSES) == {
             "WYCKOFF-HISTORY-WARMUP-QUALIFICATION",
             "SMART-SCANNER-REFERENCE-MARKET-V1"}
 
     def test_admission_runs_before_warmup_in_the_lifecycle(self):
-        source = open("ops/analysis/research_lifecycle.py",
-                      encoding="utf-8").read()
-        assert source.index("evaluate_admissions") < source.index("run_warmup")
+        assert self.SOURCE.index("evaluate_admissions") < \
+            self.SOURCE.index("_run_warmup(conn")
 
     def test_a_dry_run_touches_no_provider(self):
-        source = open("ops/analysis/research_lifecycle.py",
-                      encoding="utf-8").read()
-        body = source.split("if dry_run:")[1]
+        body = self.SOURCE.split("        if dry_run:")[1]
         assert "return summary" in body.split("# ---- 6.")[0]
 
     def test_enrichment_is_lazy_capped_and_survivor_only(self):
-        import ops.analysis.research_lifecycle as rl
-        assert rl.MAX_ENRICHED_SYMBOLS_PER_RUN == 10
-        source = open("ops/analysis/research_lifecycle.py",
-                      encoding="utf-8").read()
-        assert "candidate_state = 'research_candidate'" in source
+        # Still lazy, still capped, still survivors only — but it now FETCHES,
+        # because migration 028 gave the freshness row a cohort. See
+        # tests/test_research_lifecycle_automation.py::TestLazyEnrichment.
+        import app.research_enrichment as re_
+        assert re_.MAX_ENRICHED_SYMBOLS == 10
+        assert "candidate_state = $1" in re_.CANDIDATE_SQL
 
-    def test_enrichment_fetches_nothing_and_says_why(self):
-        # The live run proved the boundary: refresh_sec_filings writes the
+    def test_enrichment_is_confined_to_the_research_cohort(self):
+        # This replaces the previous milestone's "fetches nothing and says why".
+        # The reason it fetched nothing was that `refresh_sec_filings` wrote the
         # SHARED `sec_edgar` freshness row the Product API reads for the frozen
-        # 25, and row-level security correctly refused. Deferred, not forced.
-        import ops.analysis.research_lifecycle as rl
-        stage = open("ops/analysis/research_lifecycle.py",
-                     encoding="utf-8").read().split(
-                         "async def enrich_candidates")[1].split("FUNNEL_SQL")[0]
-        assert "si.refresh_sec_filings" not in stage
-        assert rl.ENRICHMENT_DEFERRED_REASON == \
-            "shared_source_state_assumes_frozen_universe"
+        # 25. That row now carries a scope, so the fetch is safe — and the
+        # thing that made it unsafe is now impossible rather than avoided.
+        import app.research_enrichment as re_
+        from app.source_scope import SCOPE_RESEARCH
+        stage = open("app/research_enrichment.py", encoding="utf-8").read()
+        assert "si.refresh_sec_filings" in stage
+        assert f'scope=SCOPE_RESEARCH' in stage
+        assert re_.SOURCE_SEC in re_.ENRICHMENT_SOURCES
+        assert SCOPE_RESEARCH == "research"
 
     def test_every_enrichment_source_carries_an_explicit_status(self):
-        import ops.analysis.research_lifecycle as rl
+        import app.research_enrichment as re_
 
         class Empty:
             async def fetch(self, *a, **k):
                 return []
 
-        result = asyncio.run(rl.enrich_candidates(Empty()))
+        result = asyncio.run(re_.enrich_research_candidates(Empty()))
         assert result["provider_requests"] == 0
-        assert set(result["sources"]) == {"sec_filings", "earnings",
-                                          "company_news", "analyst_grades"}
-        assert all(v["status"] == "deferred"
-                   for v in result["sources"].values())
+        assert set(result["sources"]) == set(re_.ENRICHMENT_SOURCES)
+        assert all("status" in v for v in result["sources"].values())
 
-    def test_the_lifecycle_invents_no_scheduler(self):
-        source = open("ops/analysis/research_lifecycle.py",
-                      encoding="utf-8").read()
-        for forbidden in ("job_schedules", "CronCreate", "cron_expression",
-                          "APScheduler"):
-            assert forbidden not in source
+    def test_the_lifecycle_invents_no_scheduler_of_its_own(self):
+        # It did not GROW a scheduler; it joined the existing durable one. No
+        # cron parser, no timer, no second dispatch mechanism lives here — the
+        # schedule is a `job_schedules` row created disabled by migration 029.
+        for forbidden in ("cron_expression", "APScheduler", "asyncio.sleep",
+                          "while True"):
+            assert forbidden not in self.SOURCE
+        assert "job_schedules" not in self.SOURCE
 
     def test_it_never_mutates_a_universe(self):
-        source = open("ops/analysis/research_lifecycle.py",
-                      encoding="utf-8").read()
-        assert "INSERT INTO public.history_warmup" not in source
-        assert "UPDATE public.history_warmup" not in source
+        assert "INSERT INTO public.history_warmup" not in self.SOURCE
+        assert "UPDATE public.history_warmup" not in self.SOURCE

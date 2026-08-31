@@ -162,6 +162,43 @@ async def run_scheduler_tick(*, worker_id: str, now: Optional[datetime] = None) 
         await release_db_connection(conn)
 
 
+def _template(schedule: Dict[str, Any]) -> Dict[str, Any]:
+    """The schedule's payload template as a dict, whatever the driver returned."""
+    tmpl = schedule.get("payload_template") or {}
+    if isinstance(tmpl, str):
+        try:
+            tmpl = json.loads(tmpl)
+        except (ValueError, TypeError):
+            tmpl = {}
+    return tmpl if isinstance(tmpl, dict) else {}
+
+
+def _schedule_is_ownable(schedule: Dict[str, Any]) -> bool:
+    """May THIS leader materialise this schedule?
+
+    A schedule may declare `payload_template.scheduler_owner`, naming the worker
+    type responsible for it. A schedule WITHOUT the key is unowned and any
+    leader may materialise it — so every schedule that existed before this
+    existed behaves exactly as it did, and no deployed app needs to change.
+
+    WHY OWNERSHIP IS ON THE SCHEDULE AND NOT IN EACH APP'S ENV
+    ---------------------------------------------------------
+    Because it is a property of the work. The research lifecycle must be
+    materialised only by the research worker: the pipeline-driver's role is
+    deliberately unable to touch a research table, so a research task it
+    created would be a task it could never explain, and its insert would be
+    refused by RLS on every tick — a warning loop, not a schedule. Putting the
+    fact in the schedule row means one place states it, rather than every app
+    having to carry a list of the schedules it must ignore.
+    """
+    owner = (_template(schedule).get("scheduler_owner") or "").strip()
+    if not owner:
+        return True
+    mine = ((settings.JOB_SCHEDULER_OWNER or "").strip()
+            or (getattr(settings, "JOB_WORKER_TYPE", "") or "").strip())
+    return owner == mine
+
+
 async def _tick_as_leader(conn: asyncpg.Connection, *, worker_id: str,
                           now: datetime) -> Dict[str, Any]:
     due = await conn.fetch(
@@ -169,8 +206,14 @@ async def _tick_as_leader(conn: asyncpg.Connection, *, worker_id: str,
         "AND (next_run_at IS NULL OR next_run_at <= $1) ORDER BY next_run_at ASC NULLS FIRST",
         now)
     enqueued = 0
+    skipped_not_owned = 0
     for sched in due:
         s = dict(sched)
+        if not _schedule_is_ownable(s):
+            # Not ours. Leave next_run_at alone so the owning leader still sees
+            # it as due — skipping must not consume somebody else's occurrence.
+            skipped_not_owned += 1
+            continue
         try:
             occurrence = s["next_run_at"] or compute_next_run_at(s, now)
             job_id = await _create_scheduled_job(conn, s, occurrence)
@@ -183,7 +226,36 @@ async def _tick_as_leader(conn: asyncpg.Connection, *, worker_id: str,
                 s["id"], next_run, job_id)
         except Exception:
             logger.warning("schedule tick failed for %s", s.get("schedule_code"), exc_info=True)
-    return {"leader": True, "enqueued": enqueued, "due": len(due)}
+    return {"leader": True, "enqueued": enqueued, "due": len(due),
+            "skipped_not_owned": skipped_not_owned}
+
+
+def _research_lifecycle_spec(schedule: Dict[str, Any],
+                             occurrence: datetime) -> Optional[Dict[str, Any]]:
+    """The durable task spec for the research lifecycle schedule, else None.
+
+    The run key is derived from the OCCURRENCE, so a scheduler that fires twice
+    for one occurrence produces one lifecycle run rather than two competing
+    histories of the same session.
+    """
+    from app.jobs import research_lifecycle as RL
+    if schedule.get("job_type") != RL.RESEARCH_LIFECYCLE_JOB_TYPE:
+        return None
+    run_key = RL.run_key_for_occurrence(
+        schedule_code=schedule["schedule_code"],
+        schedule_version=int(schedule["schedule_version"]),
+        occurrence_iso=occurrence.isoformat())
+    payload = RL.task_payload_from_template(_template(schedule),
+                                            run_key=run_key)
+    payload.update({"schedule_code": schedule["schedule_code"],
+                    "schedule_version": int(schedule["schedule_version"]),
+                    "occurrence_scheduled_at": occurrence.isoformat()})
+    return {"task_type": RL.RESEARCH_LIFECYCLE_TASK,
+            "queue": RL.RESEARCH_LIFECYCLE_QUEUE,
+            "max_attempts": int(RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS),
+            "payload": payload,
+            "task_key_prefix": "rlctask:",
+            "task_key": f"rlctask:{run_key}"}
 
 
 def _pipeline_driver_spec(schedule: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -229,6 +301,17 @@ async def _create_scheduled_job(conn: asyncpg.Connection, schedule: Dict[str, An
         schedule_version=int(schedule["schedule_version"]),
         occurrence_iso=occurrence.isoformat())
     driver = _pipeline_driver_spec(schedule)
+    if driver is not None:
+        # Existing behaviour, byte for byte: the driver payload gains the
+        # schedule identity here and the task key is "dpadv:" + occurrence key.
+        driver = dict(driver)
+        driver["payload"] = {**driver["payload"],
+                             "schedule_code": schedule["schedule_code"],
+                             "schedule_version": int(schedule["schedule_version"]),
+                             "occurrence_scheduled_at": occurrence.isoformat()}
+        driver["task_key"] = "dpadv:" + key
+    else:
+        driver = _research_lifecycle_spec(schedule, occurrence)
     marker_queue = (driver["queue"] if driver is not None
                     else (schedule.get("queue_name") or C.PROSPECTIVE_QUEUE))
     row = await conn.fetchrow(
@@ -245,10 +328,7 @@ async def _create_scheduled_job(conn: asyncpg.Connection, schedule: Dict[str, An
                          metadata={"occurrence": occurrence.isoformat(),
                                    "schedule_id": str(schedule["id"])})
     if driver is not None:
-        task_payload = {**driver["payload"],
-                        "schedule_code": schedule["schedule_code"],
-                        "schedule_version": int(schedule["schedule_version"]),
-                        "occurrence_scheduled_at": occurrence.isoformat()}
+        task_payload = driver["payload"]
         await conn.execute(
             "INSERT INTO job_tasks (job_id, queue_name, task_type, task_contract_version,"
             " task_key, ordinal, payload, payload_hash, idempotency_key, status, priority,"
@@ -256,7 +336,8 @@ async def _create_scheduled_job(conn: asyncpg.Connection, schedule: Dict[str, An
             "VALUES ($1,$2,$3,$3,'driver',0,$4::jsonb,$5,$6,'queued',100,$7) "
             "ON CONFLICT DO NOTHING",
             row["id"], driver["queue"], driver["task_type"], json.dumps(task_payload),
-            ident.payload_hash(task_payload), "dpadv:" + key, driver["max_attempts"])
+            ident.payload_hash(task_payload), driver["task_key"],
+            driver["max_attempts"])
         await Q.recompute_job_counters(conn, row["id"])
     return str(row["id"])
 
@@ -264,4 +345,5 @@ async def _create_scheduled_job(conn: asyncpg.Connection, schedule: Dict[str, An
 __all__ = [
     "parse_cron", "next_cron_occurrence", "next_market_daily_occurrence",
     "compute_next_run_at", "preview_occurrences", "run_scheduler_tick",
+    "_schedule_is_ownable",
 ]

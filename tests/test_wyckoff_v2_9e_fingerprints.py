@@ -300,8 +300,11 @@ class TestNoNewMigration:
         assert [p.name for p in sorted(MIGRATIONS_DIR.glob("027_*"))] == [
             "027_research_admission.sql"
         ]
-        assert not list(MIGRATIONS_DIR.glob("028_*"))
-
+        assert [q.name for q in sorted(MIGRATIONS_DIR.glob("028_*"))] == [
+            "028_source_state_scope.sql"]
+        assert [q.name for q in sorted(MIGRATIONS_DIR.glob("029_*"))] == [
+            "029_research_lifecycle_runs.sql"]
+        assert not list(MIGRATIONS_DIR.glob("030_*"))
     def test_4h_evidence_fits_existing_schema(self):
         """Everything Phase 9E persists rides in EXISTING columns: the 4H
         frame metadata + trigger evidence live inside the bounded

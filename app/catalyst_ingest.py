@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 # ---- shared vocabulary ------------------------------------------------------ #
 # Imported, not redeclared: `app/catalyst.py` owns these words. Re-exported here
 # so ingestion callers need only one import.
+from app.source_scope import normalise_scope
 from app.catalyst import (  # noqa: E402,F401
     CERTAINTIES, CERTAINTY_CONFIRMED, CERTAINTY_ESTIMATED, CERTAINTY_FILED,
     EVENT_EARNINGS, EVENT_FINANCIAL_REPORT_FILING, EVENT_TYPES,
@@ -262,9 +263,9 @@ WHERE symbol = $1 AND event_type = $2
 SOURCE_STATE_SQL = """
 INSERT INTO public.catalyst_source_state (
     source, status, last_refresh_at, last_success_at,
-    symbols_covered, events_upserted, detail, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-ON CONFLICT (source) DO UPDATE SET
+    symbols_covered, events_upserted, detail, scope, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+ON CONFLICT (source, scope) DO UPDATE SET
     status = EXCLUDED.status,
     last_refresh_at = EXCLUDED.last_refresh_at,
     last_success_at = COALESCE(EXCLUDED.last_success_at,
@@ -304,25 +305,43 @@ async def upsert_events(conn, events: Iterable[Dict[str, Any]],
 
 async def record_source_state(conn, source: str, status: str, *,
                               symbols_covered: int = 0, events_upserted: int = 0,
-                              detail: str = "", now: Optional[datetime] = None) -> None:
+                              detail: str = "", now: Optional[datetime] = None,
+                              scope: Optional[str] = None) -> None:
+    """Freshness for ONE (source, cohort).
+
+    `scope` defaults to the product cohort, so every caller that predates
+    cohorts keeps writing exactly the row it always wrote. A research refresh
+    must pass `SCOPE_RESEARCH` explicitly — and if it forgets, the research
+    role's RLS refuses the write rather than quietly claiming the product's
+    freshness. See app/source_scope.py.
+    """
     moment = now or datetime.now(timezone.utc)
     await conn.execute(
         SOURCE_STATE_SQL, source, status, moment,
         moment if status == STATE_OK else None,
-        symbols_covered, events_upserted, detail[:400] or None)
+        symbols_covered, events_upserted, detail[:400] or None,
+        normalise_scope(scope))
 
 
 async def refresh_catalysts(conn, client, symbols: Sequence[str], *,
-                            now: Optional[datetime] = None) -> Dict[str, Any]:
+                            now: Optional[datetime] = None,
+                            scope: Optional[str] = None) -> Dict[str, Any]:
     """One idempotent refresh over a bounded symbol list.
 
     Shaped like a job handler on purpose: an open connection in, a bounded
     result out, no scheduling of its own. Each source is recorded independently,
     so one source being unavailable never hides the other's result.
+
+    `scope` names the COHORT this refresh describes and is threaded down to the
+    freshness row rather than assumed. It defaults to the product cohort so
+    every existing caller is unchanged; the research lifecycle passes
+    `SCOPE_RESEARCH` so its refresh can never be read as the product's.
     """
+    scope = normalise_scope(scope)
     moment = now or datetime.now(timezone.utc)
     symbols = [s.strip().upper() for s in symbols if s and s.strip()]
-    summary: Dict[str, Any] = {"symbols": len(symbols), "sources": {}}
+    summary: Dict[str, Any] = {"symbols": len(symbols), "sources": {},
+                               "scope": scope}
 
     # 1. Forward earnings calendar (plan-gated for this deployment).
     try:
@@ -330,19 +349,19 @@ async def refresh_catalysts(conn, client, symbols: Sequence[str], *,
         written = await upsert_events(conn, events, today=moment.date())
         await record_source_state(conn, SOURCE_EARNINGS_CALENDAR, STATE_OK,
                                   symbols_covered=len(symbols),
-                                  events_upserted=written, now=moment)
+                                  events_upserted=written, now=moment, scope=scope)
         summary["sources"][SOURCE_EARNINGS_CALENDAR] = {
             "status": STATE_OK, "events": written}
     except CatalystSourceUnavailable as exc:
         await record_source_state(conn, SOURCE_EARNINGS_CALENDAR, STATE_UNAVAILABLE,
                                   symbols_covered=len(symbols), events_upserted=0,
-                                  detail=f"{exc.reason}: {exc.detail}", now=moment)
+                                  detail=f"{exc.reason}: {exc.detail}", now=moment, scope=scope)
         summary["sources"][SOURCE_EARNINGS_CALENDAR] = {
             "status": STATE_UNAVAILABLE, "reason": exc.reason}
     except Exception as exc:
         await record_source_state(conn, SOURCE_EARNINGS_CALENDAR, STATE_ERROR,
                                   symbols_covered=len(symbols), events_upserted=0,
-                                  detail=type(exc).__name__, now=moment)
+                                  detail=type(exc).__name__, now=moment, scope=scope)
         summary["sources"][SOURCE_EARNINGS_CALENDAR] = {
             "status": STATE_ERROR, "reason": type(exc).__name__}
 
@@ -352,13 +371,13 @@ async def refresh_catalysts(conn, client, symbols: Sequence[str], *,
         written = await upsert_events(conn, events, today=moment.date())
         await record_source_state(conn, SOURCE_FINANCIAL_FILINGS, STATE_OK,
                                   symbols_covered=len(symbols),
-                                  events_upserted=written, now=moment)
+                                  events_upserted=written, now=moment, scope=scope)
         summary["sources"][SOURCE_FINANCIAL_FILINGS] = {
             "status": STATE_OK, "events": written}
     except Exception as exc:
         await record_source_state(conn, SOURCE_FINANCIAL_FILINGS, STATE_ERROR,
                                   symbols_covered=len(symbols), events_upserted=0,
-                                  detail=type(exc).__name__, now=moment)
+                                  detail=type(exc).__name__, now=moment, scope=scope)
         summary["sources"][SOURCE_FINANCIAL_FILINGS] = {
             "status": STATE_ERROR, "reason": type(exc).__name__}
 
