@@ -89,7 +89,9 @@ def test_migration_012_is_wyckoff_v2_only():
         "028_source_state_scope.sql"]
     assert [name for name in files if name.startswith("029_")] == [
         "029_research_lifecycle_runs.sql"]
-    assert not any(name.startswith("030_") for name in files)
+    assert [n for n in files if n.startswith("030_")] == [
+        "030_research_session_correctness.sql"]
+    assert not any(name.startswith("031_") for name in files)
     assert "011_shadow_pair_outcomes.sql" in files
     sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
     assert "wyckoff_mtf_v2" in sql

@@ -291,7 +291,7 @@ async def run_lifecycle(conn, *,
                     conn, freshness, target=target)
             # No provider figure is claimed: a blocked run attempted nothing,
             # and reporting "0 avoided" would read as a measurement.
-            funnel = await rf.load_funnel(conn)
+            funnel = await rf.load_funnel(conn, target_session=target)
             summary["funnel"] = funnel
             return summary
 
@@ -306,7 +306,7 @@ async def run_lifecycle(conn, *,
             summary["status"] = STATUS_BLOCKED_CONFIG
             summary["blocked_detail"] = (
                 config.get("reason") or "min_price unusable")
-            funnel = await rf.load_funnel(conn)
+            funnel = await rf.load_funnel(conn, target_session=target)
             summary["funnel"] = funnel
             return summary
 
@@ -339,7 +339,8 @@ async def run_lifecycle(conn, *,
 
         if dry_run:
             funnel = await rf.load_funnel(
-                conn, provider_calls_used=summary["provider_requests_used"],
+                conn, target_session=target,
+                provider_calls_used=summary["provider_requests_used"],
                 provider_calls_avoided=gates["provider_requests_avoided"])
             summary["funnel"] = funnel
             return summary
@@ -348,7 +349,8 @@ async def run_lifecycle(conn, *,
         remaining = max(0, int(provider_budget)
                         - summary["provider_requests_used"])
         warm = await _run_warmup(conn, limit=warm_limit,
-                                 max_requests=remaining)
+                                 max_requests=remaining,
+                                 target_session=target)
         summary["warmup"] = {
             # The list for a human, and the COUNT for the audit column. The
             # audit must never have to infer a number from a field shaped for
@@ -384,13 +386,15 @@ async def run_lifecycle(conn, *,
 
         # ---- 10. funnel accounting, and it must add up (P0) ---------------- #
         funnel = await rf.load_funnel(
-            conn, provider_calls_used=summary["provider_requests_used"],
+            conn, target_session=target,
+            provider_calls_used=summary["provider_requests_used"],
             provider_calls_avoided=summary["provider_requests_avoided_by_admission"])
         summary["funnel"] = funnel
 
         # ---- 11. lazy enrichment — survivors only, research cohort (P3) ---- #
         if enrich:
-            summary["enrichment"] = await _enrich(conn, now=moment)
+            summary["enrichment"] = await _enrich(
+                conn, now=moment, target_session=target)
         else:
             summary["enrichment"] = {"enriched": 0, "provider_requests": 0,
                                      "sources": {},
@@ -451,19 +455,22 @@ async def _refresh_discovery(conn) -> Dict[str, Any]:
     return out
 
 
-async def _run_warmup(conn, *, limit: int, max_requests: int) -> Dict[str, Any]:
+async def _run_warmup(conn, *, limit: int, max_requests: int,
+                      target_session: Optional[date] = None) -> Dict[str, Any]:
     from app.config import settings
     from app.providers import get_market_data_provider
     provider = (get_market_data_provider()
                 if settings.MASSIVE_API_KEY else None)
     return await ri.run_warmup(conn, provider, limit=limit,
-                               max_requests=max_requests)
+                               max_requests=max_requests,
+                               target_session=target_session)
 
 
-async def _enrich(conn, *, now: datetime) -> Dict[str, Any]:
+async def _enrich(conn, *, now: datetime,
+                  target_session: Optional[date] = None) -> Dict[str, Any]:
     from app.config import settings
     return await re_.enrich_research_candidates(
-        conn, now=now,
+        conn, now=now, target_session=target_session,
         massive_api_key=(settings.MASSIVE_API_KEY or ""),
         sec_user_agent=(getattr(settings, "SEC_USER_AGENT", "") or ""))
 

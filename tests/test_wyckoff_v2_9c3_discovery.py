@@ -413,7 +413,9 @@ class TestPhase9C3Boundaries:
             "028_source_state_scope.sql"]
         assert [q.name for q in sorted(MIGRATIONS.glob("029_*"))] == [
             "029_research_lifecycle_runs.sql"]
-        assert not list(MIGRATIONS.glob("030_*"))
+        assert [q.name for q in sorted(MIGRATIONS.glob("030_*"))] == [
+            "030_research_session_correctness.sql"]
+        assert not list(MIGRATIONS.glob("031_*"))
         assert (MIGRATIONS / "012_wyckoff_mtf_v2.sql").exists()
 
     def test_forbidden_surfaces_unmodified(self):

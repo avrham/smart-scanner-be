@@ -148,10 +148,57 @@ MAX_WARMUP_ATTEMPTS = 3
 #: recovers within a session.
 WARMUP_COOLDOWN_MINUTES = 60
 
+#: Codes that a `terminal` class must NOT be allowed to make terminal.
+#:
+#: Everything else keeps the old behaviour — an unrecognised terminal error is
+#: still terminal, because guessing that an unknown failure will fix itself is
+#: how you build an infinite retry loop. This is an exemption list, not a
+#: permission list, and it is deliberately two entries long.
+#:
+#: `provider_history_exhausted` is the entry that matters, and it is invariant
+#: T7 in one line. Exhaustion is a statement about OLD bars: the provider has
+#: given us everything it holds behind today. It says nothing whatever about
+#: tomorrow. A symbol one month-group short of the 24-completed-month gate is
+#: exhausted AND maturing, and collapsing those two facts into one is what
+#: stranded AAL, ETHA and SOXL — 499 bars, 23 completed months, one calendar
+#: month from ready — in a state that warmup selection excluded, so the very
+#: error code that put them there could never be cleared.
+NON_TERMINAL_HISTORY_ERROR_CODES = frozenset({
+    "provider_history_exhausted",   # no more OLD bars; says nothing about new
+    "awaiting_history_maturity",    # simply too young, for now
+})
+
 
 def cooldown_until(now: datetime,
                    minutes: int = WARMUP_COOLDOWN_MINUTES) -> datetime:
     return now + timedelta(minutes=minutes)
+
+
+def months_short_of_ready(month_groups: Optional[int]) -> int:
+    """How many further COMPLETED month-groups the monthly gate still wants.
+
+    The monthly gate binds (24 completed months, ~504 sessions) while the
+    provider caps history at ~500 bars, so this — not the bar count — is what
+    a maturing symbol is actually waiting for.
+    """
+    completed = max(0, int(month_groups or 0) - 1)
+    return max(0, CANDIDATE_MIN_MONTHLY_PERIODS - completed)
+
+
+def next_maturity_recheck(now: datetime, *, months_short: int) -> datetime:
+    """WHEN this symbol could next plausibly satisfy the monthly gate.
+
+    Deterministic and calendar-derived, never an attempt count: a symbol gains
+    at most one completed month-group per month boundary, so asking the
+    provider again before that boundary cannot change the answer and would
+    spend a request to learn nothing. Parking until the boundary is how
+    "waiting for the calendar" stops competing with "retrying a failure" for
+    the same bounded budget.
+    """
+    months = max(1, int(months_short))
+    year, month = now.year, now.month + months
+    year, month = year + (month - 1) // 12, (month - 1) % 12 + 1
+    return datetime(year, month, 1, tzinfo=timezone.utc)
 
 
 def is_in_cooldown(cooldown_at: Optional[datetime], *, now: datetime) -> bool:
@@ -210,6 +257,7 @@ def classify_history_state(*, daily_bars: Optional[int],
                            symbol: str = "",
                            attempts: int = 0,
                            last_error_class: Optional[str] = None,
+                           last_error_code: Optional[str] = None,
                            ) -> str:
     """Where a symbol stands, computed from what we hold — never from a flag.
 
@@ -217,14 +265,39 @@ def classify_history_state(*, daily_bars: Optional[int],
     (the symbol does not exist for it). Running out of attempts is `failed`,
     which is a different sentence: we could not get it, not there is nothing
     to get.
+
+    TERMINALITY NOW REQUIRES AN AFFIRMATIVE REASON (T7)
+    ---------------------------------------------------
+    It used to be enough for `last_error_class` to say "terminal". That let
+    `provider_history_exhausted` — which only ever meant "no more OLD bars" —
+    pin a symbol in `unavailable` forever, and `unavailable` is excluded from
+    warmup selection, so the error code could never be cleared either. The
+    state was a closed loop, and three symbols sitting one month-group from
+    the gate were caught in it.
+
+    So the class alone no longer decides. The CODE must name something that
+    time cannot fix, and a symbol that is merely too young stays in
+    `history_warming` — parked by its cooldown, not condemned by its state.
+
+    Likewise the attempt ceiling (T8) is checked only for symbols that are NOT
+    still maturing. Attempts bound failed provider interactions; they must
+    never convert "come back next month" into permanent failure.
     """
-    if last_error_class == "terminal":
-        return STATE_UNAVAILABLE
     bars = daily_bars or 0
     if is_research_ready(bars, week_groups=week_groups,
                          month_groups=month_groups, symbol=symbol):
         return STATE_RESEARCH_READY
-    if attempts >= MAX_WARMUP_ATTEMPTS:
+    if (last_error_class == "terminal"
+            and last_error_code not in NON_TERMINAL_HISTORY_ERROR_CODES):
+        return STATE_UNAVAILABLE
+    # Below the floor there is genuinely nothing to work with, whatever the
+    # provider called it — a symbol the provider barely carries is terminal.
+    if bars and bars < RESEARCH_MIN_USABLE_BARS:
+        return STATE_UNAVAILABLE
+    # Still maturing: the monthly gate wants month-groups that only the
+    # calendar can supply. Not ready, not failed, not unavailable — waiting.
+    maturing = bars > 0 and months_short_of_ready(month_groups) > 0
+    if attempts >= MAX_WARMUP_ATTEMPTS and not maturing:
         return STATE_FAILED
     if bars > 0:
         return STATE_HISTORY_WARMING
@@ -490,6 +563,8 @@ __all__ = [
     "MAX_NEW_RESEARCH_SYMBOLS_PER_RUN", "MAX_WARMUP_SYMBOLS_PER_RUN",
     "MAX_PROVIDER_REQUESTS_PER_RUN", "MAX_CONCURRENT_WARMUPS",
     "MAX_WARMUP_ATTEMPTS", "WARMUP_COOLDOWN_MINUTES",
+    "NON_TERMINAL_HISTORY_ERROR_CODES", "months_short_of_ready",
+    "next_maturity_recheck",
     "cooldown_until", "is_in_cooldown",
     "classify_history_state", "is_research_ready",
     "PRIORITY_DIMENSIONS", "priority_key", "prioritise", "explain_priority",

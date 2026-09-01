@@ -453,21 +453,44 @@ class TestWarmup:
                     and u[1][1] == "insufficient_provider_history"]
         assert terminal and terminal[0][1][2] == "terminal"
 
-    def test_a_repeat_warmup_that_adds_nothing_is_provider_exhausted(self):
+    def test_a_repeat_warmup_that_adds_nothing_is_exhausted_but_not_terminal(self):
         # LGPS in the live cohort: 359 bars, listing younger than the 24-month
-        # gate, and a second call returned NOTHING NEW. That is the provider
-        # saying it has given us everything — `unavailable`, not `failed`,
-        # which would read as our fault.
+        # gate, and a second call returned NOTHING NEW. The provider has given
+        # us everything it holds BEHIND today — and that is all it has said.
+        #
+        # This used to be recorded as `terminal`, which is what stranded AAL,
+        # ETHA and SOXL: `unavailable` is excluded from warmup selection, so
+        # the code that put them there could never be cleared, and each was one
+        # month-group from ready. Exhaustion is now a NON-terminal fact carried
+        # with a calendar-derived recheck date.
         conn = WarmConn([_batch_row("THIN", bars=359)],
                         bars={"THIN": {"bars": 359}},
                         bars_after={"THIN": {"bars": 359}})
         conn.attempt_number = 2
         provider = FakeProvider(bars={"THIN": canonical_bars("THIN", 1)})
         asyncio.run(ri.run_warmup(conn, provider, spacing_seconds=0))
-        terminal = [u for u in conn.updates
-                    if "warmup_last_error_code=$2" in u[0]
-                    and u[1][1] == "provider_history_exhausted"]
-        assert terminal and terminal[0][1][2] == "terminal"
+        marked = [u for u in conn.updates
+                  if "warmup_last_error_code=$2" in u[0]
+                  and u[1][1] == "provider_history_exhausted"]
+        assert marked, "exhaustion must still be recorded"
+        klass, cooldown = marked[0][1][2], marked[0][1][3]
+        assert klass == "maturing"
+        assert klass != "terminal"
+        # Parked until a month boundary could actually change the answer,
+        # rather than retried every run or condemned forever.
+        assert cooldown is not None
+        assert cooldown.day == 1
+        # And the attempt it just spent is rolled back, so waiting for the
+        # calendar cannot exhaust the ceiling (SPCX's failure mode).
+        assert "warmup_attempts = GREATEST(0, warmup_attempts - $5)" in marked[0][0]
+        assert marked[0][1][4] == 1
+
+        # The state it lands in must still be reachable by warmup selection.
+        assert ru.classify_history_state(
+            daily_bars=359, week_groups=75, month_groups=18, symbol="THIN",
+            attempts=2, last_error_class="maturing",
+            last_error_code="provider_history_exhausted"
+        ) == ru.STATE_HISTORY_WARMING
 
     def test_warmup_writes_bars_through_the_canonical_upsert(self):
         # One way daily bars enter this database, not two.

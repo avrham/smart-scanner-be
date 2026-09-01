@@ -354,6 +354,7 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
     """
     rows = [dict(r) for r in await conn.fetch(
         "SELECT symbol, state, warmup_attempts, warmup_last_error_class, "
+        "       warmup_last_error_code, "
         "       history_daily_bars, research_scanned_at "
         "FROM public.research_symbols"
         + (" WHERE symbol = ANY($1::text[])" if symbols else ""),
@@ -372,7 +373,8 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
             week_groups=local.get("week_groups"),
             month_groups=local.get("month_groups"),
             attempts=int(row["warmup_attempts"] or 0),
-            last_error_class=row["warmup_last_error_class"])
+            last_error_class=row["warmup_last_error_class"],
+            last_error_code=row["warmup_last_error_code"])
         # A symbol that has been scanned stays scanned as long as it is still
         # ready — the scan is a fact about the past and re-deriving it away
         # would lose it.
@@ -406,29 +408,56 @@ WARMUP_SELECT_SQL = """
 SELECT symbol, discovery_reasons AS reasons, discovery_observation_count AS observation_count,
        history_daily_bars AS daily_bars, latest_reference_session, best_rank,
        warmup_attempts, warmup_cooldown_until
+       history_latest_session,
+       (state IN ('research_ready', 'research_scanned')) AS freshness_topup
 FROM public.research_symbols
-WHERE state IN ('discovered', 'history_required', 'history_warming')
-  AND warmup_attempts < $1
+WHERE warmup_attempts < $1
   AND (admission_state IS NULL
        OR admission_state IN ('eligible_for_history',
                               'insufficient_admission_data'))
+  AND (
+       state IN ('discovered', 'history_required', 'history_warming')
+       -- FRESHNESS TOP-UP (T3/T4). A symbol that already holds enough history
+       -- still cannot be scanned FOR session S unless its own bars reach S,
+       -- and nothing used to refresh it: warmup only ever looked at symbols
+       -- that were short of history, never at ones that were merely stale.
+       -- That is why every symbol scanned on 2026-08-31 was reading bars that
+       -- stopped on 2026-08-28 while SPY had moved on — the benchmark half of
+       -- the comparison was three days ahead of the symbol half.
+       OR (state IN ('research_ready', 'research_scanned')
+           AND ($2::date IS NULL OR history_latest_session IS NULL
+                OR history_latest_session < $2::date))
+  )
 """
 
 
 async def select_warmup_batch(conn, *, limit: int = ru.MAX_WARMUP_SYMBOLS_PER_RUN,
+                              target_session: Optional[date] = None,
                               now: Optional[datetime] = None,
                               ) -> List[Dict[str, Any]]:
     """The next symbols to warm, in the documented lexicographic order.
 
     Symbols in cooldown are skipped rather than counted against the batch: a
     parked symbol must not silently consume the budget of a healthy one.
+
+    `target_session` admits the freshness top-up class and puts it FIRST. That
+    ordering is a correctness decision, not a throughput one: a stale ready
+    symbol is one request away from being scannable for this session, while a
+    zero-bar symbol needs a full fetch and still will not be ready for months.
+    Spending the same bounded budget on the former is what makes a
+    session-aligned scan possible at all. The budget itself is unchanged.
     """
     moment = now or datetime.now(timezone.utc)
     rows = [dict(r) for r in await conn.fetch(
-        WARMUP_SELECT_SQL, ru.MAX_WARMUP_ATTEMPTS)]
+        WARMUP_SELECT_SQL, ru.MAX_WARMUP_ATTEMPTS, target_session)]
     eligible = [r for r in rows
                 if not ru.is_in_cooldown(r["warmup_cooldown_until"], now=moment)]
-    return ru.prioritise(eligible, limit=limit)
+    topups = [r for r in eligible if r.get("freshness_topup")]
+    rest = [r for r in eligible if not r.get("freshness_topup")]
+    ordered = ru.prioritise(topups, limit=limit)
+    if len(ordered) < limit:
+        ordered += ru.prioritise(rest, limit=limit - len(ordered))
+    return ordered
 
 
 async def warm_symbol(conn, provider, symbol: str, *,
@@ -486,27 +515,60 @@ async def warm_symbol(conn, provider, symbol: str, *,
                        symbol, code, klass)
         return result
 
-    after = (await bar_counts(conn, [symbol])).get(symbol, {}).get("bars", 0)
+    counts = (await bar_counts(conn, [symbol])).get(symbol, {})
+    after = counts.get("bars", 0)
     result["bars_after"] = after
-    # A symbol the provider serves but cannot fill is `unavailable`, not
-    # `failed`: retrying will not conjure history that does not exist. Two
-    # shapes of that, both terminal:
-    #   * it returned almost nothing at all (a very recent listing);
-    #   * it returned NOTHING NEW on a repeat call, which is the provider
-    #     saying it has given us everything it holds. Without this second
-    #     case a symbol whose listing is younger than the 24-month gate burns
-    #     all three attempts and lands in `failed`, which reads as our fault.
+
+    # TWO DIFFERENT SENTENCES THAT USED TO BE ONE (T7)
+    # ------------------------------------------------
+    # `exhausted` previously meant "a repeat call returned nothing new", and
+    # that was read as terminal. But "nothing new" has two causes and only one
+    # of them is about the symbol:
+    #
+    #   * the provider has no more history BEHIND today — a real, permanent
+    #     fact about back-history under a two-year plan;
+    #   * we asked twice within the SAME session, so of course nothing moved —
+    #     a fact about our own timing, not about the symbol.
+    #
+    # AAL, ETHA and SOXL hit the second case on 499 bars / 23 completed months
+    # and were marked terminal one month-group short of ready. Because
+    # `unavailable` is excluded from warmup selection, the error code that put
+    # them there could never be cleared: a closed loop.
+    #
+    # So exhaustion is now recorded as a NON-terminal fact, and terminality is
+    # reserved for the one shape that time cannot fix — the provider barely
+    # carries the symbol at all.
     exhausted = attempt_number > 1 and after == before and after > 0
-    terminal = after < ru.RESEARCH_MIN_USABLE_BARS or exhausted
+    too_thin = after < ru.RESEARCH_MIN_USABLE_BARS
+    months_short = ru.months_short_of_ready(counts.get("month_groups"))
+
+    if too_thin:
+        code, klass, cooldown = "insufficient_provider_history", "terminal", None
+    elif months_short > 0:
+        # Waiting for the calendar, not for the provider. Park until the month
+        # boundary that could actually change the answer, so a maturing symbol
+        # stops competing with real work for the bounded request budget — and
+        # so `warmup_attempts` never accumulates against it while it waits.
+        code = ("provider_history_exhausted" if exhausted
+                else "awaiting_history_maturity")
+        klass = "maturing"
+        cooldown = ru.next_maturity_recheck(moment, months_short=months_short)
+    else:
+        code, klass, cooldown = None, None, None
+
     await conn.execute(
         "UPDATE public.research_symbols SET warmup_last_error_code=$2, "
-        "warmup_last_error_class=$3, warmup_cooldown_until=NULL, "
-        "warmup_provider_requests=warmup_provider_requests+1, updated_at=NOW() "
+        "warmup_last_error_class=$3, warmup_cooldown_until=$4, "
+        "warmup_provider_requests=warmup_provider_requests+1, "
+        # An attempt that reached the provider and simply found the symbol too
+        # young is not a failed attempt (T8). Rolling it back keeps a bounded
+        # counter from turning "come back next month" into permanent failure —
+        # which is exactly what would have stranded SPCX on its third warm.
+        "warmup_attempts = GREATEST(0, warmup_attempts - $5), updated_at=NOW() "
         "WHERE symbol=$1",
-        symbol,
-        ("provider_history_exhausted" if exhausted
-         else "insufficient_provider_history") if terminal else None,
-        "terminal" if terminal else None)
+        symbol, code, klass, cooldown, 1 if klass == "maturing" else 0)
+    result["maturity_months_short"] = months_short
+    result["recheck_after"] = cooldown
     return result
 
 
@@ -514,6 +576,7 @@ async def run_warmup(conn, provider, *,
                      limit: int = ru.MAX_WARMUP_SYMBOLS_PER_RUN,
                      max_requests: int = ru.MAX_PROVIDER_REQUESTS_PER_RUN,
                      spacing_seconds: Optional[int] = None,
+                     target_session: Optional[date] = None,
                      now: Optional[datetime] = None) -> Dict[str, Any]:
     """Warm a bounded batch, sequentially, counting every provider call.
 
@@ -546,7 +609,8 @@ async def run_warmup(conn, provider, *,
         return summary
 
     try:
-        batch = await select_warmup_batch(conn, limit=limit, now=moment)
+        batch = await select_warmup_batch(
+            conn, limit=limit, target_session=target_session, now=moment)
         summary["selected"] = [r["symbol"] for r in batch]
         for index, row in enumerate(batch):
             if summary["provider_requests"] >= max_requests:

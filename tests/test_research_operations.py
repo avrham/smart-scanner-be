@@ -222,8 +222,14 @@ class TestAdmissionBlocksWarmup:
         assert ri.WARMUP_SELECT_SQL.index("admission_state") > \
             ri.WARMUP_SELECT_SQL.index("WHERE")
         source = open("app/research_ingest.py", encoding="utf-8").read()
-        # and the ordering is applied to what the SQL already filtered
-        assert "ru.prioritise(eligible" in source
+        # and the ordering is applied to what the SQL already filtered.
+        # `eligible` is now split into the freshness top-up class and the rest
+        # before prioritising, so BOTH orderings must draw from it and neither
+        # may reach past it to the raw rows.
+        assert "ru.prioritise(topups" in source
+        assert "ru.prioritise(rest" in source
+        assert "topups = [r for r in eligible" in source
+        assert "rest = [r for r in eligible" in source
 
 
 class FakeAdmissionConn:
