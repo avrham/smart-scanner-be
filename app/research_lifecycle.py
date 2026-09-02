@@ -278,6 +278,19 @@ async def run_lifecycle(conn, *,
         target = pinned
         summary["target_completed_session"] = target.isoformat()
         summary["session_pinned_from_run"] = True
+    # BUDGET IS PER RUN, NOT PER ATTEMPT (T13).
+    # `provider_budget` arrives as a per-invocation number, so without this a
+    # durable re-entry would silently hand itself a fresh ceiling and one
+    # scheduled occurrence could spend MAX_PROVIDER_REQUESTS_PER_RUN once per
+    # attempt. The deferral path happens to spend nothing — the freshness gate
+    # returns before any provider stage — but a post-gate retryable failure
+    # would multiply, and raising the attempt budget from 2 to 4 for T11 would
+    # have quadrupled the worst case rather than doubled it.
+    already_spent = int(run.get("provider_calls_used") or 0)
+    if already_spent:
+        provider_budget = max(0, int(provider_budget) - already_spent)
+        summary["provider_budget"] = provider_budget
+        summary["provider_calls_used_in_earlier_attempts"] = already_spent
     summary["run_id"] = run["id"]
     warm_detail: Dict[str, Dict[str, int]] = {}
     funnel: Dict[str, Any] = {}

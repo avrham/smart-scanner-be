@@ -671,3 +671,156 @@ class TestMaturityWriteAgainstRealConstraints:
         assert row["warmup_last_error_class"] in ("retryable", "terminal",
                                                   "operator_error")
         assert row["warmup_last_error_code"] is not None
+
+
+# =========================================================================== #
+# D6-D10 / T15 — HEALTHY_WAITING vs TERMINAL_BLOCKED, from persisted rows
+#
+# Since the lifecycle defers and re-enters, `blocked_stale_core_history` covers
+# both "healthy, the queue will bring it back" and "stopped, an operator must
+# act". A monitor that cannot tell them apart pages every morning or never.
+# These prove the distinction is decidable from persisted state alone.
+# =========================================================================== #
+
+import app.research_runs as rr
+
+
+async def _mk_run(conn, run_key, *, run_status, target=date(2026, 9, 2)):
+    return await conn.fetchval(
+        "INSERT INTO public.research_lifecycle_runs "
+        "(run_key, contract_version, status, target_session) "
+        "VALUES ($1,'v1',$2,$3) RETURNING id", run_key, run_status, target)
+
+
+async def _mk_task(conn, run_key, *, status, attempt, max_attempts=4,
+                   available_at=None):
+    available_at = available_at or datetime.now(UTC)   # NOT NULL in the schema
+    job_id = await conn.fetchval(
+        "INSERT INTO public.job_runs (job_type, job_contract_version,"
+        " queue_name, idempotency_key, status, requested_by) "
+        "VALUES ('smart_scanner_research_lifecycle.v1','v1','research_lifecycle',"
+        "        $1,'running','scheduler') RETURNING id", f"rlcjob:{run_key}")
+    await conn.execute(
+        "INSERT INTO public.job_tasks (job_id, queue_name, task_type,"
+        " task_contract_version, task_key, ordinal, payload, payload_hash,"
+        " idempotency_key, status, priority, max_attempts, attempt_count,"
+        " available_at) "
+        "VALUES ($1,'research_lifecycle','smart_scanner_research_lifecycle_run.v1',"
+        "        'v1','lifecycle',0,'{}'::jsonb,'h',$2,$3,100,$4,$5,$6)",
+        job_id, f"rlctask:{run_key}", status, max_attempts, attempt, available_at)
+
+
+class TestOperationalHealthPredicate:
+
+    def _health(self, pg, setup):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await conn.execute(
+                    "TRUNCATE public.research_lifecycle_run_symbols,"
+                    " public.research_lifecycle_runs CASCADE")
+                await conn.execute("DELETE FROM public.job_tasks")
+                await conn.execute("DELETE FROM public.job_events")
+                await conn.execute("DELETE FROM public.job_runs")
+                await setup(conn)
+                return await rr.run_health(conn)
+            finally:
+                await conn.close()
+        return asyncio.run(go())
+
+    def test_d6_a_deferred_run_reads_as_healthy_waiting(self, pg):
+        """The exact 2026-09-02 shape under the new architecture: blocked on
+        stale core, task retryable, a future attempt scheduled."""
+        async def setup(conn):
+            await _mk_run(conn, "rlc:sch:wait", run_status="blocked_stale_core_history")
+            await _mk_task(conn, "rlc:sch:wait", status="retryable", attempt=1,
+                           available_at=datetime.now(UTC) + timedelta(minutes=30))
+        rows = self._health(pg, setup)
+        assert len(rows) == 1
+        assert rows[0]["health"] == rr.HEALTH_HEALTHY_WAITING
+        assert rows[0]["run_status"] == "blocked_stale_core_history"
+
+    def test_d7_a_terminal_prerequisite_failure_reads_as_terminal_blocked(self, pg):
+        """Same run status, but the task failed — nothing will come back."""
+        async def setup(conn):
+            await _mk_run(conn, "rlc:sch:dead", run_status="blocked_stale_core_history")
+            await _mk_task(conn, "rlc:sch:dead", status="failed", attempt=2)
+        rows = self._health(pg, setup)
+        assert rows[0]["health"] == rr.HEALTH_TERMINAL_BLOCKED
+
+    def test_d8_an_exhausted_attempt_budget_reads_as_terminal_blocked(self, pg):
+        """Retryable in name, but no attempts left is not a future attempt."""
+        async def setup(conn):
+            await _mk_run(conn, "rlc:sch:spent", run_status="blocked_stale_core_history")
+            await _mk_task(conn, "rlc:sch:spent", status="retryable", attempt=4,
+                           max_attempts=4,
+                           available_at=datetime.now(UTC) + timedelta(minutes=30))
+        rows = self._health(pg, setup)
+        assert rows[0]["health"] == rr.HEALTH_TERMINAL_BLOCKED
+
+    def test_d9_a_continued_run_reads_as_completed_with_no_residual_wait(self, pg):
+        async def setup(conn):
+            await _mk_run(conn, "rlc:sch:done", run_status="completed")
+            await _mk_task(conn, "rlc:sch:done", status="succeeded", attempt=3)
+        rows = self._health(pg, setup)
+        assert rows[0]["health"] == rr.HEALTH_COMPLETED
+        assert rows[0]["task_status"] == "succeeded"
+
+    def test_d10_a_deferred_task_survives_reclaim_without_a_second_run(self, pg):
+        """Crash/reclaim: the task returns to retryable and is re-claimable;
+        the run keeps ONE identity."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await conn.execute(
+                    "TRUNCATE public.research_lifecycle_run_symbols,"
+                    " public.research_lifecycle_runs CASCADE")
+                await conn.execute("DELETE FROM public.job_tasks")
+                await conn.execute("DELETE FROM public.job_events")
+                await conn.execute("DELETE FROM public.job_runs")
+                await _mk_run(conn, "rlc:sch:crash",
+                              run_status="blocked_stale_core_history")
+                await _mk_task(conn, "rlc:sch:crash", status="retryable",
+                               attempt=1,
+                               available_at=datetime.now(UTC) - timedelta(minutes=1))
+                # re-open the SAME run, as a re-entry does
+                first = await rr.start_run(conn, run_key="rlc:sch:crash",
+                                           target_session=date(2026, 9, 2))
+                second = await rr.start_run(conn, run_key="rlc:sch:crash",
+                                            target_session=date(2026, 9, 3))
+                n = await conn.fetchval(
+                    "SELECT count(*) FROM public.research_lifecycle_runs")
+                health = await rr.run_health(conn)
+                return first, second, n, health
+            finally:
+                await conn.close()
+        first, second, n, health = asyncio.run(go())
+        assert n == 1, "re-entry must not create a second run"
+        assert first["id"] == second["id"]
+        # and the pin holds even though the caller passed a later session
+        assert second["target_session"] == date(2026, 9, 2)
+        assert health[0]["health"] == rr.HEALTH_HEALTHY_WAITING
+
+    def test_d4_the_run_budget_is_not_reset_by_re_entry(self, pg):
+        """T13: start_run reports what the run already spent, so the next
+        attempt spends the remainder rather than a fresh ceiling."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await conn.execute(
+                    "TRUNCATE public.research_lifecycle_run_symbols,"
+                    " public.research_lifecycle_runs CASCADE")
+                await _mk_run(conn, "rlc:sch:budget",
+                              run_status="blocked_stale_core_history")
+                await conn.execute(
+                    "UPDATE public.research_lifecycle_runs"
+                    " SET provider_calls_used=9 WHERE run_key='rlc:sch:budget'")
+                return await rr.start_run(conn, run_key="rlc:sch:budget",
+                                          target_session=date(2026, 9, 2))
+            finally:
+                await conn.close()
+        run = asyncio.run(go())
+        assert run["provider_calls_used"] == 9
+        remaining = max(0, ru.MAX_PROVIDER_REQUESTS_PER_RUN
+                        - run["provider_calls_used"])
+        assert remaining == 3, "re-entry must spend the remainder, not 12 again"

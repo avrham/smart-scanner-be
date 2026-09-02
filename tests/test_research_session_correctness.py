@@ -629,6 +629,7 @@ import app.jobs.registry as registry
 import app.jobs.research_lifecycle as RL
 import app.jobs.handlers.research_lifecycle_worker as rlw
 import app.research_lifecycle as svc
+import app.research_runs as rr_module
 
 
 def _blocked(requested_status="queued"):
@@ -729,3 +730,89 @@ class TestScheduledContinuation:
         src = inspect.getsource(svc.run_lifecycle)
         assert 'pinned = run.get("target_session")' in src
         assert "target = pinned" in src
+
+
+# =========================================================================== #
+# D1-D5 / T13 / T14 — the prerequisite wait must be side-effect-free, and a
+# deferral must not hand itself a fresh provider budget.
+# =========================================================================== #
+
+class TestPrerequisiteWaitHasNoSideEffects:
+
+    def test_d1_the_freshness_gate_runs_before_any_mutable_research_work(self):
+        """T14. Read the ORDER from the source, not from memory: the gate must
+        come before discovery, admission, warmup, scan and enrichment, so a
+        deferred attempt cannot repeat any of them."""
+        import inspect
+        src = inspect.getsource(svc.run_lifecycle)
+        order = {name: src.index(name) for name in (
+            "check_core_freshness", "_refresh_discovery", "admit_from_discovery",
+            "evaluate_admissions", "_run_warmup", "run_research_scans",
+            "_enrich")}
+        gate = order["check_core_freshness"]
+        for name, pos in order.items():
+            if name == "check_core_freshness":
+                continue
+            assert gate < pos, f"{name} must not precede the freshness gate"
+
+    def test_d1_the_blocked_path_returns_before_the_provider_stages(self):
+        """Everything between the gate and `return summary` on the stale branch
+        must be non-provider: an enqueue and a read."""
+        import inspect
+        src = inspect.getsource(svc.run_lifecycle)
+        head, _ = src.split("# ---- 2.", 1)
+        blocked = head.split("if not freshness[\"fresh\"]:", 1)[1]
+        assert "request_core_refresh" in blocked      # enqueue only
+        assert "load_funnel" in blocked               # read only
+        for forbidden in ("_refresh_discovery", "_run_warmup", "_enrich",
+                          "run_research_scans", "admit_from_discovery"):
+            assert forbidden not in blocked, (
+                f"{forbidden} must not run while waiting for prerequisites")
+
+    def test_d5_a_deferral_cannot_refresh_the_discovery_snapshot(self):
+        """D5/A2: discovery lives after the gate, so a scheduled occurrence
+        blocked on prerequisites cannot produce a second discovery refresh no
+        matter how many times it re-enters."""
+        import inspect
+        src = inspect.getsource(svc.run_lifecycle)
+        assert src.index("check_core_freshness") < src.index("_refresh_discovery")
+
+    def test_t13_re_entry_spends_the_remainder_not_a_fresh_budget(self):
+        import inspect
+        src = inspect.getsource(svc.run_lifecycle)
+        assert 'already_spent = int(run.get("provider_calls_used") or 0)' in src
+        assert "provider_budget = max(0, int(provider_budget) - already_spent)" in src
+
+    def test_t13_start_run_reports_spend_to_date(self):
+        import app.research_runs as rr
+        returning = rr.START_SQL.split("RETURNING")[1]
+        assert "provider_calls_used" in returning
+
+    def test_t13_the_arithmetic(self):
+        """One occurrence, four attempts. Deferrals spend nothing because the
+        gate returns first; only the attempt that passes the gate spends."""
+        budget = ru.MAX_PROVIDER_REQUESTS_PER_RUN
+        spent = 0
+        for attempt, calls in ((1, 0), (2, 0), (3, 0), (4, 8)):
+            remaining = max(0, budget - spent)
+            assert calls <= remaining, f"attempt {attempt} exceeded the run budget"
+            spent += calls
+        assert spent <= budget == 12
+
+    def test_t15_health_states_are_named_and_exported(self):
+        import app.research_runs as rr
+        assert rr.HEALTH_HEALTHY_WAITING == "HEALTHY_WAITING"
+        assert rr.HEALTH_TERMINAL_BLOCKED == "TERMINAL_BLOCKED"
+        assert rr.HEALTH_COMPLETED == "COMPLETED"
+        # decided from persisted columns only — no logs, no memory
+        for col in ("job_tasks", "attempt_count", "max_attempts",
+                    "research_lifecycle_runs"):
+            assert col in rr.RUN_HEALTH_SQL
+
+    def test_t15_a_deferred_run_is_not_reported_as_terminal(self):
+        """The whole point: same run status, opposite operational meaning."""
+        sql = rr_module.RUN_HEALTH_SQL
+        assert "'HEALTHY_WAITING'" in sql and "'TERMINAL_BLOCKED'" in sql
+        # the discriminator is the task, not the run status
+        assert "t.status = 'retryable'" in sql
+        assert "t.attempt_count < t.max_attempts" in sql
