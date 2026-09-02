@@ -222,14 +222,11 @@ class TestAdmissionBlocksWarmup:
         assert ri.WARMUP_SELECT_SQL.index("admission_state") > \
             ri.WARMUP_SELECT_SQL.index("WHERE")
         source = open("app/research_ingest.py", encoding="utf-8").read()
-        # and the ordering is applied to what the SQL already filtered.
-        # `eligible` is now split into the freshness top-up class and the rest
-        # before prioritising, so BOTH orderings must draw from it and neither
-        # may reach past it to the raw rows.
-        assert "ru.prioritise(topups" in source
-        assert "ru.prioritise(rest" in source
-        assert "topups = [r for r in eligible" in source
-        assert "rest = [r for r in eligible" in source
+        # and the ordering is applied to what the SQL already filtered — one
+        # fair queue over the survivors, never reaching past `eligible` to the
+        # raw rows, and never re-admitting a rejection.
+        assert "ru.prioritise_fairly(eligible" in source
+        assert "eligible = [r for r in rows" in source
 
 
 class FakeAdmissionConn:
@@ -318,8 +315,8 @@ class TestCandidateSemantics:
             assert not ru.is_research_candidate(row)
 
     def test_a_survivor_with_evidence_is_a_candidate(self):
-        row = _scanned(structure_state="accumulation",
-                       setup_state="setup_confirmed",
+        row = _scanned(structure_state="recognized",
+                       setup_state="valid",
                        benchmark_relative="outperforming")
         verdict = ru.classify_candidate(row)
         assert verdict["candidate_state"] == ru.CANDIDATE_RESEARCH_CANDIDATE
@@ -354,7 +351,7 @@ class TestCandidateSemantics:
 
     def test_candidate_status_is_not_ENTER_or_WATCH(self):
         # A candidate is "the screen did not disqualify it", never a verdict.
-        row = _scanned(structure_state="accumulation")
+        row = _scanned(structure_state="recognized")
         assert ru.classify_candidate(row)["candidate_state"] \
             == ru.CANDIDATE_RESEARCH_CANDIDATE
         assert "ENTER" not in str(ru.CANDIDATE_STATES)

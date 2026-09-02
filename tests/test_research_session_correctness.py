@@ -473,3 +473,142 @@ class TestEnrichmentProvenance:
     def test_enrichment_without_a_session_selects_nobody(self):
         assert asyncio.run(
             re_.candidate_symbols(None, target_session=None)) == []
+
+
+# =========================================================================== #
+# BLOCKER A — positive evidence must be affirmative
+#
+# `screen_findings` is an OR: any single finding promotes a candidate. Both
+# state tests used to be DENYLISTS written against vocabularies the strategies
+# do not emit, so indeterminate — and in one case actively negative — states
+# counted as evidence FOR the symbol.
+# =========================================================================== #
+
+class TestAffirmativeEvidence:
+
+    def _scanned(self, **evidence):
+        row = {"state": ru.STATE_RESEARCH_SCANNED, "rejection_reason": None,
+               "structure_state": None, "setup_state": None,
+               "benchmark_relative": None}
+        row.update(evidence)
+        return row
+
+    def test_1_setup_unknown_is_not_setup_present(self):
+        """`unknown` means policy.py could not read the structure at all."""
+        assert ru.SCREEN_SETUP_PRESENT not in ru.screen_findings(
+            self._scanned(setup_state="unknown"))
+
+    def test_1b_setup_invalid_is_not_setup_present(self):
+        """Worse than `unknown` and previously admitted too: `invalid` is the
+        strategy reading the structure and DISQUALIFYING it."""
+        assert ru.SCREEN_SETUP_PRESENT not in ru.screen_findings(
+            self._scanned(setup_state="invalid"))
+
+    def test_2_structure_unknown_is_not_structure_present(self):
+        assert ru.SCREEN_STRUCTURE_PRESENT not in ru.screen_findings(
+            self._scanned(structure_state="unknown"))
+
+    def test_2b_structure_ambiguous_is_not_structure_present(self):
+        """The old exclusion list was ('none','absent') — neither of which the
+        classifier ever emits, so `ambiguous` sailed through it."""
+        assert ru.SCREEN_STRUCTURE_PRESENT not in ru.screen_findings(
+            self._scanned(structure_state="ambiguous"))
+
+    def test_2c_benchmark_underperforming_is_not_a_leading_finding(self):
+        assert ru.SCREEN_BENCHMARK_LEADING not in ru.screen_findings(
+            self._scanned(benchmark_relative="underperforming"))
+
+    def test_3_unknown_only_evidence_cannot_create_a_candidate(self):
+        for row in (self._scanned(setup_state="unknown"),
+                    self._scanned(structure_state="unknown"),
+                    self._scanned(structure_state="ambiguous",
+                                  setup_state="unknown"),
+                    self._scanned(setup_state="invalid",
+                                  benchmark_relative="underperforming")):
+            verdict = ru.classify_candidate(row)
+            assert verdict["candidate_state"] != ru.CANDIDATE_RESEARCH_CANDIDATE
+            assert ru.SCREEN_NO_EVIDENCE in verdict["screen"]
+
+    def test_4_affirmative_states_still_produce_their_findings(self):
+        assert ru.screen_findings(self._scanned(
+            structure_state="recognized")) == [ru.SCREEN_STRUCTURE_PRESENT]
+        assert ru.screen_findings(self._scanned(
+            setup_state="valid")) == [ru.SCREEN_SETUP_PRESENT]
+        assert ru.screen_findings(self._scanned(
+            benchmark_relative="outperforming")) == [ru.SCREEN_BENCHMARK_LEADING]
+        # TSLL's actual shape: all three, and still a candidate.
+        assert ru.classify_candidate(self._scanned(
+            structure_state="recognized", setup_state="valid",
+            benchmark_relative="outperforming")
+        )["candidate_state"] == ru.CANDIDATE_RESEARCH_CANDIDATE
+
+    def test_5_hard_rejection_semantics_are_unchanged(self):
+        """A `rejection_reason` still ends the matter and still returns alone."""
+        row = self._scanned(rejection_reason="htf_contradiction",
+                            structure_state="recognized", setup_state="valid",
+                            benchmark_relative="outperforming")
+        assert ru.screen_findings(row) == [ru.SCREEN_HARD_DISQUALIFIED]
+        verdict = ru.classify_candidate(row)
+        assert verdict["candidate_state"] == ru.CANDIDATE_SCANNED_NOT_CANDIDATE
+        assert verdict["reason"] == "htf_contradiction"
+
+    def test_the_allowlists_are_allowlists(self):
+        assert ru.STRUCTURE_AFFIRMATIVE == ("recognized",)
+        assert ru.SETUP_AFFIRMATIVE == ("valid",)
+        assert ru.BENCHMARK_AFFIRMATIVE == ("outperforming",)
+
+    def test_the_funnel_partition_agrees_with_the_screen(self):
+        """The session-scoped derivation must not re-admit what the screen
+        rejects — both read the same evidence."""
+        stale_shape = {"symbol": "X", "admission_state": "eligible_for_history",
+                       "state": ru.STATE_RESEARCH_SCANNED, "candidate_state": None,
+                       "has_current_scan": True, "has_any_scan": True,
+                       "rejection_reason": None, "structure_state": "unknown",
+                       "setup_state": "unknown", "benchmark_relative": None}
+        assert rf.lifecycle_state(stale_shape) == rf.LIFECYCLE_SCANNED_NOT_CANDIDATE
+
+
+# =========================================================================== #
+# T9 — fairness. The pure-ordering half; the multi-session proof lives in
+# tests/test_research_session_correctness_integration.py against real Postgres.
+# =========================================================================== #
+
+class TestFairnessOrdering:
+
+    def _row(self, symbol, served):
+        return {"symbol": symbol, "last_served_at": served, "reasons": [],
+                "observation_count": 1, "daily_bars": 500, "best_rank": 100}
+
+    def test_least_recently_served_sorts_first(self):
+        rows = [self._row("NEW", datetime(2026, 9, 1, tzinfo=UTC)),
+                self._row("OLD", datetime(2026, 8, 1, tzinfo=UTC)),
+                self._row("MID", datetime(2026, 8, 15, tzinfo=UTC))]
+        assert [r["symbol"] for r in ru.prioritise_fairly(rows, limit=3)] == [
+            "OLD", "MID", "NEW"]
+
+    def test_service_moves_a_symbol_to_the_back(self):
+        rows = [self._row("A", datetime(2026, 8, 1, tzinfo=UTC)),
+                self._row("B", datetime(2026, 8, 2, tzinfo=UTC))]
+        assert ru.prioritise_fairly(rows, limit=1)[0]["symbol"] == "A"
+        rows[0]["last_served_at"] = datetime(2026, 8, 3, tzinfo=UTC)
+        assert ru.prioritise_fairly(rows, limit=1)[0]["symbol"] == "B"
+
+    def test_ordering_is_total_and_reproducible(self):
+        same = datetime(2026, 8, 1, tzinfo=UTC)
+        rows = [self._row("B", same), self._row("A", same)]
+        once = [r["symbol"] for r in ru.prioritise_fairly(rows, limit=2)]
+        twice = [r["symbol"] for r in ru.prioritise_fairly(list(reversed(rows)),
+                                                           limit=2)]
+        assert once == twice == ["A", "B"]
+
+    def test_the_batch_stays_bounded(self):
+        rows = [self._row(f"S{i}", datetime(2026, 8, 1, tzinfo=UTC))
+                for i in range(50)]
+        assert len(ru.prioritise_fairly(
+            rows, limit=ru.MAX_WARMUP_SYMBOLS_PER_RUN)) == 5
+
+    def test_selection_no_longer_orders_by_class(self):
+        import inspect
+        src = inspect.getsource(ri.select_warmup_batch)
+        assert "prioritise_fairly" in src
+        assert "topups = [r for r in eligible" not in src

@@ -653,8 +653,8 @@ class TestResearchCandidates:
 
     def test_what_the_screen_found_is_strategy_evidence_only(self):
         findings = ru.screen_findings(
-            self._row(structure_state="accumulation",
-                      setup_state="setup_forming",
+            self._row(structure_state="recognized",
+                      setup_state="valid",
                       benchmark_relative="outperforming"))
         assert set(findings) <= set(ru.SCREEN_REASONS)
         assert ru.SCREEN_STRUCTURE_PRESENT in findings
@@ -685,8 +685,8 @@ class TestResearchCandidates:
 
     def test_no_score_is_produced_anywhere(self):
         verdict = ru.classify_candidate(
-            self._row(structure_state="accumulation",
-                      setup_state="setup_confirmed"))
+            self._row(structure_state="recognized",
+                      setup_state="valid"))
         for banned in ("score", "rank", "weight", "confidence"):
             assert banned not in verdict
 

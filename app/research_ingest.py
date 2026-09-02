@@ -407,9 +407,14 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
 WARMUP_SELECT_SQL = """
 SELECT symbol, discovery_reasons AS reasons, discovery_observation_count AS observation_count,
        history_daily_bars AS daily_bars, latest_reference_session, best_rank,
-       warmup_attempts, warmup_cooldown_until
+       warmup_attempts, warmup_cooldown_until,
        history_latest_session,
-       (state IN ('research_ready', 'research_scanned')) AS freshness_topup
+       (state IN ('research_ready', 'research_scanned')) AS freshness_topup,
+       -- FAIRNESS CLOCK (T9). "How long since this symbol was last serviced,
+       -- or since it arrived if it never has been." Both columns already
+       -- exist and are already maintained, so eventual progress needs no new
+       -- state and no second scheduler.
+       COALESCE(warmup_last_attempt_at, first_observed_at) AS last_served_at
 FROM public.research_symbols
 WHERE warmup_attempts < $1
   AND (admission_state IS NULL
@@ -424,8 +429,13 @@ WHERE warmup_attempts < $1
        -- That is why every symbol scanned on 2026-08-31 was reading bars that
        -- stopped on 2026-08-28 while SPY had moved on — the benchmark half of
        -- the comparison was three days ahead of the symbol half.
-       OR (state IN ('research_ready', 'research_scanned')
-           AND ($2::date IS NULL OR history_latest_session IS NULL
+       -- With no target session there is nothing to be stale RELATIVE TO, so
+       -- this branch must be inert rather than universally true — otherwise a
+       -- caller that omits the session sweeps every ready symbol into the
+       -- batch and spends the budget refreshing things toward no deadline.
+       OR ($2::date IS NOT NULL
+           AND state IN ('research_ready', 'research_scanned')
+           AND (history_latest_session IS NULL
                 OR history_latest_session < $2::date))
   )
 """
@@ -440,24 +450,42 @@ async def select_warmup_batch(conn, *, limit: int = ru.MAX_WARMUP_SYMBOLS_PER_RU
     Symbols in cooldown are skipped rather than counted against the batch: a
     parked symbol must not silently consume the budget of a healthy one.
 
-    `target_session` admits the freshness top-up class and puts it FIRST. That
-    ordering is a correctness decision, not a throughput one: a stale ready
-    symbol is one request away from being scannable for this session, while a
-    zero-bar symbol needs a full fetch and still will not be ready for months.
-    Spending the same bounded budget on the former is what makes a
-    session-aligned scan possible at all. The budget itself is unchanged.
+    `target_session` admits the freshness top-up class — a symbol that already
+    holds enough history but whose bars lag the session cannot be scanned for
+    it, and nothing used to refresh those.
+
+    ONE QUEUE, ORDERED BY WHO HAS WAITED LONGEST (T9)
+    -------------------------------------------------
+    The first cut of this function took freshness top-ups FIRST and gave cold
+    symbols whatever slots were left. That starves, provably and permanently:
+    every new session re-stales every current symbol, so with five or more
+    ready symbols the top-up class refills to the cap every single run and no
+    cold symbol is ever reached. Worse, `priority_key` sorts on static
+    attributes only, so it was the SAME five ready symbols every run — twelve
+    stale-ready symbols starved down to five served and seven never touched.
+
+    So there is no class ordering at all. There is one queue, ordered by
+    `last_served_at` — last warm attempt, or arrival for a symbol never warmed
+    — and being served is the only thing that moves a symbol to the back of
+    it. Every eligible symbol therefore reaches the front within ceil(N/limit)
+    runs, which is the progress guarantee; `priority_key` remains the
+    tie-break, so ordering stays total and reproducible.
+
+    This needs no reserved ratio, and deliberately so: a ratio would have to
+    be justified, and the right split is not a constant. Service share falls
+    out of backlog size instead, which is the correct behaviour here because
+    the two backlogs are different SHAPES — bootstrap is finite and drains (a
+    cold symbol is ready after one successful warm) while freshness is
+    permanent maintenance. During bootstrap the queue lends capacity to cold
+    symbols in proportion to how many are waiting; once they are drained every
+    slot returns to freshness on its own.
     """
     moment = now or datetime.now(timezone.utc)
     rows = [dict(r) for r in await conn.fetch(
         WARMUP_SELECT_SQL, ru.MAX_WARMUP_ATTEMPTS, target_session)]
     eligible = [r for r in rows
                 if not ru.is_in_cooldown(r["warmup_cooldown_until"], now=moment)]
-    topups = [r for r in eligible if r.get("freshness_topup")]
-    rest = [r for r in eligible if not r.get("freshness_topup")]
-    ordered = ru.prioritise(topups, limit=limit)
-    if len(ordered) < limit:
-        ordered += ru.prioritise(rest, limit=limit - len(ordered))
-    return ordered
+    return ru.prioritise_fairly(eligible, limit=limit)
 
 
 async def warm_symbol(conn, provider, symbol: str, *,

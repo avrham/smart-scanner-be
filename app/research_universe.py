@@ -369,6 +369,34 @@ def prioritise(rows: Sequence[Dict[str, Any]], *,
     return sorted(rows, key=priority_key)[:max(0, limit)]
 
 
+def fairness_key(row: Dict[str, Any]) -> Tuple:
+    """Least-recently-served first, then the documented priority order.
+
+    `last_served_at` is the last warm ATTEMPT, or arrival for a symbol never
+    warmed (see WARMUP_SELECT_SQL). Ordering on it is what makes bounded
+    per-run capacity fair rather than merely bounded: service pushes a symbol
+    to the back, so no symbol can be permanently skipped and every eligible
+    symbol reaches the front within ceil(N/limit) runs.
+
+    Arrival — rather than "infinitely old" — is what a never-served symbol
+    gets, and that matters. Treating NULL as the oldest possible value would
+    let admission (up to MAX_NEW_RESEARCH_SYMBOLS_PER_RUN newcomers per run,
+    the same number as the warm limit) push a fresh cohort to the front every
+    single run and starve maintenance instead. This is FIFO on "waiting
+    since", which has no such mirror image.
+    """
+    served = row.get("last_served_at")
+    stamp = served.timestamp() if isinstance(served, datetime) else 0.0
+    return (stamp,) + priority_key(row)
+
+
+def prioritise_fairly(rows: Sequence[Dict[str, Any]], *,
+                      limit: int = MAX_WARMUP_SYMBOLS_PER_RUN,
+                      ) -> List[Dict[str, Any]]:
+    """One fair queue, then a hard cut. Still no score, still deterministic."""
+    return sorted(rows, key=fairness_key)[:max(0, limit)]
+
+
 def explain_priority(row: Dict[str, Any]) -> List[str]:
     """The dimensions that put this row where it is, in words.
 
@@ -441,7 +469,34 @@ RECENT_DISCOVERY_MAX_SESSIONS = 3
 #: `prospective_campaign.candidate_signal_fields`, which reads
 #: `setup_state not in (None, "absent", "none")`). Restated here as a tuple for
 #: readability only — the membership rule is the strategy's, not ours.
-_SETUP_ABSENT = (None, "", "absent", "none")
+#: POSITIVE EVIDENCE MUST BE AFFIRMATIVE (T10).
+#:
+#: These were denylists — "anything that is not absent counts as present" — and
+#: both were wrong, in the same way and for the same reason: they were written
+#: against a vocabulary the strategies do not actually emit.
+#:
+#:   * `structure_state` is 'recognized' | 'ambiguous' | 'unknown' (the
+#:     classifier's own three-way read, app/scanner_view.py:189). It never
+#:     emits 'none' or 'absent', so the old exclusion list `("none","absent")`
+#:     excluded NOTHING and `unknown` — structure could not be read at all —
+#:     counted as structure present.
+#:
+#:   * `setup_state` is 'valid' | 'invalid' | 'unknown' (a real 3-way outcome
+#:     from policy.py, documented at app/scanner_view.py:62). The old list
+#:     admitted `unknown` AND `invalid`, so the strategy explicitly reading the
+#:     structure and DISQUALIFYING it produced `research_setup_present`.
+#:
+#: Since `screen_findings` is an OR and any single finding promotes a
+#: candidate, either of those could have promoted a symbol on the strength of
+#: the strategy having failed to read it. In the audited 2026-08-31 run nothing
+#: was promoted this way only because every affected symbol also carried a
+#: `rejection_reason`, which short-circuits first. That is luck, not a gate.
+#:
+#: Allowlists, therefore. An indeterminate state is not evidence, and a
+#: negative state is certainly not evidence FOR the symbol.
+STRUCTURE_AFFIRMATIVE = ("recognized",)
+SETUP_AFFIRMATIVE = ("valid",)
+BENCHMARK_AFFIRMATIVE = ("outperforming",)
 
 
 def looked_because(row: Dict[str, Any], *,
@@ -478,12 +533,15 @@ def screen_findings(row: Dict[str, Any]) -> List[str]:
     if row.get("rejection_reason"):
         return [SCREEN_HARD_DISQUALIFIED]
     out: List[str] = []
-    structure = row.get("structure_state")
-    if structure and structure not in ("none", "absent"):
+    # Affirmative states only. `unknown`/`ambiguous` mean the strategy could
+    # not read the symbol, and `invalid` means it read it and said no; neither
+    # is a finding IN FAVOUR of the symbol, and an OR-of-findings screen would
+    # otherwise let one of them stand alone as the whole case for a candidate.
+    if row.get("structure_state") in STRUCTURE_AFFIRMATIVE:
         out.append(SCREEN_STRUCTURE_PRESENT)
-    if row.get("setup_state") not in _SETUP_ABSENT:
+    if row.get("setup_state") in SETUP_AFFIRMATIVE:
         out.append(SCREEN_SETUP_PRESENT)
-    if row.get("benchmark_relative") == "outperforming":
+    if row.get("benchmark_relative") in BENCHMARK_AFFIRMATIVE:
         out.append(SCREEN_BENCHMARK_LEADING)
     return out or [SCREEN_NO_EVIDENCE]
 
@@ -563,6 +621,9 @@ __all__ = [
     "MAX_NEW_RESEARCH_SYMBOLS_PER_RUN", "MAX_WARMUP_SYMBOLS_PER_RUN",
     "MAX_PROVIDER_REQUESTS_PER_RUN", "MAX_CONCURRENT_WARMUPS",
     "MAX_WARMUP_ATTEMPTS", "WARMUP_COOLDOWN_MINUTES",
+    "fairness_key", "prioritise_fairly",
+    "STRUCTURE_AFFIRMATIVE", "SETUP_AFFIRMATIVE",
+    "BENCHMARK_AFFIRMATIVE",
     "NON_TERMINAL_HISTORY_ERROR_CODES", "months_short_of_ready",
     "next_maturity_recheck",
     "cooldown_until", "is_in_cooldown",
