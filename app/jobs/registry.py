@@ -153,6 +153,9 @@ def _install_default_handlers() -> None:
         # spend provider requests re-doing work whose likely blocker (stale core
         # bars, a held warmup lock) has not changed within the retry window.
         max_attempts=_rl.RESEARCH_LIFECYCLE_MAX_ATTEMPTS,
+        #: Long, because what it waits out is the prerequisite core-history
+        #: refresh this same lifecycle enqueues (see the constant's comment).
+        retry_backoff_schedule=list(_rl.RESEARCH_LIFECYCLE_BACKOFF_SECONDS),
         production_enabled=True,
     ))
     # A safe, synthetic test handler for controlled retry/crash tests. NEVER

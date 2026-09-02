@@ -621,12 +621,22 @@ class TestDispatchIdentity:
         assert "run_warmup" not in cli
         assert "evaluate_admissions" not in cli
 
-    def test_two_attempts_not_three(self):
-        assert RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS == 2
+    def test_the_attempt_budget_outlasts_the_prerequisite_refresh(self):
+        # Was two, on the reasoning that the blocker "will not have changed
+        # within the retry window". The blocker was right; the window was not.
+        # Stale core bars ARE the normal 08:00 ET blocker and they clear on
+        # their own in 24-45 minutes (measured 2026-09-02), so the budget has
+        # to reach past that or the session is lost — which is exactly what
+        # happened to the 2026-09-01 occurrence.
+        assert RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS == 4
         from app.jobs.registry import resolve_handler
         spec = resolve_handler(RL.RESEARCH_LIFECYCLE_TASK)
-        assert spec.max_attempts == 2
+        assert spec.max_attempts == 4
         assert spec.queue_name == RL.RESEARCH_LIFECYCLE_QUEUE
+        # N attempts need N-1 delays, or the queue makes the missing one
+        # terminal and the extra attempts are decoration.
+        assert len(spec.retry_backoff_schedule) == 3
+        assert sum(spec.retry_backoff_schedule) / 60.0 >= 45.0
 
 
 class TestScheduleOwnership:

@@ -452,7 +452,13 @@ class TestPhase9C3Boundaries:
         shape, and the fact that a schedule with no declared owner is still
         materialised by any leader exactly as before.
         """
-        allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py"}
+        # The research lifecycle's own queue-identity modules are part of
+        # this surface too: the T11 continuation work raised the attempt
+        # budget, added the re-entry backoff, and made a stale-core block
+        # retryable. Still nothing outside the research queue.
+        allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py",
+                   "app/jobs/research_lifecycle.py",
+                   "app/jobs/handlers/research_lifecycle_worker.py"}
         changed = {p for p in _git_diff_names("app/jobs").split("\n") if p}
         assert changed <= allowed, f"unexpected queue changes: {sorted(changed - allowed)}"
 

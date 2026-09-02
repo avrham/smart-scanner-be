@@ -85,7 +85,7 @@ ON CONFLICT (run_key) DO UPDATE SET
     -- A retry re-opens the SAME run rather than creating a second one. The
     -- original started_at is kept: the run began when it began.
     status = 'running', updated_at = NOW()
-RETURNING id, started_at
+RETURNING id, started_at, target_session
 """
 
 
@@ -97,7 +97,12 @@ async def start_run(conn, *, run_key: str, target_session: Optional[date],
     row = await conn.fetchrow(START_SQL, run_key, RESEARCH_RUN_CONTRACT_VERSION,
                               moment, target_session)
     return {"id": str(row["id"]), "run_key": run_key,
-            "started_at": row["started_at"]}
+            "started_at": row["started_at"],
+            # The session this run was opened against. On a RE-ENTRY the
+            # ON CONFLICT above deliberately does not touch `target_session`,
+            # so this is the ORIGINAL pin and the caller must reuse it rather
+            # than re-resolving from a wall clock that has since moved (T12).
+            "target_session": row["target_session"]}
 
 
 FINISH_SQL = """

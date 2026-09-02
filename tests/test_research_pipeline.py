@@ -474,7 +474,12 @@ class TestWarmup:
                   and u[1][1] == "provider_history_exhausted"]
         assert marked, "exhaustion must still be recorded"
         klass, cooldown = marked[0][1][2], marked[0][1][3]
-        assert klass == "maturing"
+        # The class is NULL, not "maturing": waiting for the calendar is not an
+        # error class, and `research_symbols_error_class_ck` admits only
+        # retryable/terminal/operator_error. Writing "maturing" crashed the
+        # live lifecycle on 2026-09-02 (VISN, 159 bars). The code and the
+        # cooldown carry the whole meaning.
+        assert klass is None
         assert klass != "terminal"
         # Parked until a month boundary could actually change the answer,
         # rather than retried every run or condemned forever.
@@ -488,7 +493,7 @@ class TestWarmup:
         # The state it lands in must still be reachable by warmup selection.
         assert ru.classify_history_state(
             daily_bars=359, week_groups=75, month_groups=18, symbol="THIN",
-            attempts=2, last_error_class="maturing",
+            attempts=2, last_error_class=None,
             last_error_code="provider_history_exhausted"
         ) == ru.STATE_HISTORY_WARMING
 

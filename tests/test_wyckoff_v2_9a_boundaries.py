@@ -145,7 +145,12 @@ def test_no_scheduler_change():
     )
     assert result.stdout.strip() == ""
 
-    allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py"}
+    # Plus the research lifecycle's own queue-identity modules, which the
+    # T11 scheduled-completion work touches (attempt budget, re-entry
+    # backoff, retryable stale-core block). Nothing outside that queue.
+    allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py",
+               "app/jobs/research_lifecycle.py",
+               "app/jobs/handlers/research_lifecycle_worker.py"}
     changed = {p for p in _git_diff_names("app/jobs").split("\n") if p}
     assert changed <= allowed, f"unexpected queue changes: {sorted(changed - allowed)}"
 

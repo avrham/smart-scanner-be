@@ -612,3 +612,120 @@ class TestFairnessOrdering:
         src = inspect.getsource(ri.select_warmup_batch)
         assert "prioritise_fairly" in src
         assert "topups = [r for r in eligible" not in src
+
+
+# =========================================================================== #
+# T11 / T12 — the scheduled lifecycle must be able to finish on its own
+#
+# On 2026-09-02 the scheduled occurrence for session 2026-09-01 fired at
+# 08:00 ET, found core bars not yet current, enqueued the refresh itself, and
+# terminated in 0.2s. The refresh finished 24-45 minutes later and nothing
+# resumed the session. Every component was healthy; the session was simply
+# lost. These tests pin the continuation that fixes it.
+# =========================================================================== #
+
+import app.jobs.contracts as C
+import app.jobs.registry as registry
+import app.jobs.research_lifecycle as RL
+import app.jobs.handlers.research_lifecycle_worker as rlw
+import app.research_lifecycle as svc
+
+
+def _blocked(requested_status="queued"):
+    return {
+        "status": svc.STATUS_BLOCKED_STALE,
+        "run_key": "rlc:sch:abc", "run_id": "rid",
+        "target_completed_session": "2026-09-01",
+        "core_refresh_request": {"requested": [
+            {"universe_code": "SMART-SCANNER-REFERENCE-MARKET-V1",
+             "status": requested_status, "job_id": "j1"},
+            {"universe_code": "WYCKOFF-HISTORY-WARMUP-QUALIFICATION",
+             "status": requested_status, "job_id": "j2"}]},
+        "funnel": {}, "enrichment": {},
+    }
+
+
+class TestScheduledContinuation:
+
+    def test_t11_stale_core_with_prerequisites_requested_is_retryable(self):
+        """The exact 2026-09-02 shape must now defer, not end."""
+        out = rlw._bounded_result(_blocked())
+        assert out["status"] == svc.STATUS_BLOCKED_STALE
+        assert rlw._refresh_was_requested(_blocked()) is True
+
+    def test_t11_already_queued_prerequisites_also_justify_deferral(self):
+        assert rlw._refresh_was_requested(_blocked("already_queued")) is True
+        assert rlw._refresh_was_requested(_blocked("already_applied")) is True
+
+    def test_t11_a_refresh_that_could_not_be_requested_does_not_defer(self):
+        """Never wait for something nobody started."""
+        assert rlw._refresh_was_requested(_blocked("not_requested")) is False
+        assert rlw._refresh_was_requested({"core_refresh_request": {}}) is False
+        assert rlw._refresh_was_requested({}) is False
+
+    def test_t11_the_attempt_budget_outlasts_the_measured_refresh(self):
+        """Refresh measured at 23.7 / 44.8 minutes on 2026-09-02. The re-entry
+        schedule must reach past that."""
+        sched = RL.RESEARCH_LIFECYCLE_BACKOFF_SECONDS
+        assert len(sched) == RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS - 1
+        cumulative = [sum(sched[:i + 1]) / 60.0 for i in range(len(sched))]
+        assert cumulative == [30.0, 60.0, 90.0]
+        assert max(cumulative) >= 45.0, "must outlast the measured refresh"
+
+    def test_t11_backoff_is_actually_wired_to_the_handler(self):
+        spec = registry.resolve_handler(RL.RESEARCH_LIFECYCLE_TASK)
+        assert spec.retry_backoff_schedule == RL.RESEARCH_LIFECYCLE_BACKOFF_SECONDS
+        assert spec.max_attempts == RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS
+
+    def test_t11_every_re_entry_is_reachable_by_the_backoff_schedule(self):
+        """A handler that wants N attempts needs N-1 delays, or the queue
+        turns the missing one into a terminal failure."""
+        for attempt in range(1, RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS):
+            assert C.backoff_seconds(
+                attempt, schedule=RL.RESEARCH_LIFECYCLE_BACKOFF_SECONDS) == 1800
+        # the last attempt is terminal by design
+        assert C.backoff_seconds(
+            RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS,
+            schedule=RL.RESEARCH_LIFECYCLE_BACKOFF_SECONDS) is None
+
+    def test_t12_continuation_keeps_one_identity_for_the_occurrence(self):
+        """Same occurrence -> same run_key -> same run row. A deferral is not
+        a second research run."""
+        a = RL.run_key_for_occurrence(schedule_code="SMART-SCANNER-RESEARCH-LIFECYCLE",
+                                      schedule_version=1,
+                                      occurrence_iso="2026-09-03T12:00:00+00:00")
+        b = RL.run_key_for_occurrence(schedule_code="SMART-SCANNER-RESEARCH-LIFECYCLE",
+                                      schedule_version=1,
+                                      occurrence_iso="2026-09-03T12:00:00+00:00")
+        assert a == b
+        nxt = RL.run_key_for_occurrence(schedule_code="SMART-SCANNER-RESEARCH-LIFECYCLE",
+                                        schedule_version=1,
+                                        occurrence_iso="2026-09-04T12:00:00+00:00")
+        assert nxt != a
+
+    def test_t12_a_manual_run_cannot_collide_with_a_pending_occurrence(self):
+        """S11: an operator dispatching while automatic S is deferred must not
+        touch the scheduled occurrence's identity or audit."""
+        manual = RL.manual_run_key(label="adhoc", now=NOW)
+        occ = RL.run_key_for_occurrence(schedule_code="SMART-SCANNER-RESEARCH-LIFECYCLE",
+                                        schedule_version=1,
+                                        occurrence_iso="2026-09-03T12:00:00+00:00")
+        assert manual.startswith("rlc:manual:")
+        assert occ.startswith("rlc:sch:")
+        assert manual != occ
+
+    def test_t12_the_run_row_preserves_the_original_target_session(self):
+        """START_SQL's ON CONFLICT must not overwrite target_session, or a
+        re-entry would re-pin the run to whatever the clock says."""
+        import app.research_runs as rr
+        upsert = rr.START_SQL.split("DO UPDATE SET")[1].split("RETURNING")[0]
+        assert "target_session" not in upsert, (
+            "re-entry must not repoint the run at a different session")
+        assert "target_session" in rr.START_SQL.split("RETURNING")[1], (
+            "start_run must return the pin so the caller can reuse it")
+
+    def test_t12_the_lifecycle_reuses_the_pin_rather_than_the_clock(self):
+        import inspect
+        src = inspect.getsource(svc.run_lifecycle)
+        assert 'pinned = run.get("target_session")' in src
+        assert "target = pinned" in src

@@ -54,11 +54,30 @@ RESEARCH_LIFECYCLE_SCHEDULE_CODE = "SMART-SCANNER-RESEARCH-LIFECYCLE"
 #: The worker type allowed to materialise and to execute this schedule.
 RESEARCH_LIFECYCLE_WORKER_TYPE = "research_lifecycle"
 
-#: Two attempts, not three. The lifecycle is bounded, idempotent and cheap to
-#: repeat tomorrow; a third attempt inside one occurrence would spend provider
-#: requests re-doing work whose only likely blocker (stale core bars, a held
-#: warmup lock) will not have changed within the retry window.
-RESEARCH_LIFECYCLE_MAX_ATTEMPTS = 2
+#: Four attempts, and the reason is the whole of T11.
+#:
+#: It used to be two, on the reasoning that "the only likely blocker (stale
+#: core bars, a held warmup lock) will not have changed within the retry
+#: window". That reasoning was right about the blocker and wrong about the
+#: window. Stale core bars ARE the normal blocker at 08:00 ET, and they clear
+#: on their own — the lifecycle enqueues the refresh itself and the dedicated
+#: worker finishes it. Measured on 2026-09-02: reference 10 symbols in 23.7
+#: minutes, frozen 25 in 44.8. What was missing was not a different blocker
+#: but a long enough window to outlast it.
+#:
+#: So: three deferrals of thirty minutes each. The re-entry at +60 minutes
+#: lands after the measured 45, and two further chances absorb a slow provider
+#: day. Every attempt is complete by 09:30 ET, hours before the 16:00 ET close
+#: that could advance the session — and the session is pinned regardless.
+#:
+#: A deferral is cheap: the freshness gate answers in ~0.2s and the refresh
+#: enqueue is idempotent, so a re-entry that is still early costs one query,
+#: not a provider request.
+RESEARCH_LIFECYCLE_MAX_ATTEMPTS = 4
+
+#: Seconds before each re-entry; `schedule[k-1]` is the delay after the k-th
+#: attempt, so a handler using all N attempts supplies N-1 entries.
+RESEARCH_LIFECYCLE_BACKOFF_SECONDS = [1800, 1800, 1800]
 
 #: Bounded defaults, all overridable from the schedule's payload template.
 DEFAULT_ADMIT_LIMIT = 5
@@ -174,7 +193,8 @@ __all__ = [
     "RESEARCH_LIFECYCLE_JOB_TYPE", "RESEARCH_LIFECYCLE_JOB_CONTRACT",
     "RESEARCH_LIFECYCLE_QUEUE", "RESEARCH_LIFECYCLE_TASK",
     "RESEARCH_LIFECYCLE_SCHEDULE_CODE", "RESEARCH_LIFECYCLE_WORKER_TYPE",
-    "RESEARCH_LIFECYCLE_MAX_ATTEMPTS", "DEFAULT_ADMIT_LIMIT",
+    "RESEARCH_LIFECYCLE_MAX_ATTEMPTS",
+    "RESEARCH_LIFECYCLE_BACKOFF_SECONDS", "DEFAULT_ADMIT_LIMIT",
     "DEFAULT_WARM_LIMIT", "DEFAULT_PROVIDER_BUDGET", "DEFAULT_DISCOVERY_DAYS",
     "run_key_for_occurrence", "manual_run_key", "task_payload_from_template",
     "enqueue_research_lifecycle",

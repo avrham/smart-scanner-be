@@ -265,6 +265,19 @@ async def run_lifecycle(conn, *,
 
     run = await rr.start_run(conn, run_key=run_key, target_session=target,
                              now=moment)
+    # TARGET SESSION IS PINNED BY THE RUN, NOT BY THE CLOCK (T12).
+    # A deferred re-entry runs minutes-to-hours after the first attempt. If it
+    # re-resolved the session it could silently research S+1 the moment the
+    # wall clock crossed a market close, and the audit row would then describe
+    # a session nobody scheduled. The run row remembers which session this
+    # occurrence is about, so continuation reuses it.
+    pinned = run.get("target_session")
+    if pinned and pinned != target:
+        logger.info("research lifecycle re-entry: reusing pinned session %s "
+                    "(clock now resolves %s)", pinned, target)
+        target = pinned
+        summary["target_completed_session"] = target.isoformat()
+        summary["session_pinned_from_run"] = True
     summary["run_id"] = run["id"]
     warm_detail: Dict[str, Dict[str, int]] = {}
     funnel: Dict[str, Any] = {}

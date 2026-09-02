@@ -16,10 +16,24 @@ in `research_lifecycle_runs` where it can be queried.
 
 FAILURE CLASSIFICATION
 ----------------------
-  * `blocked_stale_core_history` / `blocked_canonical_config_unavailable` are
-    NOT failures. They are the gates doing their job, and a run that correctly
-    declined to work must not burn a retry attempt or page anyone. They return
-    ok=True with the status named.
+  * `blocked_canonical_config_unavailable` is NOT a failure. It is a gate
+    doing its job, and a run that correctly declined to work must not page
+    anyone. It returns ok=True with the status named.
+
+  * `blocked_stale_core_history` IS NOT A FAILURE EITHER — but it is also not
+    an ENDING, and treating it as one is what broke the unattended path (T11).
+    The lifecycle fires at 08:00 ET, finds the core bars not yet current for
+    the session, ENQUEUES THE REFRESH ITSELF, and used to return ok=True and
+    stop. The refresh then finished 24-45 minutes later and nothing ever came
+    back: on 2026-09-02 the scheduled occurrence for 2026-09-01 terminated in
+    0.2 seconds and the session's only automated research opportunity was
+    gone, with every piece of infrastructure healthy.
+    So a stale-core block that successfully requested its own prerequisites is
+    now reported as RETRYABLE. The durable queue already knows how to express
+    that: the task goes back to `retryable` with `available_at = NOW() +
+    backoff`, and the worker re-claims it later. Same task, same task_key,
+    same payload, same run_key, same run row, same pinned session — a deferral,
+    not a second run.
   * a funnel that does not conserve IS a failure, and a terminal one: retrying
     an accounting bug produces the same accounting bug.
   * anything else is retryable once (RESEARCH_LIFECYCLE_MAX_ATTEMPTS = 2).
@@ -95,7 +109,31 @@ async def execute_research_lifecycle(conn: asyncpg.Connection,
             "code": "research_lifecycle_failed",
             "message": type(exc).__name__}}
 
+    # Waiting for prerequisites this run itself requested. Handing the queue a
+    # retryable error is what buys the deferral; `_bounded_result` still rides
+    # along so the deferred attempt is legible in the job event.
+    status = summary.get("status")
+    if status == svc.STATUS_BLOCKED_STALE and _refresh_was_requested(summary):
+        return {"ok": False, "error": {
+            "class": C.ERR_RETRYABLE,
+            "code": "awaiting_core_history_refresh",
+            "message": "core history refresh requested; re-entering after backoff"},
+            "result": _bounded_result(summary)}
+
     return {"ok": True, "result": _bounded_result(summary)}
+
+
+def _refresh_was_requested(summary: Dict[str, Any]) -> bool:
+    """Did this attempt actually get its prerequisites moving?
+
+    Only then is deferral honest. If the refresh could NOT be requested — the
+    universe hash is missing, the enqueue raised — then re-entering would wait
+    for something nobody started, and the run should stop and be seen.
+    """
+    requested = ((summary.get("core_refresh_request") or {}).get("requested")
+                 or [])
+    return any(r.get("status") in ("queued", "already_queued", "already_applied")
+               for r in requested)
 
 
 def _bounded_result(summary: Dict[str, Any]) -> Dict[str, Any]:

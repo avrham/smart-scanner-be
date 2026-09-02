@@ -498,3 +498,176 @@ class TestFairness:
             finally:
                 await conn.close()
         asyncio.run(go())
+
+
+# =========================================================================== #
+# S14 / BLOCKER 1 — the maturity write, against the REAL CHECK constraints
+#
+# This is the coverage gap that broke the 2026-09-02 staging validation. The
+# unit fakes record SQL without enforcing constraints, and the tests above
+# exercise `select_warmup_batch` (the READ path) but never `warm_symbol`'s
+# UPDATE. So `warmup_last_error_class = 'maturing'` — a value
+# `research_symbols_error_class_ck` does not admit — reached staging and
+# crashed the lifecycle the first time a warmed symbol came back still
+# immature (VISN, 159 bars).
+# =========================================================================== #
+
+class _Provider:
+    """Minimal provider stub. `get_daily_bars` returns a LIST of already
+    canonical bar dicts — the shape the real provider returns and the one
+    `normalize_daily_bars` consumes. Getting this wrong makes the test prove
+    the error path instead of the success path."""
+    name = "stub"
+
+    def __init__(self, bars):
+        self._bars = bars
+
+    async def get_daily_bars(self, symbol, frm, to):
+        return [dict(b, symbol=symbol) for b in self._bars]
+
+
+def _hist(n, end=date(2026, 9, 1)):
+    """`n` canonical daily bars ending at `end`."""
+    return [{"trading_date": end - timedelta(days=i), "open": 10.0,
+             "high": 11.0, "low": 9.5, "close": 10.5, "volume": 1_000_000.0}
+            for i in range(n)]
+
+
+class TestMaturityWriteAgainstRealConstraints:
+
+    def _warm(self, pg, symbol, *, bars_returned, state=ru.STATE_HISTORY_REQUIRED,
+              attempts=0, now=None):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await _reset(conn)
+                await _add_symbol(conn, symbol, state=state, attempts=attempts)
+                res = await ri.warm_symbol(
+                    conn, _Provider(_hist(bars_returned)), symbol,
+                    now=now or datetime(2026, 9, 2, 13, 0, tzinfo=UTC))
+                row = dict(await conn.fetchrow(
+                    "SELECT state, warmup_attempts, warmup_last_error_code,"
+                    " warmup_last_error_class, warmup_cooldown_until"
+                    " FROM public.research_symbols WHERE symbol=$1", symbol))
+                counts = (await ri.bar_counts(conn, [symbol])).get(symbol, {})
+                return res, row, counts
+            finally:
+                await conn.close()
+        return asyncio.run(go())
+
+    def test_s14_maturity_parking_survives_the_real_check_constraint(self, pg):
+        """The exact staging failure: a symbol too young for readiness, parked
+        for calendar maturity. The UPDATE must succeed."""
+        res, row, counts = self._warm(pg, "YOUNG", bars_returned=200)  # ~7 months
+        # 1. it did not raise, and the row persisted
+        assert res["error_class"] is None
+        # 2. class is NULL — waiting is not an error class
+        assert row["warmup_last_error_class"] is None
+        # 3. the descriptive code still explains the wait
+        assert row["warmup_last_error_code"] == "awaiting_history_maturity"
+        # 4. the cooldown carries future eligibility, on a month boundary
+        assert row["warmup_cooldown_until"] is not None
+        assert row["warmup_cooldown_until"].day == 1
+        # 5. calendar waiting consumed no attempt budget
+        assert row["warmup_attempts"] == 0
+        # 6. and it lands in a state warmup can still reach
+        state = ru.classify_history_state(
+            daily_bars=counts["bars"], month_groups=counts["month_groups"],
+            week_groups=counts["week_groups"], symbol="YOUNG",
+            attempts=row["warmup_attempts"],
+            last_error_class=row["warmup_last_error_class"],
+            last_error_code=row["warmup_last_error_code"])
+        assert state == ru.STATE_HISTORY_WARMING
+        assert state not in ru.TERMINAL_STATES
+
+    def test_s14_parked_symbol_is_not_reselected_before_its_maturity_date(self, pg):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await _reset(conn)
+                await _add_symbol(conn, "YOUNG", state=ru.STATE_HISTORY_REQUIRED)
+                await ri.warm_symbol(conn, _Provider(_hist(200)), "YOUNG",
+                                     now=datetime(2026, 9, 2, 13, 0, tzinfo=UTC))
+                recheck = await conn.fetchval(
+                    "SELECT warmup_cooldown_until FROM public.research_symbols"
+                    " WHERE symbol=$1", "YOUNG")
+                before = await ri.select_warmup_batch(
+                    conn, limit=5, target_session=S,
+                    now=datetime(2026, 9, 3, tzinfo=UTC))
+                after = await ri.select_warmup_batch(
+                    conn, limit=5, target_session=S,
+                    now=recheck + timedelta(days=1))
+                return {r["symbol"] for r in before}, {r["symbol"] for r in after}
+            finally:
+                await conn.close()
+        before, after = asyncio.run(go())
+        assert "YOUNG" not in before, "parked symbol must not be re-warmed early"
+        assert "YOUNG" in after, "and must become eligible once matured"
+
+    def test_s14_a_symbol_the_provider_barely_carries_stays_terminal(self, pg):
+        """Below the usable floor is a genuine terminal answer, and `terminal`
+        is in the constrained vocabulary."""
+        res, row, _ = self._warm(pg, "THIN", bars_returned=20)
+        assert row["warmup_last_error_class"] == "terminal"
+        assert row["warmup_last_error_code"] == "insufficient_provider_history"
+        assert row["warmup_cooldown_until"] is None
+
+    def test_s14_a_fully_matured_symbol_records_no_error_at_all(self, pg):
+        res, row, counts = self._warm(pg, "GROWN", bars_returned=900)
+        assert row["warmup_last_error_class"] is None
+        assert row["warmup_last_error_code"] is None
+        assert row["warmup_cooldown_until"] is None
+        assert row["warmup_attempts"] == 1      # a real attempt WAS spent
+        state = ru.classify_history_state(
+            daily_bars=counts["bars"], month_groups=counts["month_groups"],
+            week_groups=counts["week_groups"], symbol="GROWN",
+            attempts=row["warmup_attempts"],
+            last_error_class=None, last_error_code=None)
+        assert state == ru.STATE_RESEARCH_READY
+
+    def test_s14_the_constrained_vocabulary_still_holds(self, pg):
+        """Every class the code can persist must satisfy the CHECK, and an
+        invented one must still be refused."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await _reset(conn)
+                await _add_symbol(conn, "V", state=ru.STATE_HISTORY_REQUIRED)
+                for klass in ("retryable", "terminal", "operator_error", None):
+                    await conn.execute(
+                        "UPDATE public.research_symbols SET"
+                        " warmup_last_error_class=$2 WHERE symbol=$1", "V", klass)
+                with pytest.raises(asyncpg.PostgresError):
+                    await conn.execute(
+                        "UPDATE public.research_symbols SET"
+                        " warmup_last_error_class='maturing' WHERE symbol=$1", "V")
+            finally:
+                await conn.close()
+        asyncio.run(go())
+
+    def test_s14_a_provider_failure_is_still_classified_normally(self, pg):
+        """A real provider error must keep its retryable/terminal class."""
+        class Boom:
+            name = "stub"
+            async def get_daily_history(self, *a, **k):
+                raise TimeoutError("provider timeout")
+            async def get_daily_bars(self, *a, **k):
+                raise TimeoutError("provider timeout")
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                await _reset(conn)
+                await _add_symbol(conn, "FAILS", state=ru.STATE_HISTORY_REQUIRED)
+                res = await ri.warm_symbol(conn, Boom(), "FAILS",
+                                           now=datetime(2026, 9, 2, tzinfo=UTC))
+                row = dict(await conn.fetchrow(
+                    "SELECT warmup_last_error_code, warmup_last_error_class,"
+                    " warmup_cooldown_until FROM public.research_symbols"
+                    " WHERE symbol=$1", "FAILS"))
+                return res, row
+            finally:
+                await conn.close()
+        res, row = asyncio.run(go())
+        assert row["warmup_last_error_class"] in ("retryable", "terminal",
+                                                  "operator_error")
+        assert row["warmup_last_error_code"] is not None

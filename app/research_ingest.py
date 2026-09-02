@@ -577,12 +577,23 @@ async def warm_symbol(conn, provider, symbol: str, *,
         # boundary that could actually change the answer, so a maturing symbol
         # stops competing with real work for the bounded request budget — and
         # so `warmup_attempts` never accumulates against it while it waits.
+        #
+        # THE CLASS IS NULL, AND THAT IS THE POINT.
+        # A symbol that is merely too young is not in an ERROR class at all.
+        # An earlier cut of this wrote `class='maturing'`, which is both wrong
+        # semantically and rejected by `research_symbols_error_class_ck` — the
+        # column admits only retryable/terminal/operator_error (or NULL), and
+        # the write crashed the whole lifecycle the first time a warmed symbol
+        # came back still immature (VISN, 159 bars, 2026-09-02). The waiting is
+        # already fully described by the CODE and the COOLDOWN; the class has
+        # nothing true to say, so it says nothing.
         code = ("provider_history_exhausted" if exhausted
                 else "awaiting_history_maturity")
-        klass = "maturing"
+        klass = None
         cooldown = ru.next_maturity_recheck(moment, months_short=months_short)
     else:
         code, klass, cooldown = None, None, None
+    maturing = cooldown is not None and not too_thin
 
     await conn.execute(
         "UPDATE public.research_symbols SET warmup_last_error_code=$2, "
@@ -594,7 +605,7 @@ async def warm_symbol(conn, provider, symbol: str, *,
         # which is exactly what would have stranded SPCX on its third warm.
         "warmup_attempts = GREATEST(0, warmup_attempts - $5), updated_at=NOW() "
         "WHERE symbol=$1",
-        symbol, code, klass, cooldown, 1 if klass == "maturing" else 0)
+        symbol, code, klass, cooldown, 1 if maturing else 0)
     result["maturity_months_short"] = months_short
     result["recheck_after"] = cooldown
     return result
