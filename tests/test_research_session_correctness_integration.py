@@ -25,6 +25,7 @@ Uses the same docker-postgres harness as the other *_integration tests.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
@@ -719,8 +720,8 @@ class TestOperationalHealthPredicate:
                 await conn.execute(
                     "TRUNCATE public.research_lifecycle_run_symbols,"
                     " public.research_lifecycle_runs CASCADE")
-                await conn.execute("DELETE FROM public.job_tasks")
                 await conn.execute("DELETE FROM public.job_events")
+                await conn.execute("DELETE FROM public.job_tasks")
                 await conn.execute("DELETE FROM public.job_runs")
                 await setup(conn)
                 return await rr.run_health(conn)
@@ -775,8 +776,8 @@ class TestOperationalHealthPredicate:
                 await conn.execute(
                     "TRUNCATE public.research_lifecycle_run_symbols,"
                     " public.research_lifecycle_runs CASCADE")
-                await conn.execute("DELETE FROM public.job_tasks")
                 await conn.execute("DELETE FROM public.job_events")
+                await conn.execute("DELETE FROM public.job_tasks")
                 await conn.execute("DELETE FROM public.job_runs")
                 await _mk_run(conn, "rlc:sch:crash",
                               run_status="blocked_stale_core_history")
@@ -824,3 +825,317 @@ class TestOperationalHealthPredicate:
         remaining = max(0, ru.MAX_PROVIDER_REQUESTS_PER_RUN
                         - run["provider_calls_used"])
         assert remaining == 3, "re-entry must spend the remainder, not 12 again"
+
+
+# =========================================================================== #
+# W1-W11 / T16 — the worker finalization + probe boundary
+#
+# This is the boundary all three P0 defects escaped through, and the one the
+# previous suites never drove. They asserted the handler's RETURN SHAPE and the
+# backoff CONFIGURATION; neither says anything about what the worker actually
+# does with a retryable result when a probe is registered.
+#
+# On 2026-09-03 the answer was: it throws the deferral away. Run 508f1a5d /
+# task 13149cc8 returned ERR_RETRYABLE for a stale-core deferral, the probe saw
+# a `blocked_stale_core_history` row and called it durable output, and the task
+# was reconciled to `succeeded` at attempt 1 of 4.
+#
+# These tests drive the REAL `Worker._finalize_failure` and `_reconcile_one`
+# against real Postgres rows.
+# =========================================================================== #
+
+import app.jobs.contracts as C
+import app.jobs.queue as Q
+import app.jobs.registry as R
+import app.jobs.research_lifecycle as RL
+import app.jobs.handlers.research_lifecycle_worker as rlw
+from app.jobs.worker import JobWorker
+
+
+def _worker():
+    w = JobWorker.__new__(JobWorker)          # no event loop / executor needed
+    w.worker_id = "test-worker"
+    return w
+
+
+async def _seed(conn, run_key, *, run_status, attempt=1, max_attempts=4,
+                target=date(2026, 9, 2), task_status="leased"):
+    """A research run + its queue task, shaped exactly as the scheduler makes
+    them (idempotency_key = 'rlctask:' || run_key)."""
+    await conn.execute("TRUNCATE public.research_lifecycle_run_symbols,"
+                       " public.research_lifecycle_runs CASCADE")
+    # order matters: job_events references job_tasks, which references job_runs
+    await conn.execute("DELETE FROM public.job_events")
+    await conn.execute("DELETE FROM public.job_task_attempts")
+    await conn.execute("DELETE FROM public.job_tasks")
+    await conn.execute("DELETE FROM public.job_runs")
+    await conn.execute(
+        "INSERT INTO public.research_lifecycle_runs "
+        "(run_key, contract_version, status, target_session, provider_calls_used) "
+        "VALUES ($1,'v1',$2,$3,0)", run_key, run_status, target)
+    job_id = await conn.fetchval(
+        "INSERT INTO public.job_runs (job_type, job_contract_version, queue_name,"
+        " idempotency_key, status, requested_by) VALUES "
+        "('smart_scanner_research_lifecycle.v1','v1','research_lifecycle',$1,"
+        " 'running','scheduler') RETURNING id", f"rlcjob:{run_key}")
+    task_id = await conn.fetchval(
+        "INSERT INTO public.job_tasks (job_id, queue_name, task_type,"
+        " task_contract_version, task_key, ordinal, payload, payload_hash,"
+        " idempotency_key, status, priority, max_attempts, attempt_count,"
+        " available_at, lease_owner, lease_expires_at) "
+        "VALUES ($1,'research_lifecycle','smart_scanner_research_lifecycle_run.v1',"
+        " 'v1','lifecycle',0,$2::jsonb,'h',$3,$4,100,$5,$6,NOW(),'test-worker',"
+        " NOW() + interval '5 minutes') RETURNING id",
+        job_id, json.dumps({"run_key": run_key}), f"rlctask:{run_key}",
+        task_status, max_attempts, attempt)
+    return job_id, task_id
+
+
+async def _finalize_retryable(conn, job_id, task_id, attempt, run_key):
+    """Drive the REAL worker finalization for a retryable handler result.
+
+    `run_key` is REQUIRED and must be the real one: the probe short-circuits on
+    a missing key, so a placeholder payload would make every one of these tests
+    pass without the probe ever being consulted — proving nothing.
+    """
+    spec = R.resolve_handler(RL.RESEARCH_LIFECYCLE_TASK)
+    await _worker()._finalize_failure(
+        conn, spec, task_id, job_id, {"run_key": run_key}, result={
+            "error_class": C.ERR_RETRYABLE,
+            "safe_error_code": "awaiting_core_history_refresh"},
+        attempt=attempt, duration_ms=200)
+
+
+class TestWorkerProbeBoundary:
+
+    def test_w1_the_exact_2026_09_03_failure_now_defers(self, pg):
+        """Stale-core run + ERR_RETRYABLE + live probe. The task must become
+        retryable with a real backoff, NOT reconciled to succeeded."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w1"
+                job_id, task_id = await _seed(
+                    conn, rk, run_status="blocked_stale_core_history", attempt=1)
+                # the probe must refuse to call this durable output
+                assert await rlw.probe_research_lifecycle_durable_output(
+                    conn, {"run_key": rk}) is None
+                spec = R.resolve_handler(RL.RESEARCH_LIFECYCLE_TASK)
+                await _worker()._finalize_failure(
+                    conn, spec, task_id, job_id, {"run_key": rk}, result={
+                        "error_class": C.ERR_RETRYABLE,
+                        "safe_error_code": "awaiting_core_history_refresh"},
+                    attempt=1, duration_ms=200)
+                t = dict(await conn.fetchrow(
+                    "SELECT status, attempt_count, max_attempts, available_at,"
+                    " safe_error_code FROM public.job_tasks WHERE id=$1", task_id))
+                health = await rr.run_health(conn)
+                return t, health
+            finally:
+                await conn.close()
+        t, health = asyncio.run(go())
+        assert t["status"] == "retryable", (
+            f"the 2026-09-03 defect: task became {t['status']}, not retryable")
+        assert t["available_at"] > datetime.now(UTC), "backoff must be in the future"
+        assert t["attempt_count"] < t["max_attempts"]
+        assert health[0]["health"] == rr.HEALTH_HEALTHY_WAITING
+        assert health[0]["run_status"] == "blocked_stale_core_history"
+
+    def test_w1_backoff_matches_the_configured_schedule(self, pg):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                job_id, task_id = await _seed(
+                    conn, "rlc:sch:w1b",
+                    run_status="blocked_stale_core_history", attempt=1)
+                await _finalize_retryable(conn, job_id, task_id, 1, "rlc:sch:w1b")
+                return await conn.fetchval(
+                    "SELECT EXTRACT(EPOCH FROM (available_at - NOW()))"
+                    " FROM public.job_tasks WHERE id=$1", task_id)
+            finally:
+                await conn.close()
+        delay = float(asyncio.run(go()))
+        assert 1700 < delay <= 1800, f"expected ~1800s backoff, got {delay}"
+
+    def test_w2_the_deferred_task_is_claimable_again_after_backoff(self, pg):
+        """Same task, same run, same session — a deferral, not a new run."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w2"
+                job_id, task_id = await _seed(
+                    conn, rk, run_status="blocked_stale_core_history", attempt=1)
+                await _finalize_retryable(conn, job_id, task_id, 1, rk)
+                # nothing claimable while the backoff is in the future
+                early = await Q.claim_next_task(
+                    conn, queue_name="research_lifecycle",
+                    worker_id="w", lease_seconds=300)
+                # once the backoff elapses, the SAME task comes back
+                await conn.execute(
+                    "UPDATE public.job_tasks SET available_at = NOW() - interval"
+                    " '1 minute' WHERE id=$1", task_id)
+                later = await Q.claim_next_task(
+                    conn, queue_name="research_lifecycle",
+                    worker_id="w", lease_seconds=300)
+                runs = await conn.fetchval(
+                    "SELECT count(*) FROM public.research_lifecycle_runs")
+                sess = await conn.fetchval(
+                    "SELECT target_session FROM public.research_lifecycle_runs"
+                    " WHERE run_key=$1", rk)
+                return early, later, task_id, runs, sess
+            finally:
+                await conn.close()
+        early, later, task_id, runs, sess = asyncio.run(go())
+        assert early is None, "must not be claimable before its backoff"
+        assert later is not None and later["id"] == task_id, "same task_id"
+        assert later["attempt_count"] == 2
+        assert runs == 1, "no competing run"
+        assert sess == date(2026, 9, 2), "session stays pinned"
+
+    def test_w3_completed_still_reconciles_after_crash(self, pg):
+        """The probe's original purpose must survive: a genuinely finished run
+        is not re-run and does not re-spend the provider budget."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w3"
+                job_id, task_id = await _seed(conn, rk, run_status="completed")
+                probe = await rlw.probe_research_lifecycle_durable_output(
+                    conn, {"run_key": rk})
+                await _finalize_retryable(conn, job_id, task_id, 1, rk)
+                st = await conn.fetchval(
+                    "SELECT status FROM public.job_tasks WHERE id=$1", task_id)
+                return probe, st
+            finally:
+                await conn.close()
+        probe, st = asyncio.run(go())
+        assert probe is not None and probe["ok"] is True
+        assert probe["result"]["reconciled_from_durable_output"] is True
+        assert st == "succeeded", "crash-after-persist must still reconcile"
+
+    def test_w4_dry_run_is_durable_output(self, pg):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w4"
+                job_id, task_id = await _seed(conn, rk, run_status="dry_run")
+                await _finalize_retryable(conn, job_id, task_id, 1, rk)
+                return await conn.fetchval(
+                    "SELECT status FROM public.job_tasks WHERE id=$1", task_id)
+            finally:
+                await conn.close()
+        assert asyncio.run(go()) == "succeeded"
+
+    def test_w5_failed_is_not_durable_output(self, pg):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w5"
+                job_id, task_id = await _seed(conn, rk, run_status="failed")
+                probe = await rlw.probe_research_lifecycle_durable_output(
+                    conn, {"run_key": rk})
+                await _finalize_retryable(conn, job_id, task_id, 1, rk)
+                return probe, await conn.fetchval(
+                    "SELECT status FROM public.job_tasks WHERE id=$1", task_id)
+            finally:
+                await conn.close()
+        probe, st = asyncio.run(go())
+        assert probe is None
+        assert st == "retryable", "unchanged pre-existing behaviour"
+
+    def test_w6_blocked_config_stays_durable_and_terminal(self, pg):
+        """A configuration problem does not resolve itself, the handler still
+        returns ok=True for it, and it must NOT become an auto-retry."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w6"
+                await _seed(conn, rk,
+                            run_status="blocked_canonical_config_unavailable")
+                return await rlw.probe_research_lifecycle_durable_output(
+                    conn, {"run_key": rk})
+            finally:
+                await conn.close()
+        probe = asyncio.run(go())
+        assert probe is not None, "config block stays durable output"
+        assert ("blocked_canonical_config_unavailable"
+                not in rlw._NOT_DURABLE_OUTPUT)
+
+    def test_w7_attempt_exhaustion_settles_terminally(self, pg):
+        """No infinite retry: the last allowed attempt has no backoff left, so
+        the task settles terminal and reads TERMINAL_BLOCKED."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w7"
+                last = RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS
+                job_id, task_id = await _seed(
+                    conn, rk, run_status="blocked_stale_core_history",
+                    attempt=last, max_attempts=last)
+                await _finalize_retryable(conn, job_id, task_id, last, rk)
+                t = dict(await conn.fetchrow(
+                    "SELECT status, available_at FROM public.job_tasks"
+                    " WHERE id=$1", task_id))
+                return t, await rr.run_health(conn)
+            finally:
+                await conn.close()
+        t, health = asyncio.run(go())
+        assert t["status"] == "failed", f"expected terminal, got {t['status']}"
+        assert health[0]["health"] == rr.HEALTH_TERMINAL_BLOCKED
+
+    def test_w9_target_session_survives_a_later_wall_clock(self, pg):
+        """A re-entry hours later must not re-pin the run to a newer session."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w9"
+                await _seed(conn, rk, run_status="blocked_stale_core_history",
+                            target=date(2026, 9, 2))
+                again = await rr.start_run(conn, run_key=rk,
+                                           target_session=date(2026, 9, 3))
+                return again["target_session"]
+            finally:
+                await conn.close()
+        assert asyncio.run(go()) == date(2026, 9, 2)
+
+    def test_w10_budget_carries_across_the_deferral(self, pg):
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w10"
+                await _seed(conn, rk, run_status="blocked_stale_core_history")
+                # a deferral spends nothing
+                zero = await rr.start_run(conn, run_key=rk,
+                                          target_session=date(2026, 9, 2))
+                # and if an attempt HAD spent, the next one sees it
+                await conn.execute(
+                    "UPDATE public.research_lifecycle_runs"
+                    " SET provider_calls_used=7 WHERE run_key=$1", rk)
+                after = await rr.start_run(conn, run_key=rk,
+                                           target_session=date(2026, 9, 2))
+                return zero["provider_calls_used"], after["provider_calls_used"]
+            finally:
+                await conn.close()
+        zero, after = asyncio.run(go())
+        assert zero == 0
+        assert after == 7
+        assert max(0, ru.MAX_PROVIDER_REQUESTS_PER_RUN - after) == 5
+
+    def test_w11_lease_expiry_reconcile_also_defers_now(self, pg):
+        """`_reconcile_one` uses the SAME probe and would also have destroyed
+        the continuation. It must now route to retryable instead."""
+        async def go():
+            conn = await asyncpg.connect(pg["dsn"])
+            try:
+                rk = "rlc:sch:w11"
+                job_id, task_id = await _seed(
+                    conn, rk, run_status="blocked_stale_core_history")
+                task = dict(await conn.fetchrow(
+                    "SELECT id, task_type, payload, job_id FROM public.job_tasks"
+                    " WHERE id=$1", task_id))
+                await _worker()._reconcile_one(conn, task)
+                return await conn.fetchval(
+                    "SELECT status FROM public.job_tasks WHERE id=$1", task_id)
+            finally:
+                await conn.close()
+        assert asyncio.run(go()) == "retryable"

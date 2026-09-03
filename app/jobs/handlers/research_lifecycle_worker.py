@@ -165,6 +165,20 @@ def _bounded_result(summary: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+#: Run statuses that are NOT durable output, and therefore must never let the
+#: probe reconcile a task to `succeeded`:
+#:
+#:   running                     - still executing, nothing finished
+#:   failed                      - a recorded failure is not a success
+#:   blocked_stale_core_history  - deferred, waiting on prerequisites it asked
+#:                                 for, and expecting to be re-entered (T16)
+_NOT_DURABLE_OUTPUT = frozenset({
+    "running",
+    "failed",
+    "blocked_stale_core_history",
+})
+
+
 async def probe_research_lifecycle_durable_output(
         conn: asyncpg.Connection,
         payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -172,9 +186,38 @@ async def probe_research_lifecycle_durable_output(
 
     The lifecycle writes its run row in a `finally`, so a worker that died
     after the work but before finalising the task has already left the
-    evidence. If a terminal run exists for this key, return it instead of
+    evidence. If a COMPLETE run exists for this key, return it instead of
     re-running — which would spend the provider budget a second time for a run
     that already happened.
+
+    "COMPLETE", NOT "A ROW EXISTS" (T16)
+    ------------------------------------
+    This probe is consulted from two places, and both of them will reconcile
+    the task to SUCCEEDED on any non-None answer: `_reconcile_one` when a lease
+    expires, and `_finalize_failure` before it applies retry backoff. So a
+    probe that mistakes a deferred run for a finished one does not merely
+    mislabel something — it destroys the continuation.
+
+    That is exactly what happened to the scheduled occurrence for session
+    2026-09-02 (run 508f1a5d, task 13149cc8) on 2026-09-03. The lifecycle did
+    everything right: pinned the session, checked freshness before any
+    research work, found the core bars stale, enqueued both refresh jobs, spent
+    zero provider requests, and returned ERR_RETRYABLE to ask for a deferral.
+    This probe then saw a `blocked_stale_core_history` row, called it durable
+    output, and the task was reconciled to `succeeded` 1.6 seconds in with
+    three of its four attempts unused. Both refreshes completed on time; nobody
+    ever came back; the session was lost to automation.
+
+    A blocked-on-stale-core run is a run that has NOT done its work and has
+    asked to be re-entered. It is `running` in every sense that matters here,
+    so it is treated the same way: return None and let the queue apply the
+    backoff it was configured with. The queue — not this function — owns the
+    attempt budget, so an exhausted continuation still settles terminally
+    through the normal path.
+
+    `blocked_canonical_config_unavailable` is deliberately NOT in this list.
+    That gate reports a configuration problem that will not resolve on its own,
+    the handler still returns ok=True for it, and it should stay durable.
     """
     run_key = str(payload.get("run_key") or "").strip()
     if not run_key:
@@ -188,11 +231,9 @@ async def probe_research_lifecycle_durable_output(
             "FROM public.research_lifecycle_runs WHERE run_key = $1", run_key)
     except asyncpg.PostgresError:
         return None
-    if row is None or row["status"] == "running":
-        return None
-    if row["status"] == "failed":
-        # A recorded failure is not a reconcilable success; let the queue
-        # decide whether an attempt remains.
+    if row is None or row["status"] in _NOT_DURABLE_OUTPUT:
+        # Not finished work: no output to reconcile to. Let the queue decide
+        # whether an attempt remains and, if so, when it comes back.
         return None
     return {"ok": True, "result": {
         "run_key": run_key, "run_id": str(row["id"]),
@@ -213,4 +254,5 @@ async def probe_research_lifecycle_durable_output(
 
 
 __all__ = ["run_research_lifecycle_task", "execute_research_lifecycle",
+           "_NOT_DURABLE_OUTPUT",
            "probe_research_lifecycle_durable_output"]
