@@ -109,24 +109,39 @@ REASON_NO_USER_AGENT = "sec_user_agent_absent"
 REASON_BUDGET = "enrichment_provider_budget_exhausted"
 
 
+#: `candidate_state` alone is not enough (T1). It is a persistent column with
+#: no session on it, so on its own it will happily hand back a symbol whose
+#: candidacy was earned two sessions ago — which is how ONDS, last evaluated
+#: for 2026-08-28, consumed enrichment budget during the 2026-08-31 run.
+#: Requiring a scan row AT the target session makes enrichment spend requests
+#: only on survivors of the session it is actually enriching for.
 CANDIDATE_SQL = """
-SELECT symbol
-FROM public.research_symbols
-WHERE candidate_state = $1
-ORDER BY latest_reference_session DESC, symbol
+SELECT r.symbol
+FROM public.research_symbols r
+JOIN public.research_scan_results s
+  ON s.symbol = r.symbol AND s.scan_session = $3::date
+WHERE r.candidate_state = $1
+ORDER BY r.latest_reference_session DESC, r.symbol
 LIMIT $2
 """
 
 
-async def candidate_symbols(conn, *, limit: int = MAX_ENRICHED_SYMBOLS
+async def candidate_symbols(conn, *, target_session=None,
+                            limit: int = MAX_ENRICHED_SYMBOLS
                             ) -> List[str]:
-    """The survivors, and only the survivors.
+    """The survivors of THIS session, and only those.
 
-    The filter is on `candidate_state`, the column that records what the SCREEN
-    found — never on `discovery_reasons`, which records only why we looked.
+    The filter is on `candidate_state` — the column that records what the
+    SCREEN found, never on `discovery_reasons`, which records only why we
+    looked — AND on a scan row for `target_session`, which is what makes the
+    survivor a survivor of the session being enriched rather than of any
+    session at all.
     """
+    if target_session is None:
+        return []
     rows = await conn.fetch(CANDIDATE_SQL, ru.CANDIDATE_RESEARCH_CANDIDATE,
-                            max(0, min(int(limit), MAX_ENRICHED_SYMBOLS)))
+                            max(0, min(int(limit), MAX_ENRICHED_SYMBOLS)),
+                            target_session)
     return [r["symbol"] for r in rows]
 
 
@@ -221,6 +236,7 @@ async def _enrich_earnings(conn, symbols: Sequence[str], *, api_key: str,
 
 async def enrich_research_candidates(
         conn, *, now: Optional[datetime] = None,
+        target_session=None,
         limit: int = MAX_ENRICHED_SYMBOLS,
         provider_budget: int = MAX_ENRICHMENT_PROVIDER_REQUESTS,
         massive_api_key: str = "", sec_user_agent: str = "",
@@ -234,7 +250,8 @@ async def enrich_research_candidates(
     turn a successful run into a failed one.
     """
     moment = now or datetime.now(timezone.utc)
-    symbols = await candidate_symbols(conn, limit=limit)
+    symbols = await candidate_symbols(
+        conn, target_session=target_session, limit=limit)
     summary: Dict[str, Any] = {
         "contract_version": RESEARCH_ENRICHMENT_CONTRACT_VERSION,
         "scope": SCOPE_RESEARCH,

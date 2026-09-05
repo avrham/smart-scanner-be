@@ -104,7 +104,9 @@ def test_migration_012_is_wyckoff_v2_only():
         "028_source_state_scope.sql"]
     assert [q.name for q in sorted(MIGRATIONS.glob("029_*"))] == [
         "029_research_lifecycle_runs.sql"]
-    assert not list(MIGRATIONS.glob("030_*"))
+    assert [q.name for q in sorted(MIGRATIONS.glob("030_*"))] == [
+            "030_research_session_correctness.sql"]
+    assert not list(MIGRATIONS.glob("031_*"))
     assert (MIGRATIONS / "011_shadow_pair_outcomes.sql").exists()
     sql = (MIGRATIONS / "012_wyckoff_mtf_v2.sql").read_text(encoding="utf-8")
     assert "wyckoff_mtf_v2" in sql
@@ -143,7 +145,12 @@ def test_no_scheduler_change():
     )
     assert result.stdout.strip() == ""
 
-    allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py"}
+    # Plus the research lifecycle's own queue-identity modules, which the
+    # T11 scheduled-completion work touches (attempt budget, re-entry
+    # backoff, retryable stale-core block). Nothing outside that queue.
+    allowed = {"app/jobs/registry.py", "app/jobs/scheduler.py",
+               "app/jobs/research_lifecycle.py",
+               "app/jobs/handlers/research_lifecycle_worker.py"}
     changed = {p for p in _git_diff_names("app/jobs").split("\n") if p}
     assert changed <= allowed, f"unexpected queue changes: {sorted(changed - allowed)}"
 

@@ -148,10 +148,57 @@ MAX_WARMUP_ATTEMPTS = 3
 #: recovers within a session.
 WARMUP_COOLDOWN_MINUTES = 60
 
+#: Codes that a `terminal` class must NOT be allowed to make terminal.
+#:
+#: Everything else keeps the old behaviour — an unrecognised terminal error is
+#: still terminal, because guessing that an unknown failure will fix itself is
+#: how you build an infinite retry loop. This is an exemption list, not a
+#: permission list, and it is deliberately two entries long.
+#:
+#: `provider_history_exhausted` is the entry that matters, and it is invariant
+#: T7 in one line. Exhaustion is a statement about OLD bars: the provider has
+#: given us everything it holds behind today. It says nothing whatever about
+#: tomorrow. A symbol one month-group short of the 24-completed-month gate is
+#: exhausted AND maturing, and collapsing those two facts into one is what
+#: stranded AAL, ETHA and SOXL — 499 bars, 23 completed months, one calendar
+#: month from ready — in a state that warmup selection excluded, so the very
+#: error code that put them there could never be cleared.
+NON_TERMINAL_HISTORY_ERROR_CODES = frozenset({
+    "provider_history_exhausted",   # no more OLD bars; says nothing about new
+    "awaiting_history_maturity",    # simply too young, for now
+})
+
 
 def cooldown_until(now: datetime,
                    minutes: int = WARMUP_COOLDOWN_MINUTES) -> datetime:
     return now + timedelta(minutes=minutes)
+
+
+def months_short_of_ready(month_groups: Optional[int]) -> int:
+    """How many further COMPLETED month-groups the monthly gate still wants.
+
+    The monthly gate binds (24 completed months, ~504 sessions) while the
+    provider caps history at ~500 bars, so this — not the bar count — is what
+    a maturing symbol is actually waiting for.
+    """
+    completed = max(0, int(month_groups or 0) - 1)
+    return max(0, CANDIDATE_MIN_MONTHLY_PERIODS - completed)
+
+
+def next_maturity_recheck(now: datetime, *, months_short: int) -> datetime:
+    """WHEN this symbol could next plausibly satisfy the monthly gate.
+
+    Deterministic and calendar-derived, never an attempt count: a symbol gains
+    at most one completed month-group per month boundary, so asking the
+    provider again before that boundary cannot change the answer and would
+    spend a request to learn nothing. Parking until the boundary is how
+    "waiting for the calendar" stops competing with "retrying a failure" for
+    the same bounded budget.
+    """
+    months = max(1, int(months_short))
+    year, month = now.year, now.month + months
+    year, month = year + (month - 1) // 12, (month - 1) % 12 + 1
+    return datetime(year, month, 1, tzinfo=timezone.utc)
 
 
 def is_in_cooldown(cooldown_at: Optional[datetime], *, now: datetime) -> bool:
@@ -210,6 +257,7 @@ def classify_history_state(*, daily_bars: Optional[int],
                            symbol: str = "",
                            attempts: int = 0,
                            last_error_class: Optional[str] = None,
+                           last_error_code: Optional[str] = None,
                            ) -> str:
     """Where a symbol stands, computed from what we hold — never from a flag.
 
@@ -217,14 +265,39 @@ def classify_history_state(*, daily_bars: Optional[int],
     (the symbol does not exist for it). Running out of attempts is `failed`,
     which is a different sentence: we could not get it, not there is nothing
     to get.
+
+    TERMINALITY NOW REQUIRES AN AFFIRMATIVE REASON (T7)
+    ---------------------------------------------------
+    It used to be enough for `last_error_class` to say "terminal". That let
+    `provider_history_exhausted` — which only ever meant "no more OLD bars" —
+    pin a symbol in `unavailable` forever, and `unavailable` is excluded from
+    warmup selection, so the error code could never be cleared either. The
+    state was a closed loop, and three symbols sitting one month-group from
+    the gate were caught in it.
+
+    So the class alone no longer decides. The CODE must name something that
+    time cannot fix, and a symbol that is merely too young stays in
+    `history_warming` — parked by its cooldown, not condemned by its state.
+
+    Likewise the attempt ceiling (T8) is checked only for symbols that are NOT
+    still maturing. Attempts bound failed provider interactions; they must
+    never convert "come back next month" into permanent failure.
     """
-    if last_error_class == "terminal":
-        return STATE_UNAVAILABLE
     bars = daily_bars or 0
     if is_research_ready(bars, week_groups=week_groups,
                          month_groups=month_groups, symbol=symbol):
         return STATE_RESEARCH_READY
-    if attempts >= MAX_WARMUP_ATTEMPTS:
+    if (last_error_class == "terminal"
+            and last_error_code not in NON_TERMINAL_HISTORY_ERROR_CODES):
+        return STATE_UNAVAILABLE
+    # Below the floor there is genuinely nothing to work with, whatever the
+    # provider called it — a symbol the provider barely carries is terminal.
+    if bars and bars < RESEARCH_MIN_USABLE_BARS:
+        return STATE_UNAVAILABLE
+    # Still maturing: the monthly gate wants month-groups that only the
+    # calendar can supply. Not ready, not failed, not unavailable — waiting.
+    maturing = bars > 0 and months_short_of_ready(month_groups) > 0
+    if attempts >= MAX_WARMUP_ATTEMPTS and not maturing:
         return STATE_FAILED
     if bars > 0:
         return STATE_HISTORY_WARMING
@@ -294,6 +367,34 @@ def prioritise(rows: Sequence[Dict[str, Any]], *,
                ) -> List[Dict[str, Any]]:
     """Deterministic ordering, then a hard cut. No score is produced."""
     return sorted(rows, key=priority_key)[:max(0, limit)]
+
+
+def fairness_key(row: Dict[str, Any]) -> Tuple:
+    """Least-recently-served first, then the documented priority order.
+
+    `last_served_at` is the last warm ATTEMPT, or arrival for a symbol never
+    warmed (see WARMUP_SELECT_SQL). Ordering on it is what makes bounded
+    per-run capacity fair rather than merely bounded: service pushes a symbol
+    to the back, so no symbol can be permanently skipped and every eligible
+    symbol reaches the front within ceil(N/limit) runs.
+
+    Arrival — rather than "infinitely old" — is what a never-served symbol
+    gets, and that matters. Treating NULL as the oldest possible value would
+    let admission (up to MAX_NEW_RESEARCH_SYMBOLS_PER_RUN newcomers per run,
+    the same number as the warm limit) push a fresh cohort to the front every
+    single run and starve maintenance instead. This is FIFO on "waiting
+    since", which has no such mirror image.
+    """
+    served = row.get("last_served_at")
+    stamp = served.timestamp() if isinstance(served, datetime) else 0.0
+    return (stamp,) + priority_key(row)
+
+
+def prioritise_fairly(rows: Sequence[Dict[str, Any]], *,
+                      limit: int = MAX_WARMUP_SYMBOLS_PER_RUN,
+                      ) -> List[Dict[str, Any]]:
+    """One fair queue, then a hard cut. Still no score, still deterministic."""
+    return sorted(rows, key=fairness_key)[:max(0, limit)]
 
 
 def explain_priority(row: Dict[str, Any]) -> List[str]:
@@ -368,7 +469,34 @@ RECENT_DISCOVERY_MAX_SESSIONS = 3
 #: `prospective_campaign.candidate_signal_fields`, which reads
 #: `setup_state not in (None, "absent", "none")`). Restated here as a tuple for
 #: readability only — the membership rule is the strategy's, not ours.
-_SETUP_ABSENT = (None, "", "absent", "none")
+#: POSITIVE EVIDENCE MUST BE AFFIRMATIVE (T10).
+#:
+#: These were denylists — "anything that is not absent counts as present" — and
+#: both were wrong, in the same way and for the same reason: they were written
+#: against a vocabulary the strategies do not actually emit.
+#:
+#:   * `structure_state` is 'recognized' | 'ambiguous' | 'unknown' (the
+#:     classifier's own three-way read, app/scanner_view.py:189). It never
+#:     emits 'none' or 'absent', so the old exclusion list `("none","absent")`
+#:     excluded NOTHING and `unknown` — structure could not be read at all —
+#:     counted as structure present.
+#:
+#:   * `setup_state` is 'valid' | 'invalid' | 'unknown' (a real 3-way outcome
+#:     from policy.py, documented at app/scanner_view.py:62). The old list
+#:     admitted `unknown` AND `invalid`, so the strategy explicitly reading the
+#:     structure and DISQUALIFYING it produced `research_setup_present`.
+#:
+#: Since `screen_findings` is an OR and any single finding promotes a
+#: candidate, either of those could have promoted a symbol on the strength of
+#: the strategy having failed to read it. In the audited 2026-08-31 run nothing
+#: was promoted this way only because every affected symbol also carried a
+#: `rejection_reason`, which short-circuits first. That is luck, not a gate.
+#:
+#: Allowlists, therefore. An indeterminate state is not evidence, and a
+#: negative state is certainly not evidence FOR the symbol.
+STRUCTURE_AFFIRMATIVE = ("recognized",)
+SETUP_AFFIRMATIVE = ("valid",)
+BENCHMARK_AFFIRMATIVE = ("outperforming",)
 
 
 def looked_because(row: Dict[str, Any], *,
@@ -405,12 +533,15 @@ def screen_findings(row: Dict[str, Any]) -> List[str]:
     if row.get("rejection_reason"):
         return [SCREEN_HARD_DISQUALIFIED]
     out: List[str] = []
-    structure = row.get("structure_state")
-    if structure and structure not in ("none", "absent"):
+    # Affirmative states only. `unknown`/`ambiguous` mean the strategy could
+    # not read the symbol, and `invalid` means it read it and said no; neither
+    # is a finding IN FAVOUR of the symbol, and an OR-of-findings screen would
+    # otherwise let one of them stand alone as the whole case for a candidate.
+    if row.get("structure_state") in STRUCTURE_AFFIRMATIVE:
         out.append(SCREEN_STRUCTURE_PRESENT)
-    if row.get("setup_state") not in _SETUP_ABSENT:
+    if row.get("setup_state") in SETUP_AFFIRMATIVE:
         out.append(SCREEN_SETUP_PRESENT)
-    if row.get("benchmark_relative") == "outperforming":
+    if row.get("benchmark_relative") in BENCHMARK_AFFIRMATIVE:
         out.append(SCREEN_BENCHMARK_LEADING)
     return out or [SCREEN_NO_EVIDENCE]
 
@@ -490,6 +621,11 @@ __all__ = [
     "MAX_NEW_RESEARCH_SYMBOLS_PER_RUN", "MAX_WARMUP_SYMBOLS_PER_RUN",
     "MAX_PROVIDER_REQUESTS_PER_RUN", "MAX_CONCURRENT_WARMUPS",
     "MAX_WARMUP_ATTEMPTS", "WARMUP_COOLDOWN_MINUTES",
+    "fairness_key", "prioritise_fairly",
+    "STRUCTURE_AFFIRMATIVE", "SETUP_AFFIRMATIVE",
+    "BENCHMARK_AFFIRMATIVE",
+    "NON_TERMINAL_HISTORY_ERROR_CODES", "months_short_of_ready",
+    "next_maturity_recheck",
     "cooldown_until", "is_in_cooldown",
     "classify_history_state", "is_research_ready",
     "PRIORITY_DIMENSIONS", "priority_key", "prioritise", "explain_priority",

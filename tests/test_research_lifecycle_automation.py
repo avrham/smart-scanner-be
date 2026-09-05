@@ -31,9 +31,33 @@ SESSION = date(2026, 8, 28)
 MIGRATIONS = pathlib.Path("app/db/migrations")
 
 
-def _row(symbol, *, admission=ra.ADMISSION_ELIGIBLE, state=None, candidate=None):
-    return {"symbol": symbol, "admission_state": admission, "state": state,
-            "candidate_state": candidate}
+def _row(symbol, *, admission=ra.ADMISSION_ELIGIBLE, state=None, candidate=None,
+         has_current_scan=None, has_any_scan=None, **evidence):
+    """A funnel row.
+
+    Since the session-correctness fix the partition reads THIS run's scan row
+    rather than the session-less `candidate_state` column, so a fixture that
+    means "scanned" has to say which session it was scanned for. Default:
+    a symbol whose stored state is `research_scanned` was scanned for the
+    session under test — which is what every existing fixture here meant —
+    and its screen evidence is reconstructed from `candidate`.
+    """
+    scanned_now = (state == ru.STATE_RESEARCH_SCANNED
+                   if has_current_scan is None else has_current_scan)
+    row = {"symbol": symbol, "admission_state": admission, "state": state,
+           "candidate_state": candidate,
+           "has_current_scan": bool(scanned_now),
+           "has_any_scan": bool(scanned_now if has_any_scan is None
+                                else has_any_scan),
+           "rejection_reason": None, "structure_state": None,
+           "setup_state": None, "benchmark_relative": None}
+    if candidate == ru.CANDIDATE_RESEARCH_CANDIDATE:
+        row.update(structure_state="recognized", setup_state="valid",
+                   benchmark_relative="outperforming")
+    elif candidate == ru.CANDIDATE_SCANNED_NOT_CANDIDATE:
+        row["rejection_reason"] = "unknown_structure"
+    row.update(evidence)
+    return row
 
 
 def _executable_source(path: str) -> str:
@@ -103,7 +127,8 @@ class TestFunnelPartition:
     def test_a_scanned_but_unclassified_symbol_is_not_a_non_candidate(self):
         # Folding "not yet judged" into "did not survive" is how a symbol gets
         # reported as rejected before anything judged it.
-        row = _row("X", state=ru.STATE_RESEARCH_SCANNED, candidate=None)
+        row = _row("X", state=ru.STATE_RESEARCH_SCANNED, candidate=None,
+                   has_current_scan=True)
         assert rf.lifecycle_state(row) == rf.LIFECYCLE_CLASSIFICATION_PENDING
         assert rf.lifecycle_state(row) != rf.LIFECYCLE_SCANNED_NOT_CANDIDATE
 
@@ -357,16 +382,23 @@ class FakeEnrichConn:
 class TestLazyEnrichment:
     def test_only_research_candidates_are_eligible(self):
         conn = FakeEnrichConn(["ONDS"])
-        assert asyncio.run(renrich.candidate_symbols(conn)) == ["ONDS"]
+        assert asyncio.run(renrich.candidate_symbols(
+            conn, target_session=SESSION)) == ["ONDS"]
         sql, args = conn.queries[0]
-        # Filtered on what the SCREEN found, never on why we looked.
+        # Filtered on what the SCREEN found, never on why we looked...
         assert "candidate_state = $1" in sql
         assert args[0] == ru.CANDIDATE_RESEARCH_CANDIDATE
         assert "discovery_reasons" not in sql
+        # ...and on the session that screen ran for. Without this a symbol
+        # last judged two sessions ago spends this session's budget, which is
+        # what ONDS did on 2026-08-31.
+        assert "scan_session = $3::date" in sql
+        assert args[2] == SESSION
 
     def test_scanned_not_candidate_is_never_enriched(self):
         conn = FakeEnrichConn([])
-        summary = asyncio.run(renrich.enrich_research_candidates(conn, now=NOW))
+        summary = asyncio.run(renrich.enrich_research_candidates(
+            conn, now=NOW, target_session=SESSION))
         assert summary["enriched"] == 0
         assert summary["provider_requests"] == 0
         assert all(s["status"] == renrich.STATUS_SKIPPED
@@ -382,7 +414,7 @@ class TestLazyEnrichment:
     def test_a_source_failure_is_isolated(self):
         conn = FakeEnrichConn(["ONDS"])
         summary = asyncio.run(renrich.enrich_research_candidates(
-            conn, now=NOW, massive_api_key="", sec_user_agent=""))
+            conn, now=NOW, target_session=SESSION, massive_api_key="", sec_user_agent=""))
         # No credential is `unavailable`, not an error, and the other sources
         # are still reported rather than skipped by an exception.
         assert set(summary["sources"]) == set(renrich.ENRICHMENT_SOURCES)
@@ -402,7 +434,8 @@ class TestLazyEnrichment:
         mod._enrich_sec = lambda *a, **k: boom()
         try:
             summary = asyncio.run(mod.enrich_research_candidates(
-                conn, now=NOW, sec_user_agent="x", massive_api_key=""))
+                conn, now=NOW, target_session=SESSION,
+                sec_user_agent="x", massive_api_key=""))
         finally:
             mod._enrich_sec = original
         assert summary["sources"][mod.SOURCE_SEC]["status"] == mod.STATUS_ERROR
@@ -424,7 +457,8 @@ class TestLazyEnrichment:
     def test_the_bound_is_small_and_hard(self):
         assert renrich.MAX_ENRICHED_SYMBOLS == 10
         conn = FakeEnrichConn(["A"] * 50)
-        asyncio.run(renrich.candidate_symbols(conn, limit=999))
+        asyncio.run(renrich.candidate_symbols(
+            conn, target_session=SESSION, limit=999))
         assert conn.queries[0][1][1] == renrich.MAX_ENRICHED_SYMBOLS
 
     def test_enrichment_has_its_own_provider_budget(self):
@@ -467,8 +501,15 @@ class TestRunAudit:
         assert source.index("finish_run") < source.index("assert_conservation")
 
     def test_the_child_state_vocabulary_matches_the_partition(self):
+        # Migration 030 widened the CHECK to admit `scan_stale`, so the
+        # authoritative vocabulary is now the LAST migration that rewrites the
+        # constraint, not 029. Read whichever that is rather than pinning a
+        # number a future migration would silently invalidate.
+        owning = sorted(m for m in MIGRATIONS.glob("*.sql")
+                        if "run_symbols_state_ck" in m.read_text(encoding="utf-8"))[-1]
+        sql = owning.read_text(encoding="utf-8")
         listed = set(re.findall(r"'([a-z_]+)'",
-                                self.SQL.split("run_symbols_state_ck")[1]
+                                sql.split("run_symbols_state_ck")[-1]
                                 .split("))")[0]))
         assert listed == set(rf.LIFECYCLE_STATES)
 
@@ -580,12 +621,22 @@ class TestDispatchIdentity:
         assert "run_warmup" not in cli
         assert "evaluate_admissions" not in cli
 
-    def test_two_attempts_not_three(self):
-        assert RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS == 2
+    def test_the_attempt_budget_outlasts_the_prerequisite_refresh(self):
+        # Was two, on the reasoning that the blocker "will not have changed
+        # within the retry window". The blocker was right; the window was not.
+        # Stale core bars ARE the normal 08:00 ET blocker and they clear on
+        # their own in 24-45 minutes (measured 2026-09-02), so the budget has
+        # to reach past that or the session is lost — which is exactly what
+        # happened to the 2026-09-01 occurrence.
+        assert RL.RESEARCH_LIFECYCLE_MAX_ATTEMPTS == 4
         from app.jobs.registry import resolve_handler
         spec = resolve_handler(RL.RESEARCH_LIFECYCLE_TASK)
-        assert spec.max_attempts == 2
+        assert spec.max_attempts == 4
         assert spec.queue_name == RL.RESEARCH_LIFECYCLE_QUEUE
+        # N attempts need N-1 delays, or the queue makes the missing one
+        # terminal and the extra attempts are decoration.
+        assert len(spec.retry_backoff_schedule) == 3
+        assert sum(spec.retry_backoff_schedule) / 60.0 >= 45.0
 
 
 class TestScheduleOwnership:

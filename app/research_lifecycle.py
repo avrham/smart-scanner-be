@@ -265,6 +265,32 @@ async def run_lifecycle(conn, *,
 
     run = await rr.start_run(conn, run_key=run_key, target_session=target,
                              now=moment)
+    # TARGET SESSION IS PINNED BY THE RUN, NOT BY THE CLOCK (T12).
+    # A deferred re-entry runs minutes-to-hours after the first attempt. If it
+    # re-resolved the session it could silently research S+1 the moment the
+    # wall clock crossed a market close, and the audit row would then describe
+    # a session nobody scheduled. The run row remembers which session this
+    # occurrence is about, so continuation reuses it.
+    pinned = run.get("target_session")
+    if pinned and pinned != target:
+        logger.info("research lifecycle re-entry: reusing pinned session %s "
+                    "(clock now resolves %s)", pinned, target)
+        target = pinned
+        summary["target_completed_session"] = target.isoformat()
+        summary["session_pinned_from_run"] = True
+    # BUDGET IS PER RUN, NOT PER ATTEMPT (T13).
+    # `provider_budget` arrives as a per-invocation number, so without this a
+    # durable re-entry would silently hand itself a fresh ceiling and one
+    # scheduled occurrence could spend MAX_PROVIDER_REQUESTS_PER_RUN once per
+    # attempt. The deferral path happens to spend nothing — the freshness gate
+    # returns before any provider stage — but a post-gate retryable failure
+    # would multiply, and raising the attempt budget from 2 to 4 for T11 would
+    # have quadrupled the worst case rather than doubled it.
+    already_spent = int(run.get("provider_calls_used") or 0)
+    if already_spent:
+        provider_budget = max(0, int(provider_budget) - already_spent)
+        summary["provider_budget"] = provider_budget
+        summary["provider_calls_used_in_earlier_attempts"] = already_spent
     summary["run_id"] = run["id"]
     warm_detail: Dict[str, Dict[str, int]] = {}
     funnel: Dict[str, Any] = {}
@@ -291,7 +317,7 @@ async def run_lifecycle(conn, *,
                     conn, freshness, target=target)
             # No provider figure is claimed: a blocked run attempted nothing,
             # and reporting "0 avoided" would read as a measurement.
-            funnel = await rf.load_funnel(conn)
+            funnel = await rf.load_funnel(conn, target_session=target)
             summary["funnel"] = funnel
             return summary
 
@@ -306,7 +332,7 @@ async def run_lifecycle(conn, *,
             summary["status"] = STATUS_BLOCKED_CONFIG
             summary["blocked_detail"] = (
                 config.get("reason") or "min_price unusable")
-            funnel = await rf.load_funnel(conn)
+            funnel = await rf.load_funnel(conn, target_session=target)
             summary["funnel"] = funnel
             return summary
 
@@ -339,7 +365,8 @@ async def run_lifecycle(conn, *,
 
         if dry_run:
             funnel = await rf.load_funnel(
-                conn, provider_calls_used=summary["provider_requests_used"],
+                conn, target_session=target,
+                provider_calls_used=summary["provider_requests_used"],
                 provider_calls_avoided=gates["provider_requests_avoided"])
             summary["funnel"] = funnel
             return summary
@@ -348,7 +375,8 @@ async def run_lifecycle(conn, *,
         remaining = max(0, int(provider_budget)
                         - summary["provider_requests_used"])
         warm = await _run_warmup(conn, limit=warm_limit,
-                                 max_requests=remaining)
+                                 max_requests=remaining,
+                                 target_session=target)
         summary["warmup"] = {
             # The list for a human, and the COUNT for the audit column. The
             # audit must never have to infer a number from a field shaped for
@@ -384,13 +412,15 @@ async def run_lifecycle(conn, *,
 
         # ---- 10. funnel accounting, and it must add up (P0) ---------------- #
         funnel = await rf.load_funnel(
-            conn, provider_calls_used=summary["provider_requests_used"],
+            conn, target_session=target,
+            provider_calls_used=summary["provider_requests_used"],
             provider_calls_avoided=summary["provider_requests_avoided_by_admission"])
         summary["funnel"] = funnel
 
         # ---- 11. lazy enrichment — survivors only, research cohort (P3) ---- #
         if enrich:
-            summary["enrichment"] = await _enrich(conn, now=moment)
+            summary["enrichment"] = await _enrich(
+                conn, now=moment, target_session=target)
         else:
             summary["enrichment"] = {"enriched": 0, "provider_requests": 0,
                                      "sources": {},
@@ -451,19 +481,22 @@ async def _refresh_discovery(conn) -> Dict[str, Any]:
     return out
 
 
-async def _run_warmup(conn, *, limit: int, max_requests: int) -> Dict[str, Any]:
+async def _run_warmup(conn, *, limit: int, max_requests: int,
+                      target_session: Optional[date] = None) -> Dict[str, Any]:
     from app.config import settings
     from app.providers import get_market_data_provider
     provider = (get_market_data_provider()
                 if settings.MASSIVE_API_KEY else None)
     return await ri.run_warmup(conn, provider, limit=limit,
-                               max_requests=max_requests)
+                               max_requests=max_requests,
+                               target_session=target_session)
 
 
-async def _enrich(conn, *, now: datetime) -> Dict[str, Any]:
+async def _enrich(conn, *, now: datetime,
+                  target_session: Optional[date] = None) -> Dict[str, Any]:
     from app.config import settings
     return await re_.enrich_research_candidates(
-        conn, now=now,
+        conn, now=now, target_session=target_session,
         massive_api_key=(settings.MASSIVE_API_KEY or ""),
         sec_user_agent=(getattr(settings, "SEC_USER_AGENT", "") or ""))
 

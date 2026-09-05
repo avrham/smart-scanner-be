@@ -100,6 +100,15 @@ LIFECYCLE_HISTORY_FAILED = "history_failed"
 #: Enough history; the research scan has not run yet.
 LIFECYCLE_SCAN_PENDING = "scan_pending"
 
+#: Enough history, and a scan EXISTS — but for an earlier session, not this
+#: run's. Its own state, and not folded into either neighbour, for the reason
+#: this whole module exists: folding it into `scan_pending` would lose the fact
+#: that we hold evidence, and folding it into a scanned state is precisely the
+#: defect. ONDS entered the 2026-08-31 run carrying a `research_candidate`
+#: classification earned on 2026-08-28 and was counted as one of that run's two
+#: candidates without being evaluated for it even once.
+LIFECYCLE_SCAN_STALE = "scan_stale"
+
 #: Scanned, but the candidate classification has not been applied. Should be
 #: transient. Given its own state rather than folded into either neighbour,
 #: because folding it is how a symbol gets counted as a non-candidate before
@@ -120,6 +129,7 @@ LIFECYCLE_STATES: Tuple[str, ...] = (
     LIFECYCLE_HISTORY_UNAVAILABLE,
     LIFECYCLE_HISTORY_FAILED,
     LIFECYCLE_SCAN_PENDING,
+    LIFECYCLE_SCAN_STALE,
     LIFECYCLE_CLASSIFICATION_PENDING,
     LIFECYCLE_SCANNED_NOT_CANDIDATE,
     LIFECYCLE_RESEARCH_CANDIDATE,
@@ -130,7 +140,8 @@ LIFECYCLE_STATES: Tuple[str, ...] = (
 POST_ADMISSION_STATES: Tuple[str, ...] = (
     LIFECYCLE_HISTORY_PENDING, LIFECYCLE_HISTORY_WARMING,
     LIFECYCLE_HISTORY_UNAVAILABLE, LIFECYCLE_HISTORY_FAILED,
-    LIFECYCLE_SCAN_PENDING, LIFECYCLE_CLASSIFICATION_PENDING,
+    LIFECYCLE_SCAN_PENDING, LIFECYCLE_SCAN_STALE,
+    LIFECYCLE_CLASSIFICATION_PENDING,
     LIFECYCLE_SCANNED_NOT_CANDIDATE, LIFECYCLE_RESEARCH_CANDIDATE,
 )
 
@@ -146,6 +157,13 @@ TERMINAL_LIFECYCLE_STATES: Tuple[str, ...] = (
     LIFECYCLE_ADMISSION_REJECTED, LIFECYCLE_HISTORY_UNAVAILABLE,
     LIFECYCLE_HISTORY_FAILED,
 )
+
+
+#: The columns `research_scan_results` supplies to the screen. If every one of
+#: them is NULL the scan produced nothing to judge, which is not the same as
+#: judging the symbol and finding nothing.
+_SCAN_EVIDENCE_FIELDS = ("rejection_reason", "structure_state", "setup_state",
+                         "benchmark_relative")
 
 
 class FunnelConservationError(AssertionError):
@@ -185,18 +203,36 @@ def lifecycle_state(row: Dict[str, Any]) -> str:
         return LIFECYCLE_HISTORY_FAILED
     if state == ru.STATE_HISTORY_WARMING:
         return LIFECYCLE_HISTORY_WARMING
-    if state == ru.STATE_RESEARCH_SCANNED:
-        candidate = row.get("candidate_state")
-        if candidate == ru.CANDIDATE_RESEARCH_CANDIDATE:
-            return LIFECYCLE_RESEARCH_CANDIDATE
-        if candidate == ru.CANDIDATE_SCANNED_NOT_CANDIDATE:
+    if state in (ru.STATE_RESEARCH_SCANNED, ru.STATE_RESEARCH_READY):
+        # SESSION-SCOPED FROM HERE DOWN (T1/T2/T5).
+        #
+        # `candidate_state` is a persistent column with no session on it: it
+        # remembers the last classification a symbol ever received, from
+        # whichever session produced it. Reading it here is what let a run
+        # report a candidate it had not evaluated. So the scanned states are
+        # now derived from THIS SESSION's scan row and nothing else, while the
+        # persistent column is left untouched for audit and history.
+        #
+        # `has_current_scan` and the evidence beside it come from a join on
+        # `research_scan_results` at `scan_session = target`, which is already
+        # this project's unit of scan provenance — it is half the primary key.
+        if not row.get("has_current_scan"):
+            # Evidence exists, but not for this session. Distinct from
+            # never-scanned, and emphatically not a scanned state.
+            return (LIFECYCLE_SCAN_STALE if row.get("has_any_scan")
+                    else LIFECYCLE_SCAN_PENDING)
+        # A scan row exists for this session but carries no evidence at all —
+        # nothing has judged this symbol yet. Kept as its own state for the
+        # reason it always was: folding "not yet judged" into "did not
+        # survive" reports a rejection nobody made.
+        if not any(row.get(k) is not None for k in _SCAN_EVIDENCE_FIELDS):
+            return LIFECYCLE_CLASSIFICATION_PENDING
+        findings = ru.screen_findings(row)
+        if ru.SCREEN_HARD_DISQUALIFIED in findings:
             return LIFECYCLE_SCANNED_NOT_CANDIDATE
-        # Scanned, not yet classified (or classified as insufficient/
-        # unavailable, which contradicts `research_scanned` and is therefore
-        # also "not judged yet"). Never silently a non-candidate.
-        return LIFECYCLE_CLASSIFICATION_PENDING
-    if state == ru.STATE_RESEARCH_READY:
-        return LIFECYCLE_SCAN_PENDING
+        if findings == [ru.SCREEN_NO_EVIDENCE]:
+            return LIFECYCLE_SCANNED_NOT_CANDIDATE
+        return LIFECYCLE_RESEARCH_CANDIDATE
     # `discovered`, `history_required`, an unknown/NULL state: admitted and
     # waiting for history. Unknown lands here rather than nowhere.
     return LIFECYCLE_HISTORY_PENDING
@@ -288,7 +324,8 @@ def summarise(rows: Iterable[Dict[str, Any]], *,
                 rate(passed, selected, of="symbols_selected_for_research"),
             # 8/15 — of admitted symbols, how many reached usable history.
             "history_readiness_rate":
-                rate(states[LIFECYCLE_SCAN_PENDING] + scanned, admitted,
+                rate(states[LIFECYCLE_SCAN_PENDING]
+                     + states[LIFECYCLE_SCAN_STALE] + scanned, admitted,
                      of="symbols_admitted_to_history"),
             # 1/7 — of SCANNED symbols. A different population, a different
             # word: this is never called the admission rate and never merged
@@ -376,6 +413,15 @@ def check_conservation(summary: Dict[str, Any]) -> Dict[str, Any]:
        summary["research_candidates"],
        "research_candidates <= scanned")
 
+    # 6b. Stale evidence is NOT scanned evidence (T5). Named and checked so a
+    #     future edit cannot quietly fold `scan_stale` back into the scanned
+    #     population, which is the exact shape of the defect this state exists
+    #     to prevent.
+    eq("stale_scans_are_not_scanned",
+       summary["scanned"],
+       sum(states[s] for s in SCANNED_STATES),
+       "scanned excludes scan_stale")
+
     # 7. The rate denominators are the populations they claim to be — so a
     #    future edit cannot quietly re-point a rate at a different cohort.
     rates = summary["rates"]
@@ -420,13 +466,28 @@ def assert_conservation(summary: Dict[str, Any]) -> None:
         f"research funnel does not conserve symbols — {detail}")
 
 
+#: The funnel now carries a SESSION. `research_scan_results` is joined at the
+#: run's target session — `(symbol, scan_session)` is that table's unique key,
+#: so "was this symbol evaluated for S?" is answerable from evidence we already
+#: persist, with no new column and no new table.
+#:
+#: `has_any_scan` separates "ready and never looked at" from "we hold evidence,
+#: but from an earlier session". Both are unscanned FOR THIS RUN; only one of
+#: them means we already know something about the symbol.
 FUNNEL_ROW_SQL = """
-SELECT symbol, admission_state, state, candidate_state
-FROM public.research_symbols
+SELECT r.symbol, r.admission_state, r.state, r.candidate_state,
+       (cur.symbol IS NOT NULL)                    AS has_current_scan,
+       (r.research_scanned_at IS NOT NULL)         AS has_any_scan,
+       cur.rejection_reason, cur.structure_state, cur.setup_state,
+       cur.benchmark_relative
+FROM public.research_symbols r
+LEFT JOIN public.research_scan_results cur
+       ON cur.symbol = r.symbol AND cur.scan_session = $1::date
 """
 
 
-async def load_funnel(conn, *, provider_calls_used: int = 0,
+async def load_funnel(conn, *, target_session=None,
+                      provider_calls_used: int = 0,
                       provider_calls_avoided: Optional[int] = None,
                       ) -> Dict[str, Any]:
     """The whole research pool, partitioned. One query, one pass, no FILTERs.
@@ -441,13 +502,14 @@ async def load_funnel(conn, *, provider_calls_used: int = 0,
     default made a standalone `--summary` report a conservation violation
     against its own invented measurement.
     """
-    rows = [dict(r) for r in await conn.fetch(FUNNEL_ROW_SQL)]
+    rows = [dict(r) for r in await conn.fetch(FUNNEL_ROW_SQL, target_session)]
     return summarise(rows, provider_calls_used=provider_calls_used,
                      provider_calls_avoided=provider_calls_avoided)
 
 
 __all__ = [
     "RESEARCH_FUNNEL_CONTRACT_VERSION", "LIFECYCLE_STATES",
+    "LIFECYCLE_SCAN_STALE",
     "POST_ADMISSION_STATES", "SCANNED_STATES", "TERMINAL_LIFECYCLE_STATES",
     "LIFECYCLE_ADMISSION_PENDING", "LIFECYCLE_ADMISSION_REJECTED",
     "LIFECYCLE_HISTORY_PENDING", "LIFECYCLE_HISTORY_WARMING",

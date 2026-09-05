@@ -85,7 +85,7 @@ ON CONFLICT (run_key) DO UPDATE SET
     -- A retry re-opens the SAME run rather than creating a second one. The
     -- original started_at is kept: the run began when it began.
     status = 'running', updated_at = NOW()
-RETURNING id, started_at
+RETURNING id, started_at, target_session, provider_calls_used
 """
 
 
@@ -97,7 +97,16 @@ async def start_run(conn, *, run_key: str, target_session: Optional[date],
     row = await conn.fetchrow(START_SQL, run_key, RESEARCH_RUN_CONTRACT_VERSION,
                               moment, target_session)
     return {"id": str(row["id"]), "run_key": run_key,
-            "started_at": row["started_at"]}
+            "started_at": row["started_at"],
+            # The session this run was opened against. On a RE-ENTRY the
+            # ON CONFLICT above deliberately does not touch `target_session`,
+            # so this is the ORIGINAL pin and the caller must reuse it rather
+            # than re-resolving from a wall clock that has since moved (T12).
+            "target_session": row["target_session"],
+            # What THIS run has already spent with the provider across every
+            # previous attempt. A durable re-entry must spend the remainder of
+            # the run's budget, not a fresh copy of it (T13).
+            "provider_calls_used": int(row["provider_calls_used"] or 0)}
 
 
 FINISH_SQL = """
@@ -455,7 +464,82 @@ __all__ = [
     "RESEARCH_RUN_CONTRACT_VERSION", "RUN_STATUSES", "MEASURABLE_STATUSES",
     "RUN_STATUS_RUNNING", "RUN_STATUS_COMPLETED", "RUN_STATUS_DRY_RUN",
     "RUN_STATUS_FAILED", "RUN_STATUS_BLOCKED_STALE",
+    "HEALTH_COMPLETED", "HEALTH_HEALTHY_WAITING",
+    "HEALTH_TERMINAL_BLOCKED", "HEALTH_RUNNING",
+    "RUN_HEALTH_SQL", "run_health",
     "RUN_STATUS_BLOCKED_CONFIG", "MAX_SUMMARY_BYTES",
     "start_run", "finish_run", "fail_run", "recent_runs", "measurement",
     "_count",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# operational health of a scheduled occurrence (T15)
+#
+# `blocked_stale_core_history` used to mean one thing: the run stopped and an
+# operator has to do something. Since the lifecycle learned to defer and
+# re-enter (T11) the SAME status also covers a healthy wait — the run asked for
+# its own prerequisites and the queue will bring it back. Those are opposite
+# operational facts wearing one name, and a monitor that cannot tell them apart
+# either pages on every normal morning or never pages at all.
+#
+# The distinction does not need a new status, and deliberately does not get
+# one: it is not a property of the run alone. It is the run status TOGETHER
+# with whether a future attempt is still scheduled, and that second half
+# already lives in `job_tasks` — status, available_at, attempt_count,
+# max_attempts. So the predicate joins the two, and reads only persisted
+# columns: no worker logs, no in-memory state, no new column.
+#
+# The join is `job_tasks.idempotency_key = 'rlctask:' || run_key`, which is
+# exactly the key `enqueue_research_lifecycle` writes.
+# --------------------------------------------------------------------------- #
+
+HEALTH_COMPLETED = "COMPLETED"
+HEALTH_HEALTHY_WAITING = "HEALTHY_WAITING"
+HEALTH_TERMINAL_BLOCKED = "TERMINAL_BLOCKED"
+HEALTH_RUNNING = "RUNNING"
+
+#: One row per research run, with the operational verdict a monitor should act
+#: on. `$1` is an optional target_session filter (NULL = every run).
+RUN_HEALTH_SQL = """
+SELECT r.id, r.run_key, r.target_session, r.status AS run_status,
+       t.status AS task_status, t.attempt_count, t.max_attempts,
+       t.available_at,
+       CASE
+         WHEN r.status = 'completed' THEN 'COMPLETED'
+         WHEN r.status = 'dry_run'   THEN 'COMPLETED'
+         -- A future attempt is genuinely scheduled: the task is retryable and
+         -- it still has an attempt left. Deliberately NOT also testing
+         -- `available_at IS NOT NULL` — the column is NOT NULL in the schema,
+         -- so that clause would read like a safeguard while being incapable of
+         -- ever being false. `available_at` is reported instead, so an operator
+         -- can see WHEN it comes back; the decision rests on the two facts that
+         -- can actually vary.
+         WHEN t.status = 'retryable'
+              AND t.attempt_count < t.max_attempts THEN 'HEALTHY_WAITING'
+         -- Still executing.
+         WHEN t.status IN ('queued','leased','running')
+              OR r.status = 'running' THEN 'RUNNING'
+         -- Anything else that is not completed has no future automatic
+         -- continuation: the attempts are spent, the task failed, or there is
+         -- no task at all. That is the operator's problem.
+         ELSE 'TERMINAL_BLOCKED'
+       END AS health
+FROM public.research_lifecycle_runs r
+LEFT JOIN public.job_tasks t
+       ON t.idempotency_key = 'rlctask:' || r.run_key
+WHERE ($1::date IS NULL OR r.target_session = $1::date)
+ORDER BY r.started_at DESC
+"""
+
+
+async def run_health(conn, *, target_session=None) -> List[Dict[str, Any]]:
+    """Operational verdict per run, from persisted state only.
+
+    A monitor must NOT raise on HEALTHY_WAITING — that is a scheduled
+    occurrence waiting out the core-history refresh it requested, inside its
+    continuation window. It MUST raise on TERMINAL_BLOCKED, which means the
+    attempts are exhausted, the task failed, or nothing will come back.
+    """
+    rows = await conn.fetch(RUN_HEALTH_SQL, target_session)
+    return [dict(r) for r in rows]

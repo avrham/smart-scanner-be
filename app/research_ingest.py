@@ -354,6 +354,7 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
     """
     rows = [dict(r) for r in await conn.fetch(
         "SELECT symbol, state, warmup_attempts, warmup_last_error_class, "
+        "       warmup_last_error_code, "
         "       history_daily_bars, research_scanned_at "
         "FROM public.research_symbols"
         + (" WHERE symbol = ANY($1::text[])" if symbols else ""),
@@ -372,7 +373,8 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
             week_groups=local.get("week_groups"),
             month_groups=local.get("month_groups"),
             attempts=int(row["warmup_attempts"] or 0),
-            last_error_class=row["warmup_last_error_class"])
+            last_error_class=row["warmup_last_error_class"],
+            last_error_code=row["warmup_last_error_code"])
         # A symbol that has been scanned stays scanned as long as it is still
         # ready — the scan is a fact about the past and re-deriving it away
         # would lose it.
@@ -405,30 +407,85 @@ async def refresh_states(conn, *, symbols: Optional[Sequence[str]] = None,
 WARMUP_SELECT_SQL = """
 SELECT symbol, discovery_reasons AS reasons, discovery_observation_count AS observation_count,
        history_daily_bars AS daily_bars, latest_reference_session, best_rank,
-       warmup_attempts, warmup_cooldown_until
+       warmup_attempts, warmup_cooldown_until,
+       history_latest_session,
+       (state IN ('research_ready', 'research_scanned')) AS freshness_topup,
+       -- FAIRNESS CLOCK (T9). "How long since this symbol was last serviced,
+       -- or since it arrived if it never has been." Both columns already
+       -- exist and are already maintained, so eventual progress needs no new
+       -- state and no second scheduler.
+       COALESCE(warmup_last_attempt_at, first_observed_at) AS last_served_at
 FROM public.research_symbols
-WHERE state IN ('discovered', 'history_required', 'history_warming')
-  AND warmup_attempts < $1
+WHERE warmup_attempts < $1
   AND (admission_state IS NULL
        OR admission_state IN ('eligible_for_history',
                               'insufficient_admission_data'))
+  AND (
+       state IN ('discovered', 'history_required', 'history_warming')
+       -- FRESHNESS TOP-UP (T3/T4). A symbol that already holds enough history
+       -- still cannot be scanned FOR session S unless its own bars reach S,
+       -- and nothing used to refresh it: warmup only ever looked at symbols
+       -- that were short of history, never at ones that were merely stale.
+       -- That is why every symbol scanned on 2026-08-31 was reading bars that
+       -- stopped on 2026-08-28 while SPY had moved on — the benchmark half of
+       -- the comparison was three days ahead of the symbol half.
+       -- With no target session there is nothing to be stale RELATIVE TO, so
+       -- this branch must be inert rather than universally true — otherwise a
+       -- caller that omits the session sweeps every ready symbol into the
+       -- batch and spends the budget refreshing things toward no deadline.
+       OR ($2::date IS NOT NULL
+           AND state IN ('research_ready', 'research_scanned')
+           AND (history_latest_session IS NULL
+                OR history_latest_session < $2::date))
+  )
 """
 
 
 async def select_warmup_batch(conn, *, limit: int = ru.MAX_WARMUP_SYMBOLS_PER_RUN,
+                              target_session: Optional[date] = None,
                               now: Optional[datetime] = None,
                               ) -> List[Dict[str, Any]]:
     """The next symbols to warm, in the documented lexicographic order.
 
     Symbols in cooldown are skipped rather than counted against the batch: a
     parked symbol must not silently consume the budget of a healthy one.
+
+    `target_session` admits the freshness top-up class — a symbol that already
+    holds enough history but whose bars lag the session cannot be scanned for
+    it, and nothing used to refresh those.
+
+    ONE QUEUE, ORDERED BY WHO HAS WAITED LONGEST (T9)
+    -------------------------------------------------
+    The first cut of this function took freshness top-ups FIRST and gave cold
+    symbols whatever slots were left. That starves, provably and permanently:
+    every new session re-stales every current symbol, so with five or more
+    ready symbols the top-up class refills to the cap every single run and no
+    cold symbol is ever reached. Worse, `priority_key` sorts on static
+    attributes only, so it was the SAME five ready symbols every run — twelve
+    stale-ready symbols starved down to five served and seven never touched.
+
+    So there is no class ordering at all. There is one queue, ordered by
+    `last_served_at` — last warm attempt, or arrival for a symbol never warmed
+    — and being served is the only thing that moves a symbol to the back of
+    it. Every eligible symbol therefore reaches the front within ceil(N/limit)
+    runs, which is the progress guarantee; `priority_key` remains the
+    tie-break, so ordering stays total and reproducible.
+
+    This needs no reserved ratio, and deliberately so: a ratio would have to
+    be justified, and the right split is not a constant. Service share falls
+    out of backlog size instead, which is the correct behaviour here because
+    the two backlogs are different SHAPES — bootstrap is finite and drains (a
+    cold symbol is ready after one successful warm) while freshness is
+    permanent maintenance. During bootstrap the queue lends capacity to cold
+    symbols in proportion to how many are waiting; once they are drained every
+    slot returns to freshness on its own.
     """
     moment = now or datetime.now(timezone.utc)
     rows = [dict(r) for r in await conn.fetch(
-        WARMUP_SELECT_SQL, ru.MAX_WARMUP_ATTEMPTS)]
+        WARMUP_SELECT_SQL, ru.MAX_WARMUP_ATTEMPTS, target_session)]
     eligible = [r for r in rows
                 if not ru.is_in_cooldown(r["warmup_cooldown_until"], now=moment)]
-    return ru.prioritise(eligible, limit=limit)
+    return ru.prioritise_fairly(eligible, limit=limit)
 
 
 async def warm_symbol(conn, provider, symbol: str, *,
@@ -486,27 +543,71 @@ async def warm_symbol(conn, provider, symbol: str, *,
                        symbol, code, klass)
         return result
 
-    after = (await bar_counts(conn, [symbol])).get(symbol, {}).get("bars", 0)
+    counts = (await bar_counts(conn, [symbol])).get(symbol, {})
+    after = counts.get("bars", 0)
     result["bars_after"] = after
-    # A symbol the provider serves but cannot fill is `unavailable`, not
-    # `failed`: retrying will not conjure history that does not exist. Two
-    # shapes of that, both terminal:
-    #   * it returned almost nothing at all (a very recent listing);
-    #   * it returned NOTHING NEW on a repeat call, which is the provider
-    #     saying it has given us everything it holds. Without this second
-    #     case a symbol whose listing is younger than the 24-month gate burns
-    #     all three attempts and lands in `failed`, which reads as our fault.
+
+    # TWO DIFFERENT SENTENCES THAT USED TO BE ONE (T7)
+    # ------------------------------------------------
+    # `exhausted` previously meant "a repeat call returned nothing new", and
+    # that was read as terminal. But "nothing new" has two causes and only one
+    # of them is about the symbol:
+    #
+    #   * the provider has no more history BEHIND today — a real, permanent
+    #     fact about back-history under a two-year plan;
+    #   * we asked twice within the SAME session, so of course nothing moved —
+    #     a fact about our own timing, not about the symbol.
+    #
+    # AAL, ETHA and SOXL hit the second case on 499 bars / 23 completed months
+    # and were marked terminal one month-group short of ready. Because
+    # `unavailable` is excluded from warmup selection, the error code that put
+    # them there could never be cleared: a closed loop.
+    #
+    # So exhaustion is now recorded as a NON-terminal fact, and terminality is
+    # reserved for the one shape that time cannot fix — the provider barely
+    # carries the symbol at all.
     exhausted = attempt_number > 1 and after == before and after > 0
-    terminal = after < ru.RESEARCH_MIN_USABLE_BARS or exhausted
+    too_thin = after < ru.RESEARCH_MIN_USABLE_BARS
+    months_short = ru.months_short_of_ready(counts.get("month_groups"))
+
+    if too_thin:
+        code, klass, cooldown = "insufficient_provider_history", "terminal", None
+    elif months_short > 0:
+        # Waiting for the calendar, not for the provider. Park until the month
+        # boundary that could actually change the answer, so a maturing symbol
+        # stops competing with real work for the bounded request budget — and
+        # so `warmup_attempts` never accumulates against it while it waits.
+        #
+        # THE CLASS IS NULL, AND THAT IS THE POINT.
+        # A symbol that is merely too young is not in an ERROR class at all.
+        # An earlier cut of this wrote `class='maturing'`, which is both wrong
+        # semantically and rejected by `research_symbols_error_class_ck` — the
+        # column admits only retryable/terminal/operator_error (or NULL), and
+        # the write crashed the whole lifecycle the first time a warmed symbol
+        # came back still immature (VISN, 159 bars, 2026-09-02). The waiting is
+        # already fully described by the CODE and the COOLDOWN; the class has
+        # nothing true to say, so it says nothing.
+        code = ("provider_history_exhausted" if exhausted
+                else "awaiting_history_maturity")
+        klass = None
+        cooldown = ru.next_maturity_recheck(moment, months_short=months_short)
+    else:
+        code, klass, cooldown = None, None, None
+    maturing = cooldown is not None and not too_thin
+
     await conn.execute(
         "UPDATE public.research_symbols SET warmup_last_error_code=$2, "
-        "warmup_last_error_class=$3, warmup_cooldown_until=NULL, "
-        "warmup_provider_requests=warmup_provider_requests+1, updated_at=NOW() "
+        "warmup_last_error_class=$3, warmup_cooldown_until=$4, "
+        "warmup_provider_requests=warmup_provider_requests+1, "
+        # An attempt that reached the provider and simply found the symbol too
+        # young is not a failed attempt (T8). Rolling it back keeps a bounded
+        # counter from turning "come back next month" into permanent failure —
+        # which is exactly what would have stranded SPCX on its third warm.
+        "warmup_attempts = GREATEST(0, warmup_attempts - $5), updated_at=NOW() "
         "WHERE symbol=$1",
-        symbol,
-        ("provider_history_exhausted" if exhausted
-         else "insufficient_provider_history") if terminal else None,
-        "terminal" if terminal else None)
+        symbol, code, klass, cooldown, 1 if maturing else 0)
+    result["maturity_months_short"] = months_short
+    result["recheck_after"] = cooldown
     return result
 
 
@@ -514,6 +615,7 @@ async def run_warmup(conn, provider, *,
                      limit: int = ru.MAX_WARMUP_SYMBOLS_PER_RUN,
                      max_requests: int = ru.MAX_PROVIDER_REQUESTS_PER_RUN,
                      spacing_seconds: Optional[int] = None,
+                     target_session: Optional[date] = None,
                      now: Optional[datetime] = None) -> Dict[str, Any]:
     """Warm a bounded batch, sequentially, counting every provider call.
 
@@ -546,7 +648,8 @@ async def run_warmup(conn, provider, *,
         return summary
 
     try:
-        batch = await select_warmup_batch(conn, limit=limit, now=moment)
+        batch = await select_warmup_batch(
+            conn, limit=limit, target_session=target_session, now=moment)
         summary["selected"] = [r["symbol"] for r in batch]
         for index, row in enumerate(batch):
             if summary["provider_requests"] >= max_requests:

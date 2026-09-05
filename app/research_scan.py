@@ -99,6 +99,13 @@ async def _local_bars(conn, symbol: str, session: date,
             for r in reversed(rows)]
 
 
+def effective_session(bars: List[Dict[str, Any]]) -> Optional[date]:
+    """The session a series ACTUALLY represents: its newest bar at or before
+    the pin. Not the pin itself — the two differ whenever a symbol is stale,
+    and conflating them is how a 2026-08-28 close became 2026-08-31 evidence."""
+    return bars[-1]["trading_date"] if bars else None
+
+
 async def build_context(conn, symbol: str, *, session: date) -> Dict[str, Any]:
     """Benchmark-relative context, and an explicit answer about the sector.
 
@@ -110,14 +117,34 @@ async def build_context(conn, symbol: str, *, session: date) -> Dict[str, Any]:
     """
     own = await _local_bars(conn, symbol, session)
     bench = await _local_bars(conn, PRIMARY_BENCHMARK, session)
+
+    # SESSION ALIGNMENT (T3). The lookahead barrier `trading_date <= session`
+    # bounds both series from ABOVE and neither from below, so two series can
+    # satisfy it while representing different days. On 2026-08-31 that is
+    # exactly what happened: SPY had been refreshed to the target session and
+    # the research symbols still stopped at 2026-08-28, so every excess figure
+    # was a symbol's three-day-old close measured against a current benchmark.
+    # The tell was that IBIT's excess moved 20.19 -> 21.94 between two scans in
+    # which IBIT gained no bars at all; the entire change was SPY moving.
+    #
+    # We refuse rather than truncate. Trimming SPY back to the symbol's last
+    # day would make the arithmetic agree while still labelling the answer an
+    # evaluation of `session`, which is the same lie with better internals.
+    own_effective = effective_session(own)
+    bench_effective = effective_session(bench)
+    aligned = bool(bench) and own_effective == bench_effective
     benchmark = mc.build_reference_relative_strength(
-        own, bench, reference_symbol=PRIMARY_BENCHMARK if bench else None,
+        own, bench if aligned else [],
+        reference_symbol=PRIMARY_BENCHMARK if aligned else None,
         reference_kind="broad_market",
-        unavailable_reason=None if bench else "no_benchmark_bars_stored")
+        unavailable_reason=(
+            None if aligned else
+            "no_benchmark_bars_stored" if not bench
+            else "benchmark_session_misaligned"))
 
     sector_symbol = sector_benchmark_for(symbol)
     sector_state = ru.classify_sector_state(
-        symbol, benchmark_available=bool(bench))
+        symbol, benchmark_available=aligned)
     sector: Dict[str, Any] = {
         "status": mc.STATUS_UNAVAILABLE,
         "reason": "symbol_not_in_sector_registry",
@@ -125,13 +152,22 @@ async def build_context(conn, symbol: str, *, session: date) -> Dict[str, Any]:
     }
     if sector_symbol:
         sector_bars = await _local_bars(conn, sector_symbol, session)
+        sector_aligned = (bool(sector_bars)
+                          and effective_session(sector_bars) == own_effective)
         sector = mc.build_reference_relative_strength(
-            own, sector_bars, reference_symbol=sector_symbol,
+            own, sector_bars if sector_aligned else [],
+            reference_symbol=sector_symbol if sector_aligned else None,
             reference_kind="sector",
-            unavailable_reason=None if sector_bars else "no_sector_bars_stored")
+            unavailable_reason=(
+                None if sector_aligned else
+                "no_sector_bars_stored" if not sector_bars
+                else "sector_session_misaligned"))
 
     return {"benchmark": benchmark, "sector": sector,
             "sector_state": sector_state, "sector_symbol": sector_symbol,
+            "effective_session": own_effective,
+            "benchmark_effective_session": bench_effective,
+            "session_aligned": aligned,
             "volume": mc.build_volume_context(own)}
 
 
@@ -379,10 +415,19 @@ async def run_research_scans(conn, *, session: date,
                              now: Optional[datetime] = None) -> Dict[str, Any]:
     """Scan every research-ready symbol, one at a time, failing per symbol."""
     moment = now or datetime.now(timezone.utc)
+    # SCAN ELIGIBILITY IS SESSION-SCOPED (T4). Holding enough history is not
+    # the same as holding CURRENT history: a symbol whose newest bar predates
+    # the pinned session cannot be evaluated FOR that session, because every
+    # number derived from it — structure, setup, and above all the benchmark
+    # comparison — would describe a different day than the one we are claiming
+    # to report. `history_latest_session` is maintained by `refresh_states`
+    # from the bars themselves, so this filter reads a fact, not a flag.
     rows = [dict(r) for r in await conn.fetch(
         "SELECT symbol FROM public.research_symbols "
         "WHERE state IN ('research_ready','research_scanned') "
-        "ORDER BY latest_reference_session DESC, symbol LIMIT $1", limit)]
+        "  AND history_latest_session = $2 "
+        "ORDER BY latest_reference_session DESC, symbol LIMIT $1",
+        limit, session)]
     summary: Dict[str, Any] = {"session": session.isoformat(),
                                "scanned": [], "failed": []}
     for row in rows:
@@ -412,7 +457,7 @@ async def run_research_scans(conn, *, session: date,
 
 
 __all__ = [
-    "CONTEXT_BARS", "build_context", "evaluate_research_symbol",
+    "CONTEXT_BARS", "effective_session", "build_context", "evaluate_research_symbol",
     "persist_research_scan", "run_research_scans",
     "classify_and_store_candidate", "reclassify_candidates",
 ]
