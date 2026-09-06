@@ -6,6 +6,8 @@
     python -m ops.analysis.research_outcomes --status
     python -m ops.analysis.research_outcomes --recheck  [--label audit]
     python -m ops.analysis.research_outcomes --schedule-preview
+    python -m ops.analysis.research_outcomes --enable-schedule
+    python -m ops.analysis.research_outcomes --disable-schedule
 
 THE THREE MODES, AND WHEN EACH IS HONEST
 ----------------------------------------
@@ -104,6 +106,71 @@ async def status() -> dict:
         return {"connected_as": role, **(await svc.outcome_status(conn))}
 
 
+async def set_schedule(*, enable: bool) -> dict:
+    """Enable or disable the outcome schedule, ALWAYS seeding `next_run_at`.
+
+    WHY THIS EXISTS RATHER THAN A HAND-WRITTEN UPDATE
+    -------------------------------------------------
+    The durable scheduler treats a row with `next_run_at IS NULL` as DUE, and
+    then does this (app/jobs/scheduler.py::_tick_as_leader):
+
+        occurrence = s["next_run_at"] or compute_next_run_at(s, now)
+
+    So a schedule enabled with a NULL next_run_at fires on its very next tick —
+    but stamped with the identity of the next FUTURE occurrence, and it then
+    advances past that occurrence. Measured on this schedule in staging: the
+    tick at 2026-09-06T11:21:38Z materialised occurrence 2026-09-09T15:00:00Z
+    (three days early) and set next_run_at to 2026-09-10T15:00:00Z, so the
+    2026-09-09 slot produced no run at its own time and the durable record
+    nonetheless claims it was served.
+
+    Nothing was lost — an observation waits in the ledger until it is measured,
+    so the only cost was one day of latency — but the audit trail was wrong
+    about which occurrence a run answered, and that is not a property to leave
+    in place.
+
+    The scheduler is SHARED with the daily pipeline and the research lifecycle,
+    so it is not this workstream's to change. What is ours is never handing it a
+    NULL: `next_run_at` is computed here with the SAME resolver the scheduler
+    uses, so the first tick takes the stored instant and the identity it stamps
+    is the occurrence it actually ran for.
+    """
+    from app.jobs.scheduler import compute_next_run_at
+
+    async with research_connection() as conn:
+        role = await conn.fetchval("SELECT current_user")
+        row = await conn.fetchrow(
+            "SELECT * FROM job_schedules WHERE schedule_code=$1 "
+            "ORDER BY schedule_version DESC LIMIT 1",
+            RO.RESEARCH_OUTCOMES_SCHEDULE_CODE)
+        if row is None:
+            return {"connected_as": role, "error": "schedule_not_found",
+                    "note": "migration 031 has not been applied here"}
+        sched = dict(row)
+        before = {"enabled": sched["enabled"], "paused": sched["paused"],
+                  "next_run_at": (sched["next_run_at"].isoformat()
+                                  if sched["next_run_at"] else None)}
+        if not enable:
+            await conn.execute(
+                "UPDATE job_schedules SET enabled=FALSE, paused=TRUE,"
+                " updated_at=NOW() WHERE id=$1", sched["id"])
+            return {"connected_as": role, "action": "disabled", "before": before,
+                    "after": {"enabled": False, "paused": True,
+                              "next_run_at": before["next_run_at"]}}
+
+        # Keep an already-scheduled occurrence; only a NULL is dangerous.
+        next_run = sched["next_run_at"] or compute_next_run_at(
+            sched, datetime.now(timezone.utc))
+        await conn.execute(
+            "UPDATE job_schedules SET enabled=TRUE, paused=FALSE,"
+            " next_run_at=$2, updated_at=NOW() WHERE id=$1",
+            sched["id"], next_run)
+        return {"connected_as": role, "action": "enabled", "before": before,
+                "after": {"enabled": True, "paused": False,
+                          "next_run_at": next_run.isoformat()},
+                "seeded_next_run_at": sched["next_run_at"] is None}
+
+
 async def schedule_preview() -> dict:
     from app.jobs.scheduler import preview_occurrences
     async with research_connection() as conn:
@@ -160,6 +227,12 @@ def main() -> None:
                              "DETECT (never repair) a corrected bar")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--schedule-preview", action="store_true")
+    parser.add_argument("--enable-schedule", action="store_true",
+                        help="enable the outcome schedule, seeding next_run_at "
+                             "so the first tick cannot consume a future "
+                             "occurrence")
+    parser.add_argument("--disable-schedule", action="store_true",
+                        help="disable and pause the outcome schedule")
     parser.add_argument("--label", default="manual")
     parser.add_argument("--scan-limit", type=int, default=svc.DEFAULT_SCAN_LIMIT)
     parser.add_argument("--observation-limit", type=int,
@@ -167,9 +240,13 @@ def main() -> None:
     args = parser.parse_args()
 
     if not (args.dry_run or args.dispatch or args.run or args.status
-            or args.schedule_preview):
-        parser.error("choose --dry-run, --dispatch, --run, --status or "
-                     "--schedule-preview")
+            or args.schedule_preview or args.enable_schedule
+            or args.disable_schedule):
+        parser.error("choose --dry-run, --dispatch, --run, --status, "
+                     "--schedule-preview, --enable-schedule or "
+                     "--disable-schedule")
+    if args.enable_schedule and args.disable_schedule:
+        parser.error("--enable-schedule and --disable-schedule are exclusive")
 
     if args.dry_run:
         print(json.dumps(asyncio.run(dry_run(
@@ -185,6 +262,9 @@ def main() -> None:
             indent=2, default=str))
     if args.status:
         _print_status(asyncio.run(status()))
+    if args.enable_schedule or args.disable_schedule:
+        print(json.dumps(asyncio.run(set_schedule(
+            enable=bool(args.enable_schedule))), indent=2, default=str))
     if args.schedule_preview:
         print(json.dumps(asyncio.run(schedule_preview()), indent=2,
                          default=str))

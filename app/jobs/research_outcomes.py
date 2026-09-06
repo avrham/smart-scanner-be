@@ -15,9 +15,30 @@ bar the power to defer today's discovery — the exact inversion the brief
 forbids in one line: *outcome maturation should not prevent today's research
 run from completing*.
 
-As a separate job it structurally cannot. Its own job_run, its own task, its
-own attempt budget, its own schedule, its own run row. A total failure of every
-outcome attempt leaves the lifecycle's row untouched and its counters correct.
+As a separate job it cannot do that — but only in one of the two senses of
+"isolation", and the distinction is worth writing down because the first cut of
+this file blurred them.
+
+FAILURE ISOLATION IS COMPLETE. Own job_run, own task, own attempt budget, own
+schedule, own run row. A total failure of every outcome attempt leaves
+`research_lifecycle_runs` untouched and its counters correct; there is no code
+path from an outcome error to a lifecycle status, and no shared row to corrupt.
+
+RESOURCE ISOLATION IS NOT, AND CANNOT BE HERE. The research worker runs at
+concurrency 1 and the parent renews a running task's lease indefinitely
+(`app/jobs/worker.py` heartbeats every JOB_TASK_HEARTBEAT_SECONDS with no child
+wall clock), so whichever task is executing holds the single executor until it
+returns. An outcome pass therefore DELAYS a concurrent lifecycle task by its own
+duration. A separate queue would not change that — same worker, same executor —
+and the queue is an identity boundary rather than a scheduling one.
+
+What bounds the delay is the WORK, and it is bounded by construction: at most
+`scan_limit` (<= 200) scans x 5 inserts plus `observation_limit` (<= 400)
+observations x 6 small point queries, every one of them capped at 120 s by the
+role's `statement_timeout`. Measured in staging on 2026-09-06: 0.68 s and
+1.23 s for the full pass. The schedules are three hours apart, so the ordinary
+case is no overlap at all; the residual is a lifecycle RETRY (30-minute backoff)
+landing on the same minute, which waits one outcome pass.
 
 WHY IT RIDES THE `research_lifecycle` QUEUE ANYWAY
 --------------------------------------------------

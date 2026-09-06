@@ -364,6 +364,24 @@ class FakeConn:
         self.pending_writes = []
         self.revision_writes = []
         self.plan_inserts = []
+        self.transactions = 0
+
+    def transaction(self):
+        """Planning wraps each scan's five INSERTs in one transaction, so the
+        fake has to offer one — and counts them, which is how the unit level
+        checks that the transaction is taken at all. Whether it ROLLS BACK is a
+        real-Postgres question and is proven there."""
+        fake = self
+
+        class _Tx:
+            async def __aenter__(self):
+                fake.transactions += 1
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Tx()
 
     # -- helpers ----------------------------------------------------------- #
     def _row(self, symbol, day):
@@ -582,6 +600,10 @@ class TestBoundedness:
             conn, now=datetime(2026, 9, 4, 23, tzinfo=UTC),
             scan_limit=3, observation_limit=3))
         assert summary["truncated_by_limit"] is True
+        # One transaction per SCAN, never one for the whole pass: a single
+        # long transaction would hold row locks for the duration and turn a
+        # bounded read-mostly job into a blocker for the lifecycle.
+        assert conn.transactions == 3
 
 
 class TestRunKeys:

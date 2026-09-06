@@ -450,16 +450,43 @@ LIMIT $2
 
 async def plan_missing_observations(conn, *, limit: int = DEFAULT_SCAN_LIMIT,
                                     ) -> Dict[str, Any]:
-    """Give every scan the five observation rows it owes. Idempotent."""
+    """Give every scan the five observation rows it owes. Idempotent.
+
+    ONE TRANSACTION PER SCAN, AND THE REASON IS PROVENANCE
+    ------------------------------------------------------
+    The attribution snapshot is read ONCE per scan, in `plan_observations`, and
+    all five horizons copy from that one in-memory dict — so within a single
+    pass they cannot disagree. The hazard is a pass that does not finish.
+
+    Without a transaction the five INSERTs are five statements. A worker that
+    died after two of them would leave a scan holding 1D and 3D from revision A;
+    the next pass re-reads `research_scan_results`, and if the symbol has since
+    been re-scanned for the same session — which `research_scan.UPSERT_SCAN_SQL`
+    does in place — it would write 5D, 10D and 20D from revision B. One scan,
+    five horizons, two different classifications, and nothing in the row to say
+    so. That is exactly the failure the snapshot exists to prevent, arriving
+    through the back door.
+
+    A transaction makes the five rows all-or-nothing, so a scan is either
+    entirely unplanned (and re-selected, since the existence probe is the LAST
+    horizon written) or entirely planned from one revision.
+
+    The transaction is per SCAN, not per pass: a single long transaction over
+    two hundred scans would hold row locks for the whole pass and turn a
+    bounded read-mostly job into a blocker for the lifecycle that shares this
+    connection's role.
+    """
     scans = [dict(r) for r in await conn.fetch(
         SELECT_UNPLANNED_SCANS_SQL, max(0, int(limit)), HORIZONS[-1])]
     inserted = 0
     for scan in scans:
-        for plan in plan_observations(scan):
-            row = await conn.fetchrow(
-                INSERT_PLAN_SQL, *[plan[c] for c in _PLAN_COLUMNS])
-            if row is not None:
-                inserted += 1
+        plans = plan_observations(scan)
+        async with conn.transaction():
+            for plan in plans:
+                row = await conn.fetchrow(
+                    INSERT_PLAN_SQL, *[plan[c] for c in _PLAN_COLUMNS])
+                if row is not None:
+                    inserted += 1
     return {"scans_considered": len(scans), "observations_planned": inserted,
             "truncated_by_limit": len(scans) >= max(0, int(limit))}
 

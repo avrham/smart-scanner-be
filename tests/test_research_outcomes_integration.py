@@ -56,7 +56,8 @@ MIGRATIONS = ["001_initial_schema", "005_massive_provider",
               "026_research_symbols", "027_research_admission",
               "028_source_state_scope", "029_research_lifecycle_runs",
               "030_research_session_correctness",
-              "031_research_scan_outcomes"]
+              "031_research_scan_outcomes",
+              "032_research_outcome_freeze_attribution"]
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 UTC = timezone.utc
@@ -246,9 +247,22 @@ class TestSchemaGuarantees:
         assert tmpl["queue"] == "research_lifecycle"
 
     def test_the_migration_is_idempotent(self, pg):
-        r = _psql(pg["cid"], None, path=os.path.join(
-            REPO, "app", "db", "migrations", "031_research_scan_outcomes.sql"))
-        assert r.returncode == 0, r.stderr[-800:]
+        """Re-applying 031 must succeed — AND 032 must be re-applied after it.
+
+        This is not test bookkeeping, it is the ordering rule for this pair.
+        031 and 032 both `CREATE OR REPLACE` the same trigger function, so
+        replaying 031 on a database that already has 032 silently reinstates
+        031's narrower guard. That is true of any replay of an older migration
+        that replaces a function, and it is why a replay must always continue
+        forward through the rest of the chain rather than stopping at the file
+        somebody meant to re-run. The audit found this by replaying 031 here
+        and watching thirteen 032 assertions stop holding.
+        """
+        for name in ("031_research_scan_outcomes",
+                     "032_research_outcome_freeze_attribution"):
+            r = _psql(pg["cid"], None, path=os.path.join(
+                REPO, "app", "db", "migrations", f"{name}.sql"))
+            assert r.returncode == 0, f"{name}: {r.stderr[-800:]}"
 
     def test_the_lifecycle_schedule_was_not_touched(self, conn):
         """The validated 18:30 ET research lifecycle schedule must be exactly
@@ -878,3 +892,175 @@ class TestDryRunAndStatus:
         assert after["scan_classification"] == rf.LIFECYCLE_RESEARCH_CANDIDATE
         assert after["scan_setup_state"] == "valid"
         assert float(after["symbol_return_pct"]) == pytest.approx(10.0)
+
+
+# --------------------------------------------------------------------------- #
+# 6. acceptance audit (2026-09-06) — the repairs, against real Postgres
+# --------------------------------------------------------------------------- #
+
+class TestFreezeGuardsTheAttribution:
+    """Migration 032. The audit found ten attribution columns outside the
+    guarded set: a measured row's benchmark, strategy, verdict, evidence and
+    revision-tell could all be edited while its numbers stayed put."""
+
+    def _measured_id(self, conn):
+        _seed_measurable(conn)
+        run(ro.run_outcome_maturation(conn, run_key="freeze32", now=NOW))
+        return run(conn.fetchval(
+            "SELECT id FROM public.research_scan_outcomes "
+            "WHERE symbol='AAL' AND horizon_sessions=1 AND status='measured'"))
+
+    @pytest.mark.parametrize("column,value", [
+        ("benchmark_symbol", "QQQ"),
+        ("strategy_code", "something_else"),
+        ("strategy_version", "v9"),
+        ("config_hash", "a-different-config"),
+        ("scan_classification", "scanned_not_candidate"),
+        ("scan_verdict", "AVOID"),
+        ("scan_structure_state", "unknown"),
+        ("scan_setup_state", "invalid"),
+        ("scan_reason_code", "rewritten"),
+        ("scan_rejection_reason", "price_below_minimum"),
+        ("scan_benchmark_relative", "underperforming"),
+        ("contract_version", "research_scan_outcome.v2"),
+        ("calculation_version", "outcome.v2"),
+        ("market_calendar_version", "some_other_calendar.v1"),
+    ])
+    def test_no_meaning_column_can_be_rewritten_on_a_measured_row(
+            self, conn, column, value):
+        oid = self._measured_id(conn)
+        with pytest.raises(asyncpg.PostgresError):
+            run(conn.execute(
+                f"UPDATE public.research_scan_outcomes SET {column}=$2 "
+                "WHERE id=$1", oid, value))
+
+    def test_the_revision_tell_itself_cannot_be_edited(self, conn):
+        """`scan_scanned_at` is what detects a re-scan. A detector that can be
+        edited detects nothing."""
+        oid = self._measured_id(conn)
+        with pytest.raises(asyncpg.PostgresError):
+            run(conn.execute(
+                "UPDATE public.research_scan_outcomes SET scan_scanned_at=NOW() "
+                "WHERE id=$1", oid))
+
+    def test_recording_that_we_looked_again_is_still_permitted(self, conn):
+        oid = self._measured_id(conn)
+        run(conn.execute(
+            "UPDATE public.research_scan_outcomes SET revision_detected=TRUE,"
+            " attempt_count=attempt_count+1, last_attempt_at=NOW() WHERE id=$1",
+            oid))
+        row = run(conn.fetchrow(
+            "SELECT revision_detected, attempt_count, symbol_return_pct "
+            "FROM public.research_scan_outcomes WHERE id=$1", oid))
+        assert row["revision_detected"] is True
+        assert float(row["symbol_return_pct"]) == pytest.approx(10.0)
+
+    def test_a_pending_row_is_still_freely_updatable(self, conn):
+        """The widening must not freeze rows that have not been measured."""
+        _seed_measurable(conn)
+        run(ro.run_outcome_maturation(conn, run_key="freeze32-pending", now=NOW))
+        oid = run(conn.fetchval(
+            "SELECT id FROM public.research_scan_outcomes "
+            "WHERE status='not_yet_eligible' LIMIT 1"))
+        run(conn.execute(
+            "UPDATE public.research_scan_outcomes SET scan_verdict='AVOID',"
+            " benchmark_symbol='QQQ' WHERE id=$1", oid))
+        assert run(conn.fetchval(
+            "SELECT scan_verdict FROM public.research_scan_outcomes WHERE id=$1",
+            oid)) == "AVOID"
+
+
+class TestPlanningAtomicity:
+    """A partial plan must never let two scan revisions share one scan."""
+
+    def test_a_failed_plan_leaves_no_partial_row(self, conn):
+        """The transaction is proven by making the FIFTH insert fail: if the
+        five inserts were independent statements, four rows would survive.
+
+        The failure is injected through a thin PROXY rather than by patching
+        the connection — asyncpg's `Connection.fetchrow` is a read-only
+        attribute, and a proxy also keeps the real transaction semantics the
+        test is actually about.
+        """
+        run(_add_scan(conn, "AAL"))
+
+        class FailingFifthInsert:
+            """Forwards everything; fails the fifth planning INSERT."""
+
+            def __init__(self, inner):
+                self._inner = inner
+                self._inserts = 0
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            async def fetchrow(self, sql, *args):
+                if sql is ro.INSERT_PLAN_SQL:
+                    self._inserts += 1
+                    if self._inserts == 5:
+                        raise RuntimeError("simulated worker death mid-plan")
+                return await self._inner.fetchrow(sql, *args)
+
+        proxy = FailingFifthInsert(conn)
+        with pytest.raises(RuntimeError):
+            run(ro.plan_missing_observations(proxy))
+
+        # All five, or none. Never four.
+        assert run(conn.fetchval(
+            "SELECT count(*) FROM public.research_scan_outcomes")) == 0
+
+    def test_a_replan_after_a_rollback_writes_one_consistent_revision(self, conn):
+        """And the scan really can change underneath: the re-plan must produce
+        five rows that agree, not a mixture."""
+        run(_add_scan(conn, "AAL", candidate=True))
+        run(conn.execute(
+            "UPDATE public.research_scan_results SET rejection_reason="
+            "'price_below_minimum', setup_state='invalid',"
+            " structure_state='unknown', benchmark_relative='underperforming'"
+            " WHERE symbol='AAL'"))
+        run(ro.plan_missing_observations(conn))
+        rows = run(conn.fetch(
+            "SELECT scan_classification, scan_setup_state, config_hash "
+            "FROM public.research_scan_outcomes WHERE symbol='AAL'"))
+        assert len(rows) == 5
+        assert len({(r["scan_classification"], r["scan_setup_state"],
+                     r["config_hash"]) for r in rows}) == 1
+        assert rows[0]["scan_classification"] == rf.LIFECYCLE_SCANNED_NOT_CANDIDATE
+
+
+class TestTerminalIsRecoverable:
+    """CONCERN B — a `failed_terminal` row is not a dead end if data arrives."""
+
+    def test_a_terminal_observation_can_still_be_measured_on_a_recheck(self, conn):
+        scan_session = date(2026, 1, 5)
+        run(_add_symbol(conn, "AAL"))
+        run(conn.execute(
+            "INSERT INTO public.research_scan_results (symbol, scan_session,"
+            " scanned_at, contract_version, strategy_code, strategy_version,"
+            " config_hash, verdict, structure_state, setup_state,"
+            " benchmark_relative, benchmark_symbol) "
+            "VALUES ('AAL',$1,NOW(),'research_scan.v1','wyckoff_mtf','v2','c',"
+            " 'WATCH','recognized','valid','outperforming','SPY')", scan_session))
+        # Far enough past the horizon that the 60-session grace is exhausted.
+        far = ro.horizon_session_for(scan_session, 1)
+        for _ in range(ro.MISSING_DATA_GRACE_SESSIONS + 2):
+            far = ro.horizon_session_for(far, 1)
+        late = datetime.combine(far, datetime.min.time(),
+                                tzinfo=UTC) + timedelta(hours=21)
+        run(ro.run_outcome_maturation(conn, run_key="grace-1", now=late))
+        row = run(conn.fetchrow(
+            "SELECT * FROM public.research_scan_outcomes WHERE horizon_sessions=1"))
+        assert row["status"] == ro.STATUS_FAILED_TERMINAL
+        assert row["status_reason"] == ro.REASON_GRACE_EXCEEDED
+
+        # The bars finally arrive. An operator recheck measures it.
+        entry, exit_ = scan_session, ro.horizon_session_for(scan_session, 1)
+        run(_add_bar(conn, "AAL", entry, 100.0))
+        run(_add_bar(conn, "AAL", exit_, 110.0))
+        run(_seed_benchmark(conn, {entry: 500.0, exit_: 505.0}))
+        run(ro.run_outcome_maturation(conn, run_key="grace-2", now=late,
+                                      include_settled=True))
+        row = run(conn.fetchrow(
+            "SELECT * FROM public.research_scan_outcomes WHERE horizon_sessions=1"))
+        assert row["status"] == ro.STATUS_MEASURED
+        assert float(row["symbol_return_pct"]) == pytest.approx(10.0)

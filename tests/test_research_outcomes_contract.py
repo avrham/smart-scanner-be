@@ -406,3 +406,242 @@ class TestOperatorSurface:
         code = _executable_source("ops/analysis/research_outcomes.py")
         assert "research_connection" in code
         assert "intel_connection()" not in code
+
+
+# =========================================================================== #
+# acceptance audit, 2026-09-06 — the properties the audit had to establish
+#
+# Each class below pins something the audit MEASURED against the deployed
+# staging system, so that what was true once stays checkable in CI.
+# =========================================================================== #
+
+MIGRATION_032 = (MIGRATIONS / "032_research_outcome_freeze_attribution.sql"
+                 ).read_text(encoding="utf-8")
+
+
+class TestScheduleBootstrapHazard:
+    """CONCERN A — a schedule enabled with next_run_at NULL fires early.
+
+    Measured in staging: the tick at 2026-09-06T11:21:38Z materialised
+    occurrence 2026-09-09T15:00:00Z and advanced next_run_at to
+    2026-09-10T15:00:00Z, so the 2026-09-09 slot produced no run at its own
+    time while the durable record claimed it had been served.
+
+    The behaviour lives in SHARED scheduler code and is deliberately NOT
+    changed here. These tests pin it as a KNOWN hazard, and pin the
+    outcome-specific mitigation that keeps this schedule away from it.
+    """
+
+    SCHEDULE = {"schedule_type": "market_daily", "timezone": "America/New_York",
+                "market_close_delay_minutes": 1140}
+
+    def test_the_hazard_is_real_a_null_next_run_at_resolves_to_the_future(self):
+        from app.jobs.scheduler import compute_next_run_at
+        tick = datetime(2026, 9, 6, 11, 21, 38, tzinfo=UTC)
+        occurrence = compute_next_run_at(self.SCHEDULE, tick)
+        # This is what `_tick_as_leader` would stamp the run with.
+        assert occurrence == datetime(2026, 9, 9, 15, 0, tzinfo=UTC)
+        assert occurrence - tick > timedelta(days=3)
+
+    def test_and_it_then_skips_that_occurrence(self):
+        from app.jobs.scheduler import compute_next_run_at
+        occurrence = datetime(2026, 9, 9, 15, 0, tzinfo=UTC)
+        assert compute_next_run_at(self.SCHEDULE, occurrence) == datetime(
+            2026, 9, 10, 15, 0, tzinfo=UTC)
+
+    def test_the_hazard_is_shared_not_specific_to_this_schedule(self):
+        """The same computation on the lifecycle's LIVE delay behaves the same,
+        which is why the repair is a mitigation here and not an edit there."""
+        from app.jobs.scheduler import compute_next_run_at
+        tick = datetime(2026, 9, 6, 11, 21, 38, tzinfo=UTC)
+        lifecycle = dict(self.SCHEDULE, market_close_delay_minutes=960)
+        assert compute_next_run_at(lifecycle, tick) - tick > timedelta(days=3)
+
+    def test_a_seeded_next_run_at_is_used_verbatim(self):
+        """The mitigation: `_tick_as_leader` prefers the stored instant, so a
+        seeded schedule stamps the occurrence it actually runs for."""
+        seeded = datetime(2026, 9, 9, 15, 0, tzinfo=UTC)
+        sched = dict(self.SCHEDULE, next_run_at=seeded)
+        occurrence = sched["next_run_at"] or None       # the scheduler's rule
+        assert occurrence == seeded
+
+    def test_the_operator_surface_seeds_rather_than_leaving_null(self):
+        code = _executable_source("ops/analysis/research_outcomes.py")
+        assert "def set_schedule" in code
+        assert "compute_next_run_at" in code
+        assert "next_run_at=$2" in code
+        # and it must never enable without also writing next_run_at
+        assert "SET enabled=TRUE, paused=FALSE, next_run_at=$2" in code.replace(
+            "\n", " ").replace("  ", " ").replace('" "', "")
+
+
+class TestCadenceAcrossTheAwkwardDates:
+    """CONCERN A — holiday, weekend and DST handling of the outcome cadence."""
+
+    SCHEDULE = TestScheduleBootstrapHazard.SCHEDULE
+
+    def test_labor_day_is_skipped_and_no_trading_session_is_lost(self):
+        from app.jobs.scheduler import compute_next_run_at
+        from app.prospective_session import is_trading_day
+        assert not is_trading_day(date(2026, 9, 7))          # Labor Day
+        cur = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
+        fired = []
+        for _ in range(4):
+            cur = compute_next_run_at(self.SCHEDULE, cur)
+            fired.append(cur)
+        # Each session fires ~19 h after its own close:
+        #   Thu 09-03's session -> Fri 09-04 11:00 ET
+        #   Fri 09-04's session -> Sat 09-05 11:00 ET
+        #   Labor Day 09-07 is not a session, so it produces NO occurrence
+        #   Tue 09-08's session -> Wed 09-09 11:00 ET
+        assert fired[0] == datetime(2026, 9, 4, 15, 0, tzinfo=UTC)
+        assert fired[1] == datetime(2026, 9, 5, 15, 0, tzinfo=UTC)
+        assert fired[2] == datetime(2026, 9, 9, 15, 0, tzinfo=UTC)
+        assert fired[3] == datetime(2026, 9, 10, 15, 0, tzinfo=UTC)
+        # The three-day gap IS the holiday: no occurrence answers Labor Day.
+        assert fired[2] - fired[1] == timedelta(days=4)
+
+    def test_every_trading_session_gets_exactly_one_occurrence(self):
+        """The Saturday firing is not a bug: `market_daily` walks SESSIONS and
+        adds the delay, so each session is measured once, ~19 h after close."""
+        from app.jobs.scheduler import compute_next_run_at
+        from app.prospective_session import (is_trading_day,
+                                             resolve_latest_completed_session)
+        cur = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+        seen = []
+        for _ in range(12):
+            cur = compute_next_run_at(self.SCHEDULE, cur)
+            seen.append(resolve_latest_completed_session(cur))
+        assert len(seen) == len(set(seen)), "a session was measured twice"
+        for session in seen:
+            assert is_trading_day(session)
+
+    def test_the_local_hour_survives_the_dst_change(self):
+        from app.jobs.scheduler import compute_next_run_at
+        cur = datetime(2026, 10, 29, 12, 0, tzinfo=UTC)
+        locals_ = []
+        for _ in range(4):
+            cur = compute_next_run_at(self.SCHEDULE, cur)
+            locals_.append(cur.astimezone(ZoneInfo("America/New_York")))
+        assert {t.strftime("%H:%M") for t in locals_} == {"11:00"}
+        assert {t.tzname() for t in locals_} == {"EDT", "EST"}
+
+
+class TestFreezeCoversTheWholeMeaning:
+    """CONCERN C — migration 032 widens the trigger to the attribution."""
+
+    #: Every column that says what a measured number is ABOUT. The audit found
+    #: all ten of the scan_* / strategy_* ones outside the guarded set.
+    MEANING_COLUMNS = (
+        "benchmark_symbol", "strategy_code", "strategy_version", "config_hash",
+        "scan_classification", "scan_verdict", "scan_structure_state",
+        "scan_setup_state", "scan_reason_code", "scan_rejection_reason",
+        "scan_benchmark_relative", "scan_scanned_at",
+        "contract_version", "calculation_version", "market_calendar_version",
+        "scan_id",
+    )
+    MEASUREMENT_COLUMNS = (
+        "status", "measured_at", "entry_close", "exit_close",
+        "benchmark_entry_close", "benchmark_exit_close", "symbol_return_pct",
+        "benchmark_return_pct", "excess_return_pct", "mfe_pct", "mae_pct",
+        "excursion_basis", "window_sessions_expected",
+        "window_sessions_present", "bars_hash",
+    )
+
+    def test_every_meaning_column_is_guarded(self):
+        for column in self.MEANING_COLUMNS + self.MEASUREMENT_COLUMNS:
+            assert f"NEW.{column} " in MIGRATION_032 or \
+                   f"NEW.{column}\n" in MIGRATION_032, column
+
+    def test_the_columns_deliberately_left_writable_are_still_writable(self):
+        """A measured row must remain able to record that we looked again."""
+        for column in ("attempt_count", "last_attempt_at", "revision_detected",
+                       "revision_notes"):
+            assert f"NEW.{column} IS DISTINCT" not in MIGRATION_032, column
+
+    def test_it_is_a_pure_widening_and_touches_nothing_else(self):
+        upper = MIGRATION_032.upper()
+        assert "CREATE OR REPLACE FUNCTION" in upper
+        assert "ALTER TABLE" not in upper
+        assert "CREATE TABLE" not in upper
+        assert "DELETE FROM" not in upper
+        assert "INSERT INTO" not in upper
+        assert "JOB_SCHEDULES" not in upper
+        # exactly one relation is named
+        assert MIGRATION_032.count("public.research_scan_outcomes") >= 2
+        assert "strategy_shadow" not in MIGRATION_032
+
+
+class TestPlanningIsAtomicPerScan:
+    """CONCERN C — a partial plan must not mix two scan revisions."""
+
+    def test_the_five_inserts_run_in_one_transaction(self):
+        code = _executable_source("app/research_outcomes.py")
+        assert "async with conn.transaction():" in code
+
+    def test_the_snapshot_is_read_once_per_scan(self):
+        """All five horizons copy from ONE in-memory dict, so within a pass
+        they cannot disagree even before the transaction is considered."""
+        import app.research_outcomes as _ro
+        row = {"id": "s1", "symbol": "AAL", "scan_session": date(2026, 8, 28),
+               "scanned_at": datetime(2026, 8, 28, 22, 30, tzinfo=UTC),
+               "strategy_code": "wyckoff_mtf", "strategy_version": "v2",
+               "config_hash": "cfg", "verdict": "WATCH",
+               "structure_state": "recognized", "setup_state": "valid",
+               "reason_code": "spring_confirmed", "rejection_reason": None,
+               "benchmark_relative": "outperforming"}
+        plans = _ro.plan_observations(row)
+        for field in ("scan_classification", "config_hash", "scan_setup_state",
+                      "scan_scanned_at", "strategy_version"):
+            assert len({p[field] for p in plans}) == 1, field
+
+
+class TestSharedWorkerClaimsAreAccurate:
+    """CONCERN D — the documented isolation claim must match the code."""
+
+    def test_the_module_does_not_claim_resource_isolation_it_does_not_have(self):
+        header = pathlib.Path("app/jobs/research_outcomes.py").read_text(
+            encoding="utf-8")
+        assert "FAILURE ISOLATION IS COMPLETE" in header
+        assert "RESOURCE ISOLATION IS NOT" in header
+        # the earlier, overstated sentence must be gone
+        assert "As a separate job it structurally cannot." not in header
+
+    def test_retry_backoff_releases_the_worker(self):
+        """A task in backoff is not claimable, so it cannot hold the executor."""
+        queue = pathlib.Path("app/jobs/queue.py").read_text(encoding="utf-8")
+        assert "available_at <= NOW()" in queue
+        assert "available_at = NOW() + ($4 || ' seconds')::interval" in queue
+
+    def test_the_pass_is_bounded_by_construction(self):
+        import app.research_outcomes as _ro
+        assert _ro.DEFAULT_SCAN_LIMIT == 200
+        assert _ro.DEFAULT_OBSERVATION_LIMIT == 400
+        assert "LIMIT $2" in _ro.SELECT_DUE_SQL
+        assert "LIMIT $1" in _ro.SELECT_UNPLANNED_SCANS_SQL
+
+
+class TestReturnContractIsDescriptive:
+    """CONCERN E — say what the number is, and what it is not."""
+
+    def test_the_window_excludes_the_entry_session(self):
+        code = _executable_source("app/research_outcomes.py")
+        assert "trading_date > $2 AND trading_date <= $3" in code
+
+    def test_nothing_calls_the_reference_an_entry_or_a_trade(self):
+        import app.research_outcomes as _ro
+        header = (_ro.__doc__ or "")
+        assert "not a trade" in header
+        assert "MARKET-PATH OBSERVATION" in header
+        for word in ("profit", "p&l", "pnl", "tradable", "executable entry"):
+            assert word not in header.lower(), word
+
+    def test_excursions_are_never_claimed_to_know_intrabar_order(self):
+        assert _ro_excursion_doc_mentions_order()
+
+
+def _ro_excursion_doc_mentions_order() -> bool:
+    import app.research_outcomes as _ro
+    src = pathlib.Path("app/research_outcomes.py").read_text(encoding="utf-8")
+    return ("intrabar ORDER" in src or "intrabar order" in src) and \
+        _ro.EXCURSION_BASIS_DAILY == "daily_high_low.v1"

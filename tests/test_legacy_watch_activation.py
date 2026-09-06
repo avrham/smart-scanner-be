@@ -450,4 +450,6 @@ class TestUnchangedBehavior:
             "030_research_session_correctness.sql"]
         assert [q.name for q in sorted(MIGRATIONS.glob("031_*"))] == [
             "031_research_scan_outcomes.sql"]
-        assert not list(MIGRATIONS.glob("032_*"))
+        assert [q.name for q in sorted(MIGRATIONS.glob("032_*"))] == [
+            "032_research_outcome_freeze_attribution.sql"]
+        assert not list(MIGRATIONS.glob("033_*"))
