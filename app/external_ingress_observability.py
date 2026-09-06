@@ -22,15 +22,39 @@ them. That is the gap this module closes.
 
 THE SHAPE THAT KEEPS BOTH PROPERTIES
 ------------------------------------
-Counters accumulate in memory, and are flushed to exactly ONE row —
-`catalyst_source_state('external_ingress_refused', 'product')` — at most once
-per `flush_interval`. So:
+Counters accumulate in memory and are flushed, at most once per
+`flush_interval`, into `catalyst_source_state` under ONE ROW PER REASON CODE:
 
-  * an anonymous caller cannot grow any table: the row count is one, forever,
-    no matter how much traffic arrives;
-  * a flood costs at most one UPDATE per interval, not one per request;
+    external_ingress_refused_unauthorized_no_credential
+    external_ingress_refused_unauthorized_bad_credential
+    external_ingress_refused_route_not_found
+    ...
+
+So:
+
+  * an anonymous caller cannot grow any table: the reason vocabulary is closed
+    and capped, so the row count is bounded no matter how much traffic
+    arrives;
+  * a flood costs at most one UPDATE per reason per interval, not one per
+    request;
   * the evidence survives a restart, which a log line and an in-process
     counter do not.
+
+WHY ONE ROW PER REASON RATHER THAN ONE ROW TOTAL
+------------------------------------------------
+This started as a single aggregate row and that was wrong, which the live
+staging deployment showed within a minute of the first probe. The ingress runs
+TWO machines. `events_upserted` accumulates, so the TOTAL was right — but
+`detail`, the free-text field carrying the per-reason breakdown, is
+last-writer-wins. Machine B flushing one `route_not_found` erased machine A's
+record that two requests had arrived with a bad credential.
+
+The total was never the interesting number. "How many refusals" does not tell
+an operator anything; "which reason" is the entire diagnostic, and it was
+precisely the part that two processes could silently overwrite. Giving each
+reason its own row moves the count into `events_upserted`, where the database
+adds concurrent writes instead of letting one clobber the other. There is no
+read-modify-write and therefore no race.
 
 It needs NO migration: `catalyst_source_state` already carries a running
 `events_upserted` total, and the ingress role's RLS policy permits exactly the
@@ -62,12 +86,18 @@ from app.source_scope import SCOPE_PRODUCT
 
 logger = logging.getLogger(__name__)
 
-#: The single freshness row every refusal is folded into. Named inside the
-#: `external_` namespace so the ingress role's RLS policy already covers it,
-#: and distinct from every registry source so it can never be mistaken for one
-#: (the health endpoint's source list is driven by `external_signal_sources`,
-#: which has no row by this name).
-REFUSAL_STATE_SOURCE = "external_ingress_refused"
+#: Prefix for the freshness rows refusals are folded into: one row per reason,
+#: named `<prefix>_<reason>`. Inside the `external_` namespace so the ingress
+#: role's RLS policy already covers it, and distinct from every registry source
+#: so it can never be mistaken for one — the health endpoint's source list is
+#: driven by `external_signal_sources`, which has no row by any of these names,
+#: and every product read looks a row up by an explicit `source_state_key()`.
+REFUSAL_STATE_PREFIX = "external_ingress_refused"
+
+
+def refusal_state_source(reason: str) -> str:
+    """The durable row name for one refusal reason."""
+    return f"{REFUSAL_STATE_PREFIX}_{reason}"
 
 #: Refusals happen at most a handful of times a minute in normal life, and a
 #: flood must not become a write amplifier. One durable write per 30s is
@@ -151,33 +181,52 @@ class RefusalLedger:
                  flush_interval: float = DEFAULT_FLUSH_INTERVAL_SECONDS):
         self.flush_interval = float(flush_interval)
         self.counts: Dict[str, int] = {}
+        #: Counted but not yet written, PER REASON — the unit a flush works in,
+        #: because each reason owns its own durable row.
+        self.pending_by_reason: Dict[str, int] = {}
+        #: The most recent context for each reason, so a flush can say how the
+        #: caller presented itself without one reason's detail overwriting
+        #: another's.
+        self.context: Dict[str, Dict[str, Any]] = {}
         self.total = 0
-        self.pending = 0
         self.last_reason: Optional[str] = None
         self.last_transport: Optional[str] = None
         self.last_fingerprint: Optional[str] = None
         self.last_refused_at: Optional[datetime] = None
         self._last_flush_monotonic: Optional[float] = None
 
+    @property
+    def pending(self) -> int:
+        """Total unwritten refusals, across every reason."""
+        return sum(self.pending_by_reason.values())
+
     # -- recording ---------------------------------------------------------- #
 
     def record(self, reason: str, *, transport: str = TRANSPORT_NONE,
                fingerprint: Optional[str] = None,
-               now: Optional[datetime] = None) -> None:
-        """Count one refusal. Never raises, never touches the network."""
+               now: Optional[datetime] = None) -> str:
+        """Count one refusal. Never raises, never touches the network.
+
+        Returns the reason key it was counted under, which is not always the
+        reason passed in — see the cap below.
+        """
         key = str(reason or "unknown")[:64]
         if key not in self.counts and len(self.counts) >= MAX_TRACKED_REASONS:
             # A closed vocabulary in practice; the cap exists so a future
-            # caller that passes something attacker-influenced cannot grow
-            # this map without bound.
+            # caller that passes something attacker-influenced cannot grow this
+            # map — or the number of durable rows — without bound.
             key = "other"
+        moment = now or datetime.now(timezone.utc)
         self.counts[key] = self.counts.get(key, 0) + 1
+        self.pending_by_reason[key] = self.pending_by_reason.get(key, 0) + 1
+        self.context[key] = {"transport": transport,
+                             "fingerprint": fingerprint, "at": moment}
         self.total += 1
-        self.pending += 1
         self.last_reason = key
         self.last_transport = transport
         self.last_fingerprint = fingerprint
-        self.last_refused_at = now or datetime.now(timezone.utc)
+        self.last_refused_at = moment
+        return key
 
     # -- flushing ----------------------------------------------------------- #
 
@@ -190,20 +239,26 @@ class RefusalLedger:
         moment = time.monotonic() if monotonic is None else monotonic
         return (moment - self._last_flush_monotonic) >= self.flush_interval
 
-    def detail(self) -> str:
-        """A compact, secret-free summary for the state row's `detail`."""
-        parts = [f"{k}={v}" for k, v in sorted(self.counts.items())]
-        if self.last_reason:
-            tail = f"last={self.last_reason}"
-            if self.last_transport:
-                tail += f" via {self.last_transport}"
-            if self.last_fingerprint:
-                # The caller's value, hashed and truncated. Never ours.
-                tail += f" supplied_fp={self.last_fingerprint}"
-            if self.last_refused_at:
-                tail += f" at {self.last_refused_at.isoformat()}"
-            parts.append(tail)
-        return "; ".join(parts)[:MAX_DETAIL_CHARS]
+    def detail(self, reason: str) -> str:
+        """A compact, secret-free note for ONE reason's row.
+
+        Scoped to a single reason on purpose. A cross-reason summary here would
+        be written by whichever process flushed last and would erase what the
+        others had seen — the exact bug this shape replaced.
+        """
+        context = self.context.get(reason) or {}
+        parts = [reason]
+        transport = context.get("transport")
+        if transport:
+            parts.append(f"via {transport}")
+        fingerprint = context.get("fingerprint")
+        if fingerprint:
+            # The caller's value, hashed and truncated. Never ours.
+            parts.append(f"supplied_fp={fingerprint}")
+        moment = context.get("at")
+        if isinstance(moment, datetime):
+            parts.append(f"at {moment.isoformat()}")
+        return " ".join(parts)[:MAX_DETAIL_CHARS]
 
     def snapshot(self) -> Dict[str, Any]:
         """What the health endpoint reports about THIS process."""
@@ -218,8 +273,22 @@ class RefusalLedger:
                                 if self.last_refused_at else None),
         }
 
-    def reset_pending(self, *, monotonic: Optional[float] = None) -> None:
-        self.pending = 0
+    def take_pending(self) -> Dict[str, int]:
+        """Claim the pending counts, leaving the ledger empty of them.
+
+        Claimed BEFORE the write and restored on failure (see `flush_refusals`)
+        so a refusal is never counted twice and never silently dropped.
+        """
+        claimed = dict(self.pending_by_reason)
+        self.pending_by_reason = {}
+        return claimed
+
+    def restore_pending(self, claimed: Dict[str, int]) -> None:
+        for reason, count in claimed.items():
+            self.pending_by_reason[reason] = (
+                self.pending_by_reason.get(reason, 0) + count)
+
+    def mark_flushed(self, *, monotonic: Optional[float] = None) -> None:
         self._last_flush_monotonic = (time.monotonic() if monotonic is None
                                       else monotonic)
 
@@ -243,76 +312,99 @@ ON CONFLICT (source, scope) DO UPDATE SET
     updated_at = NOW()
 """
 
-READ_REFUSAL_SQL = """
-SELECT events_upserted, last_refresh_at, detail
+READ_REFUSALS_SQL = """
+SELECT source, events_upserted, last_refresh_at, detail
 FROM public.catalyst_source_state
-WHERE source = $1 AND scope = $2
+WHERE source LIKE $1 AND scope = $2
 """
 
 
 async def flush_refusals(conn, *, ledger: Optional[RefusalLedger] = None,
                          force: bool = False,
-                         now: Optional[datetime] = None) -> bool:
-    """Fold the pending refusals into the durable row. Returns whether it wrote.
+                         now: Optional[datetime] = None) -> int:
+    """Fold the pending refusals into their durable rows. Returns rows written.
 
     Best effort by contract: a failure here must never change the response to
     the caller. A refusal that could not be recorded is a lost diagnostic, and
-    a refusal that took the endpoint down would be an outage.
+    a refusal that took the endpoint down would be an outage — so the counts
+    are put BACK on failure and retried by the next flush rather than dropped.
 
     `ledger` defaults to the process ledger RESOLVED AT CALL TIME rather than
     bound as a default argument: a default is evaluated once at import, which
-    would silently keep writing the original ledger after a caller replaced
-    the module-level one — the exact way a diagnostic quietly stops diagnosing.
+    would silently keep writing the original ledger after a caller replaced the
+    module-level one — the exact way a diagnostic quietly stops diagnosing.
     """
     ledger = LEDGER if ledger is None else ledger
     if not (force and ledger.pending > 0) and not ledger.due():
-        return False
-    pending = ledger.pending
-    try:
-        await conn.execute(
-            UPSERT_REFUSAL_SQL, REFUSAL_STATE_SOURCE,
-            now or datetime.now(timezone.utc), pending, ledger.detail(),
-            SCOPE_PRODUCT)
-    except Exception:
+        return 0
+    moment = now or datetime.now(timezone.utc)
+    claimed = ledger.take_pending()
+    written = 0
+    failed: Dict[str, int] = {}
+    for reason, count in claimed.items():
+        try:
+            await conn.execute(
+                UPSERT_REFUSAL_SQL, refusal_state_source(reason), moment,
+                count, ledger.detail(reason), SCOPE_PRODUCT)
+            written += 1
+        except Exception:
+            failed[reason] = count
+    if failed:
+        ledger.restore_pending(failed)
         logger.warning("external ingress: refusal ledger flush failed",
-                       exc_info=False)
-        return False
-    ledger.reset_pending()
-    return True
+                       extra={"extra_data": {
+                           "event": "external_refusal_flush_error",
+                           "reasons": sorted(failed)}}, exc_info=False)
+    ledger.mark_flushed()
+    return written
 
 
-async def read_refusal_row(conn) -> Dict[str, Any]:
-    """The DURABLE refusal totals, which outlive this process.
+async def read_refusals(conn) -> Dict[str, Any]:
+    """The DURABLE refusal counts, which outlive this process AND its peers.
+
+    Per reason, because that is the diagnostic. The total is derived rather
+    than stored: a stored total is one more thing two machines can disagree
+    about, and it was never the number anyone needed.
 
     Returns a bounded dict even on failure: the health endpoint must degrade to
     "unknown" rather than 500, because an operator reads it precisely when
     something is already wrong.
     """
     try:
-        row = await conn.fetchrow(READ_REFUSAL_SQL, REFUSAL_STATE_SOURCE,
-                                  SCOPE_PRODUCT)
+        rows = await conn.fetch(READ_REFUSALS_SQL,
+                                f"{REFUSAL_STATE_PREFIX}\\_%", SCOPE_PRODUCT)
     except Exception:
         logger.warning("external ingress: refusal ledger unreadable",
                        exc_info=False)
         return {"available": False}
-    if row is None:
-        # Never refused anything since the row was created. Distinct from
-        # "cannot read", and the distinction is the diagnostic.
-        return {"available": True, "recorded_total": 0,
-                "last_refused_at": None, "detail": None}
-    last = row["last_refresh_at"]
+
+    by_reason: Dict[str, int] = {}
+    last_at: Optional[datetime] = None
+    last_detail: Optional[str] = None
+    for row in rows:
+        reason = str(row["source"])[len(REFUSAL_STATE_PREFIX) + 1:]
+        by_reason[reason] = int(row["events_upserted"] or 0)
+        moment = row["last_refresh_at"]
+        if moment is not None and (last_at is None or moment > last_at):
+            last_at, last_detail = moment, row["detail"]
     return {
         "available": True,
-        "recorded_total": int(row["events_upserted"] or 0),
-        "last_refused_at": last.isoformat() if last else None,
-        "detail": row["detail"],
+        # Empty rather than absent when nothing has ever been refused: "never
+        # refused" and "cannot read" are different answers and the whole point
+        # is not to conflate them.
+        "by_reason": dict(sorted(by_reason.items())),
+        "recorded_total": sum(by_reason.values()),
+        "last_refused_at": last_at.isoformat() if last_at else None,
+        "last_detail": last_detail,
     }
 
 
 __all__ = [
-    "REFUSAL_STATE_SOURCE", "DEFAULT_FLUSH_INTERVAL_SECONDS",
+    "REFUSAL_STATE_PREFIX", "refusal_state_source",
+    "DEFAULT_FLUSH_INTERVAL_SECONDS",
     "TRANSPORT_NONE", "TRANSPORT_HEADER", "TRANSPORT_QUERY",
     "REASON_NO_CREDENTIAL", "REASON_BAD_CREDENTIAL", "REASON_ROUTE_NOT_FOUND",
+    "MAX_TRACKED_REASONS", "MAX_DETAIL_CHARS",
     "credential_fingerprint", "token_is_url_safe", "RefusalLedger", "LEDGER",
-    "flush_refusals", "read_refusal_row",
+    "flush_refusals", "read_refusals",
 ]

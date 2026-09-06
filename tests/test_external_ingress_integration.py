@@ -35,6 +35,10 @@ import pytest
 
 asyncpg = pytest.importorskip("asyncpg")
 
+from app.external_ingress_observability import (  # noqa: E402
+    credential_fingerprint as obs_fingerprint,
+)
+
 PG_IMAGE = "postgres:16-alpine"
 DBNAME = "ingressdb"
 INGEST_ROLE = "smart_scanner_external_ingest"
@@ -283,10 +287,37 @@ class TestPublicContractOverRealHTTP:
             self, client, pg):
         post(client, payload(), token="wrong-and-stale")
         detail = rows(pg, "SELECT detail FROM catalyst_source_state WHERE "
-                      "source='external_ingress_refused' AND scope='product';")
-        assert "unauthorized_bad_credential" in detail
-        assert "wrong-and-stale" not in detail
-        assert TOKEN not in detail
+                      "source='external_ingress_refused_"
+                      "unauthorized_bad_credential' AND scope='product';")
+        assert detail, "the refusal left no durable trace"
+        assert "wrong-and-stale" not in detail, "the caller's value must not be stored"
+        assert TOKEN not in detail, "the expected value must never be stored"
+        # The fingerprint is of what the CALLER sent, so an owner can hash
+        # their own copy and compare without anything reversible being kept.
+        assert obs_fingerprint("wrong-and-stale") in detail
+
+    def test_each_refusal_reason_gets_its_own_durable_row(self, client, pg):
+        post(client, payload(), token=None)              # no credential
+        post(client, payload(), token="also-wrong")      # wrong credential
+        client.post("/api/external/signal", content=json.dumps(payload()))
+        # A misdirected POST is counted in the middleware, which holds no
+        # database session on purpose — anonymous traffic must never make the
+        # gate acquire one. Reading health is what makes it durable, and that
+        # is the call an operator makes anyway.
+        client.get("/api/external/health")
+        found = rows(pg, "SELECT string_agg(source, ',' ORDER BY source) FROM "
+                     "catalyst_source_state WHERE source LIKE "
+                     "'external\\_ingress\\_refused\\_%' AND scope='product';")
+        for reason in ("unauthorized_no_credential",
+                       "unauthorized_bad_credential", "route_not_found"):
+            assert f"external_ingress_refused_{reason}" in found
+
+    def test_the_refusal_rows_are_not_visible_as_sources(self, client):
+        post(client, payload(), token=None)
+        listed = [s["source"] for s in
+                  client.get("/api/external/health").json()["sources"]]
+        assert not [s for s in listed
+                    if s.startswith("external_ingress_refused")]
 
     def test_malformed_json_is_a_stable_code_not_a_parser_message(self, client):
         response = post(client, None, as_text="{not json")

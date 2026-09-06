@@ -328,20 +328,33 @@ curl -s https://$APP.fly.dev/api/external/health | jq '.ingress_refusals'
 ```jsonc
 {
   "available": true,
-  "recorded_total": 12,                    // DURABLE, survives a restart
+  "by_reason": {                            // DURABLE, survives a restart
+    "unauthorized_bad_credential": 12,      // and both machines
+    "route_not_found": 3
+  },
+  "recorded_total": 15,
   "last_refused_at": "2026-09-06T10:24:25Z",
-  "detail": "unauthorized_bad_credential=12; last=unauthorized_bad_credential via query supplied_fp=9f2c1ab4 at ...",
+  "last_detail": "unauthorized_bad_credential via query supplied_fp=9f2c1ab4 at ...",
   "this_process": { "since_boot": {...}, "last_reason": "..." }
 }
 ```
+
+`by_reason` is the number that matters, and it is durable because each reason
+owns its own `catalyst_source_state` row
+(`external_ingress_refused_<reason>`), where the database ADDS concurrent
+writes. The ingress runs two machines; an earlier design kept one aggregate row
+whose free-text breakdown was last-writer-wins, so one machine flushing
+`route_not_found` erased the other's record of a bad credential. `this_process`
+is one machine's view and will usually be smaller than the durable total —
+that is expected, not a discrepancy.
 
 Read it like this:
 
 | what you see | what it means | what to do |
 |---|---|---|
-| `recorded_total: 0` **and** no accepted delivery | **Nothing has ever reached this app.** Not a server problem. | The alert has no webhook URL, the webhook action is not ticked on those alert instances, the alert expired, or the URL points at another host. §3. |
+| `by_reason: {}` **and** no accepted delivery | **Nothing has ever reached this app.** Not a server problem. | The alert has no webhook URL, the webhook action is not ticked on those alert instances, the alert expired, or the URL points at another host. §3. |
 | `unauthorized_no_credential` | Requests arrive at the right path with **no** `?token=`. | The webhook URL was pasted without its query string. |
-| `unauthorized_bad_credential` | Requests arrive with a credential that does not match. | Compare fingerprints: `printf %s "<what you pasted>" \| shasum -a 256 \| cut -c1-8` against `supplied_fp`. Equal means TradingView is sending exactly what you pasted and the *deployed secret* differs — re-copy the URL from §4 and re-arm the alerts. |
+| `unauthorized_bad_credential` | Requests arrive with a credential that does not match. | Compare fingerprints: `printf %s "<what you pasted>" \| shasum -a 256 \| cut -c1-8` against `supplied_fp` in `last_detail`. Equal means TradingView is sending exactly what you pasted and the *deployed secret* differs — re-copy the URL from §4 and re-arm the alerts. |
 | `route_not_found` | POSTs are reaching the app on a path it does not serve. | A typo or a trailing slash. The path is exactly `/api/external/signals`. |
 | `rate_limited` / `payload_too_large` | The alert is firing far too often, or the message is not an alert. | §4 env. |
 

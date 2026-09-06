@@ -350,7 +350,7 @@ async def external_ingress_health(db: asyncpg.Connection = Depends(get_db)):
         await obs.flush_refusals(db, force=True, now=now)
     refusals: Dict[str, Any] = {"available": False}
     if database_ready:
-        refusals = await obs.read_refusal_row(db)
+        refusals = await obs.read_refusals(db)
     refusals["this_process"] = obs.LEDGER.snapshot()
 
     ready = database_ready and token_configured
