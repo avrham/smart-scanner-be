@@ -121,6 +121,14 @@ GRANT SELECT, INSERT, UPDATE ON public.research_symbols                  TO smar
 GRANT SELECT, INSERT, UPDATE ON public.research_scan_results             TO smart_scanner_research_lifecycle;
 GRANT SELECT, INSERT, UPDATE ON public.research_lifecycle_runs           TO smart_scanner_research_lifecycle;
 GRANT SELECT, INSERT, UPDATE ON public.research_lifecycle_run_symbols    TO smart_scanner_research_lifecycle;
+-- The outcome ledger (migration 031). SELECT/INSERT/UPDATE and NO DELETE, for
+-- a stronger reason than the tables above it: an outcome ledger from which
+-- rows can be removed is not evidence. Immutability of a MEASURED row is
+-- additionally enforced by the `research_scan_outcomes_freeze` trigger, which
+-- this role cannot drop (it holds no privilege on the function or the table's
+-- definition).
+GRANT SELECT, INSERT, UPDATE ON public.research_scan_outcomes           TO smart_scanner_research_lifecycle;
+GRANT SELECT, INSERT, UPDATE ON public.research_outcome_runs            TO smart_scanner_research_lifecycle;
 
 -- ---------------------------------------------------------------------------
 -- 6) SHARED relations — the grant is broad, the POLICY is narrow.

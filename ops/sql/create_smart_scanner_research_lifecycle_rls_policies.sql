@@ -47,6 +47,7 @@ DECLARE
   own_rels constant text[] := ARRAY[
     'public.research_symbols', 'public.research_scan_results',
     'public.research_lifecycle_runs', 'public.research_lifecycle_run_symbols',
+    'public.research_scan_outcomes', 'public.research_outcome_runs',
     'public.external_discovery_candidates',
     'public.sec_filings', 'public.sec_filing_symbols',
     'public.company_news_articles', 'public.company_news_symbols'];

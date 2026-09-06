@@ -103,6 +103,61 @@ def resolve_latest_completed_session(now_utc: datetime) -> date:
     return d
 
 
+def nth_trading_session_after(session_date: date, n: int) -> date:
+    """The Nth US regular trading session STRICTLY AFTER `session_date`.
+
+    Pure calendar arithmetic — no bars, no store, no clock. `n` must be >= 1.
+
+    WHY THIS AND NOT "THE NTH STORED BAR"
+    -------------------------------------
+    Counting stored bars would let a gap in our own ingestion redefine the
+    horizon: with one session's bar missing, the 5th stored bar is the 6th
+    trading session and a "5D outcome" would quietly measure six days. It
+    would also let the symbol's grid and the benchmark's grid drift apart, so
+    a benchmark-relative figure would compare two different windows — the
+    2026-08-31 misalignment defect, in a new place.
+
+    The rule calendar here is the same one `resolve_latest_completed_session`
+    uses, so a horizon resolved by this function and a completed session
+    resolved by that one are always talking about the same grid. The price of
+    a rule is that an UNSCHEDULED closure (a national day of mourning, a
+    weather closure) is not in it; that shows up as a bar that never arrives
+    for the resolved date, which the outcome engine reports as waiting-for-data
+    rather than papering over. Honest, and visible.
+    """
+    if n < 1:
+        raise ValueError("n must be >= 1")
+    d = session_date
+    remaining = int(n)
+    # Bounded. 20 sessions is the longest horizon this project asks for, and
+    # no run of consecutive non-trading days comes near this ceiling.
+    for _ in range(remaining * 12 + 40):
+        d = d + timedelta(days=1)
+        if is_trading_day(d):
+            remaining -= 1
+            if remaining == 0:
+                return d
+    raise ValueError("no Nth trading session found within the bounded search")
+
+
+def trading_sessions_between(start: date, end: date) -> int:
+    """Trading sessions strictly after `start` and at or before `end`.
+
+    Zero when `end` is not after `start`. Lets a grace window be expressed in
+    SESSIONS rather than calendar days, so a weekend is never counted as two
+    days of a symbol's data being late.
+    """
+    if end <= start:
+        return 0
+    count = 0
+    d = start + timedelta(days=1)
+    while d <= end:
+        if is_trading_day(d):
+            count += 1
+        d = d + timedelta(days=1)
+    return count
+
+
 def session_cutoff_utc(session_date: date) -> datetime:
     """The regular-close instant (16:00 ET) of `session_date`, as UTC."""
     close_local = datetime.combine(session_date, REGULAR_CLOSE, ZoneInfo(EXCHANGE_TZ))
@@ -122,4 +177,5 @@ __all__ = [
     "MARKET_CALENDAR_VERSION", "EXCHANGE_TZ", "REGULAR_OPEN", "REGULAR_CLOSE",
     "us_market_holidays", "is_trading_day",
     "resolve_latest_completed_session", "session_cutoff_utc", "resolve_snapshot",
+    "nth_trading_session_after", "trading_sessions_between",
 ]

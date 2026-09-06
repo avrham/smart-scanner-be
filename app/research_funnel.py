@@ -179,6 +179,43 @@ class FunnelConservationError(AssertionError):
 # derivation
 # --------------------------------------------------------------------------- #
 
+def scan_classification(row: Dict[str, Any]) -> str:
+    """The classification of ONE scan, from that scan's own evidence.
+
+    Returns exactly one of `classification_pending`, `scanned_not_candidate`
+    or `research_candidate`. Pure, total, and dependent on nothing except the
+    four evidence columns `research_scan_results` supplies.
+
+    WHY THIS IS ITS OWN FUNCTION
+    ----------------------------
+    It was the tail of `lifecycle_state`, reachable only from inside that
+    function's scanned branch, and the research outcome engine needs the same
+    answer for a scan row it is measuring. Copying six lines would have been
+    cheaper to write and would have created a SECOND definition of what
+    `research_candidate` means — the failure this project spent P0 removing
+    from `research_symbols.candidate_state`. So it is extracted verbatim and
+    called from both places, and `lifecycle_state`'s behaviour is unchanged by
+    construction.
+
+    Note what it deliberately does NOT take: the symbol's lifecycle state, its
+    admission tier, or the session. Those decide whether a scan is the RIGHT
+    scan to read — `lifecycle_state` answers that before it gets here, and the
+    outcome engine answers it by holding the scan row itself.
+    """
+    # A scan row exists but carries no evidence at all — nothing has judged
+    # this symbol yet. Kept as its own answer for the reason it always was:
+    # folding "not yet judged" into "did not survive" reports a rejection
+    # nobody made.
+    if not any(row.get(k) is not None for k in _SCAN_EVIDENCE_FIELDS):
+        return LIFECYCLE_CLASSIFICATION_PENDING
+    findings = ru.screen_findings(row)
+    if ru.SCREEN_HARD_DISQUALIFIED in findings:
+        return LIFECYCLE_SCANNED_NOT_CANDIDATE
+    if findings == [ru.SCREEN_NO_EVIDENCE]:
+        return LIFECYCLE_SCANNED_NOT_CANDIDATE
+    return LIFECYCLE_RESEARCH_CANDIDATE
+
+
 def lifecycle_state(row: Dict[str, Any]) -> str:
     """The ONE state this symbol is in. Total, deterministic, order-dependent.
 
@@ -221,18 +258,10 @@ def lifecycle_state(row: Dict[str, Any]) -> str:
             # never-scanned, and emphatically not a scanned state.
             return (LIFECYCLE_SCAN_STALE if row.get("has_any_scan")
                     else LIFECYCLE_SCAN_PENDING)
-        # A scan row exists for this session but carries no evidence at all —
-        # nothing has judged this symbol yet. Kept as its own state for the
-        # reason it always was: folding "not yet judged" into "did not
-        # survive" reports a rejection nobody made.
-        if not any(row.get(k) is not None for k in _SCAN_EVIDENCE_FIELDS):
-            return LIFECYCLE_CLASSIFICATION_PENDING
-        findings = ru.screen_findings(row)
-        if ru.SCREEN_HARD_DISQUALIFIED in findings:
-            return LIFECYCLE_SCANNED_NOT_CANDIDATE
-        if findings == [ru.SCREEN_NO_EVIDENCE]:
-            return LIFECYCLE_SCANNED_NOT_CANDIDATE
-        return LIFECYCLE_RESEARCH_CANDIDATE
+        # From here the answer depends on THIS session's scan row alone, so it
+        # is `scan_classification` — the same function the outcome engine
+        # calls, which is what keeps `research_candidate` one definition.
+        return scan_classification(row)
     # `discovered`, `history_required`, an unknown/NULL state: admitted and
     # waiting for history. Unknown lands here rather than nowhere.
     return LIFECYCLE_HISTORY_PENDING
@@ -516,6 +545,7 @@ __all__ = [
     "LIFECYCLE_HISTORY_UNAVAILABLE", "LIFECYCLE_HISTORY_FAILED",
     "LIFECYCLE_SCAN_PENDING", "LIFECYCLE_CLASSIFICATION_PENDING",
     "LIFECYCLE_SCANNED_NOT_CANDIDATE", "LIFECYCLE_RESEARCH_CANDIDATE",
-    "FunnelConservationError", "lifecycle_state", "admission_tier", "rate",
+    "FunnelConservationError", "scan_classification", "lifecycle_state",
+    "admission_tier", "rate",
     "summarise", "check_conservation", "assert_conservation", "load_funnel",
 ]

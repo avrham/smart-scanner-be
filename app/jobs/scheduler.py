@@ -265,6 +265,40 @@ def _research_lifecycle_spec(schedule: Dict[str, Any],
             "task_key": f"rlctask:{run_key}"}
 
 
+def _research_outcomes_spec(schedule: Dict[str, Any],
+                            occurrence: datetime) -> Optional[Dict[str, Any]]:
+    """The durable task spec for the research OUTCOME schedule, else None.
+
+    Same shape as `_research_lifecycle_spec` and same idempotency argument: the
+    run key is derived from the OCCURRENCE, so a scheduler that fires twice for
+    one occurrence produces one maturation run rather than two competing
+    records of the same pass.
+
+    The task rides the research lifecycle's queue on purpose — see
+    app/jobs/research_outcomes.py — so this schedule needs no new worker, no
+    new RLS predicate and no configuration change on the deployed app. It is a
+    different JOB, which is where the isolation lives.
+    """
+    from app.jobs import research_outcomes as RO
+    if schedule.get("job_type") != RO.RESEARCH_OUTCOMES_JOB_TYPE:
+        return None
+    run_key = RO.run_key_for_occurrence(
+        schedule_code=schedule["schedule_code"],
+        schedule_version=int(schedule["schedule_version"]),
+        occurrence_iso=occurrence.isoformat())
+    payload = RO.task_payload_from_template(_template(schedule),
+                                            run_key=run_key)
+    payload.update({"schedule_code": schedule["schedule_code"],
+                    "schedule_version": int(schedule["schedule_version"]),
+                    "occurrence_scheduled_at": occurrence.isoformat()})
+    return {"task_type": RO.RESEARCH_OUTCOMES_TASK,
+            "queue": RO.RESEARCH_OUTCOMES_QUEUE,
+            "max_attempts": int(RO.RESEARCH_OUTCOMES_MAX_ATTEMPTS),
+            "payload": payload,
+            "task_key_prefix": "roctask:",
+            "task_key": f"roctask:{run_key}"}
+
+
 def _pipeline_driver_spec(schedule: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return the durable-driver task spec for a daily-pipeline schedule whose
     payload_template carries the frozen ``universe_id`` (and optional hash), else
@@ -318,7 +352,11 @@ async def _create_scheduled_job(conn: asyncpg.Connection, schedule: Dict[str, An
                              "occurrence_scheduled_at": occurrence.isoformat()}
         driver["task_key"] = "dpadv:" + key
     else:
-        driver = _research_lifecycle_spec(schedule, occurrence)
+        # First match wins. Each resolver answers None for a schedule that is
+        # not its own, so adding a job type is one entry here and never a
+        # change to the ones above it.
+        driver = (_research_lifecycle_spec(schedule, occurrence)
+                  or _research_outcomes_spec(schedule, occurrence))
     marker_queue = (driver["queue"] if driver is not None
                     else (schedule.get("queue_name") or C.PROSPECTIVE_QUEUE))
     row = await conn.fetchrow(

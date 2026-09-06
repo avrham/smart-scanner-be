@@ -58,6 +58,11 @@ FROM (VALUES
   ('public.prospective_campaign_registrations','INSERT'),
   ('public.daily_bars','DELETE'),
   ('public.research_symbols','DELETE'),
+  -- The outcome ledger is append-and-freeze. A role that could DELETE a
+  -- measured outcome could erase the evidence the freeze trigger exists to
+  -- protect, which would make the trigger decorative.
+  ('public.research_scan_outcomes','DELETE'),
+  ('public.research_outcome_runs','DELETE'),
   ('public.job_runs','DELETE'),
   ('public.job_tasks','DELETE'),
   ('public.job_schedules','INSERT'),

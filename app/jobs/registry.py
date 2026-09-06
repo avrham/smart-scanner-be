@@ -158,6 +158,27 @@ def _install_default_handlers() -> None:
         retry_backoff_schedule=list(_rl.RESEARCH_LIFECYCLE_BACKOFF_SECONDS),
         production_enabled=True,
     ))
+    from app.jobs.handlers import research_outcomes_worker as _row
+    from app.jobs import research_outcomes as _ro
+    register(HandlerSpec(
+        task_type=_ro.RESEARCH_OUTCOMES_TASK,
+        # The SAME queue as the lifecycle, deliberately: the queue is the
+        # execution-identity boundary and this work belongs to that identity.
+        # Isolation between the two comes from being separate JOBS with
+        # separate attempt budgets, not from separate lanes — see the header
+        # of app/jobs/research_outcomes.py.
+        queue_name=_ro.RESEARCH_OUTCOMES_QUEUE,
+        child_callable=_row.run_research_outcomes_task,
+        probe_fn=_row.probe_research_outcomes_durable_output,
+        # Three and short. Unlike the lifecycle, this run has no prerequisite
+        # it can request and therefore nothing to outlast: a bar that is
+        # missing now will still be missing in thirty minutes, and the row
+        # already says so as `waiting_for_data`. These attempts are for
+        # transport faults, which resolve in seconds.
+        max_attempts=_ro.RESEARCH_OUTCOMES_MAX_ATTEMPTS,
+        retry_backoff_schedule=list(_ro.RESEARCH_OUTCOMES_BACKOFF_SECONDS),
+        production_enabled=True,
+    ))
     # A safe, synthetic test handler for controlled retry/crash tests. NEVER
     # selectable unless JOB_ALLOW_TEST_HANDLERS=true; performs no strategy math
     # and touches no real campaign data.
