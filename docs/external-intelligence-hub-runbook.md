@@ -304,13 +304,81 @@ curl -s "https://smart-scanner-be-staging.fly.dev/api/scanner/symbol?symbol=AAPL
 | `timestamp_out_of_window` | 422 | `source_timestamp` more than 30 min from arrival |
 | `ingest_unavailable` | 503 | authentic delivery, storage failed — retry is meaningful |
 
-401/429/413 are refused **before** anything is written; everything else is
-recorded in `external_signal_deliveries` with its reason, which is what makes
-"the alert fired, why is nothing showing?" answerable.
+401/429/413 are refused **before** anything is written to
+`external_signal_deliveries`; everything else is recorded there with its
+reason. Recording refused traffic per request would let an anonymous caller
+fill that table, so it is deliberately not done — the refusals are counted
+instead (see §5.1).
 
 `status: duplicate` is a **success**, returned 200. A repeated delivery has
 already been recorded, and erroring would invite a retry storm that changes
 nothing.
+
+### 5.1 "The alert fired and nothing arrived" — the diagnostic
+
+This is the question the ingress exists to answer, and until 2026-09-06 it
+could not: a refused request left a log line, Fly retains those for minutes,
+and an empty `external_signal_deliveries` was equally consistent with three
+completely different problems. `GET /api/external/health` now separates them.
+
+```bash
+curl -s https://$APP.fly.dev/api/external/health | jq '.ingress_refusals'
+```
+
+```jsonc
+{
+  "available": true,
+  "recorded_total": 12,                    // DURABLE, survives a restart
+  "last_refused_at": "2026-09-06T10:24:25Z",
+  "detail": "unauthorized_bad_credential=12; last=unauthorized_bad_credential via query supplied_fp=9f2c1ab4 at ...",
+  "this_process": { "since_boot": {...}, "last_reason": "..." }
+}
+```
+
+Read it like this:
+
+| what you see | what it means | what to do |
+|---|---|---|
+| `recorded_total: 0` **and** no accepted delivery | **Nothing has ever reached this app.** Not a server problem. | The alert has no webhook URL, the webhook action is not ticked on those alert instances, the alert expired, or the URL points at another host. §3. |
+| `unauthorized_no_credential` | Requests arrive at the right path with **no** `?token=`. | The webhook URL was pasted without its query string. |
+| `unauthorized_bad_credential` | Requests arrive with a credential that does not match. | Compare fingerprints: `printf %s "<what you pasted>" \| shasum -a 256 \| cut -c1-8` against `supplied_fp`. Equal means TradingView is sending exactly what you pasted and the *deployed secret* differs — re-copy the URL from §4 and re-arm the alerts. |
+| `route_not_found` | POSTs are reaching the app on a path it does not serve. | A typo or a trailing slash. The path is exactly `/api/external/signals`. |
+| `rate_limited` / `payload_too_large` | The alert is firing far too often, or the message is not an alert. | §4 env. |
+
+`supplied_fp` is the first 8 hex of SHA-256 over what the **caller** sent. The
+expected credential is never hashed, published or logged — there is no
+fingerprint of it anywhere, deliberately, because that would be an oracle.
+
+Two things this replaced, both real defects found on 2026-09-06:
+
+* the ingress credential was written verbatim into uvicorn's access log on
+  every delivery (`"POST /api/external/signals?token=… HTTP/1.1" 401`). Since
+  TradingView cannot send a custom header, the query parameter is the only
+  mechanism available, so this affected every genuine alert. It is redacted at
+  the logging handler now — see `CredentialQueryRedactor` in
+  `app/utils/logging.py`.
+* the running revision issued `ON CONFLICT (source)` against
+  `catalyst_source_state` after migration 028 made the key `(source, scope)`.
+  An accepted delivery therefore stored its signal and then returned **503** to
+  a sender that does not retry. The SQL is fixed, and freshness bookkeeping is
+  now best-effort so the next such mismatch costs a stale row rather than an
+  alert.
+
+### 5.2 What TradingView can and cannot do (measured 2026-09-06)
+
+From TradingView's own webhook documentation, because the server contract has
+to fit inside it:
+
+| capability | fact | consequence here |
+|---|---|---|
+| custom HTTP headers | **not supported** | the credential must travel in the URL; `X-Smart-Scanner-Token` exists for callers that *can* send headers, and TradingView is not one |
+| method | POST only | the ingress allowlist permits POST and OPTIONS on one path, nothing else |
+| Content-Type | set automatically — `application/json` for a valid JSON message, `text/plain` otherwise | the handler reads raw bytes and never branches on Content-Type |
+| ports | **80 and 443 only** | `https://…fly.dev` is 443; never configure an `http://` URL, which answers 301 and costs a redirect inside a 3-second budget |
+| IPv6 | **not supported** | the app must keep a public **IPv4** address. `fly ips list` must show a v4 row; a v6-only app would be silently unreachable from TradingView |
+| timeout | 3 seconds, no documented retry | treat delivery as at-most-once; `min_machines_running = 1` is not optional |
+| 2FA | required on the account for webhook alerts | an account-side prerequisite, invisible from here |
+| credentials | the docs say never put them in the webhook **body** | which is exactly why this gateway never reads a token from the body |
 
 ---
 

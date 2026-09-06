@@ -15,6 +15,7 @@ from app.maintenance_mode import is_maintenance_route_allowed
 from app.history_warmup_mode import is_history_warmup_route_allowed
 from app.prospective_mode import is_prospective_route_allowed
 from app.external_ingest_mode import is_external_ingest_route_allowed
+import app.external_ingress_observability as external_ingress_observability
 from app.build_info import build_provenance, startup_log_fields
 from app.deps import get_db
 from app.routers import public, admin, outcomes, shadow, scanner, external
@@ -232,6 +233,21 @@ async def audit_only_gate(request, call_next):
     if settings.EXTERNAL_INGEST_ONLY_MODE and not is_external_ingest_route_allowed(
         request.method, request.url.path
     ):
+        # COUNTED, not just refused — but only a POST. A third party that
+        # posts an alert to a path this deployment does not serve (a trailing
+        # slash, a typo, an older URL) is otherwise completely invisible: the
+        # gate answers 404 before any handler runs, so there is no delivery
+        # row, and the log line is gone within minutes. GET probes are excluded
+        # deliberately: the internet scans every public host constantly, and
+        # letting that noise into the counter would bury the one signal it
+        # exists to surface. A webhook is a POST.
+        #
+        # In memory only here — the middleware has no database session and must
+        # never acquire one for anonymous traffic; the ingress and health
+        # handlers flush it durably.
+        if request.method.upper() == "POST":
+            external_ingress_observability.LEDGER.record(
+                external_ingress_observability.REASON_ROUTE_NOT_FOUND)
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     return await call_next(request)
 

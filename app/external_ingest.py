@@ -358,6 +358,46 @@ async def record_source_state(conn, source: str, status: str, *,
 # the gateway
 # --------------------------------------------------------------------------- #
 
+async def record_source_state_best_effort(conn, source: str, status: str, *,
+                                           signals_written: int = 0,
+                                           detail: str = "",
+                                           now: Optional[datetime] = None
+                                           ) -> bool:
+    """Freshness bookkeeping that can fail without failing the delivery.
+
+    This wrapper exists because of a real incident shape, not a hypothetical.
+    The delivery row and the signal row are each committed on their own
+    statement — nothing here opens a transaction — so by the time this runs the
+    signal is ALREADY STORED. Letting a bookkeeping error propagate therefore
+    turned a stored signal into a 503, and TradingView allows a webhook three
+    seconds and documents no retry: the sender records a permanent failure for
+    a delivery that in fact succeeded, and nobody reconciles the two.
+
+    That is exactly what the deployed build did after migration 028 moved
+    `catalyst_source_state` to a (source, scope) primary key while the running
+    revision still said `ON CONFLICT (source)`. The SQL is fixed; this wrapper
+    is the reason the NEXT such mismatch costs a stale freshness row instead of
+    a lost alert.
+
+    Returns whether the row was written, so a caller (and a test) can tell the
+    degraded path from the healthy one rather than inferring it.
+    """
+    try:
+        await record_source_state(conn, source, status,
+                                  signals_written=signals_written,
+                                  detail=detail, now=now)
+        return True
+    except Exception:
+        # No traceback: this runs on an internet-facing path and a traceback
+        # may quote the payload. The delivery stands; only freshness is stale.
+        logger.error("external ingest: source state write failed",
+                     extra={"extra_data": {
+                         "event": "external_source_state_error",
+                         "source": source, "status": status}},
+                     exc_info=False)
+        return False
+
+
 def decode_body(raw_body: bytes, *,
                 max_bytes: int = MAX_PAYLOAD_BYTES) -> Dict[str, Any]:
     """Size-check, then decode. In that order, always.
@@ -412,7 +452,7 @@ async def ingest_delivery(conn, raw_body: bytes, *,
             conn, source=source, received_at=moment, fingerprint=fingerprint,
             payload_bytes=payload_bytes, status=DELIVERY_REJECTED,
             rejection_reason=exc.reason, raw_payload=payload)
-        await record_source_state(
+        await record_source_state_best_effort(
             conn, source, STATE_ERROR,
             detail=f"rejected: {exc.reason}", now=moment)
         return {"status": DELIVERY_REJECTED, "reason": exc.reason,
@@ -445,9 +485,9 @@ async def ingest_delivery(conn, raw_body: bytes, *,
     signal_id = await insert_signal(conn, signal, delivery_id=delivery_id,
                                     symbol_scope=scope, key=key)
 
-    await record_source_state(conn, source, STATE_OK,
-                              signals_written=1 if signal_id else 0,
-                              now=moment)
+    await record_source_state_best_effort(
+        conn, source, STATE_OK, signals_written=1 if signal_id else 0,
+        now=moment)
 
     if signal_id is None:
         # Different bytes, same observation — e.g. the source re-sent with a
@@ -496,5 +536,6 @@ __all__ = [
     "SlidingWindowLimiter", "body_fingerprint", "idempotency_key",
     "fetch_scanner_universe", "classify_symbol_scope", "record_delivery",
     "insert_signal", "record_source_state", "decode_body", "ingest_delivery",
+    "record_source_state_best_effort",
     "audit_log_fields",
 ]

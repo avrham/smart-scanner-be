@@ -51,6 +51,7 @@ from fastapi.responses import JSONResponse
 from app.config import settings
 from app.deps import get_db
 import app.external_ingest as ei
+import app.external_ingress_observability as obs
 import app.external_signals as es
 from app.source_scope import SCOPE_PRODUCT
 
@@ -72,6 +73,23 @@ _global_limiter = ei.SlidingWindowLimiter(
     max(60, getattr(settings, "EXTERNAL_INGEST_RATE_LIMIT_PER_MINUTE", 60) * 4))
 
 INGRESS_TOKEN_HEADER = "X-Smart-Scanner-Token"
+
+#: How much of the body is inspected to pick a RATE-LIMIT BUCKET, before the
+#: body is parsed.
+#:
+#: This was 64 bytes, and 64 bytes did not work. The documented AI Edge alert
+#: template opens with the contract version, so `"ai_edge"` begins at byte 67 —
+#: three bytes past the window. Every AI Edge delivery was therefore counted in
+#: the `tradingview` bucket, and the per-source isolation this limiter exists
+#: to provide did not exist for the one source it was written for. With Open
+#: Long and Open Short armed across a 25-symbol watchlist, a single bar close
+#: can present 50 alerts at once, so sharing one 60/min bucket with any second
+#: TradingView script is a 429 on a real signal.
+#:
+#: 256 bytes covers every template in the runbook with room to spare and is
+#: still a bounded prefix of a body that is capped at 8 KiB — the check stays
+#: cheaper than the JSON parse it precedes, which is the property that matters.
+SOURCE_HINT_PEEK_BYTES = 256
 
 
 def _safe_error(status_code: int, reason: str,
@@ -96,14 +114,34 @@ def _authenticate(request: Request, token_query: Optional[str],
     The header is preferred so that any caller ABLE to send one does, leaving
     the query parameter as the documented fallback for platforms that cannot
     — rather than as the normal path for everyone.
+
+    On failure the WIRE RESPONSE stays a single undifferentiated
+    `unauthorized`: "no token", "wrong token" and "no token configured on the
+    server" must remain indistinguishable to an anonymous caller. The refusal
+    is separately classified into the local ledger, because internally those
+    three are completely different problems — a webhook URL missing its
+    `?token=` is not a stale secret — and the system had no way to tell them
+    apart when the question was actually asked.
     """
     expected = (getattr(settings, "EXTERNAL_INGEST_TOKEN", "") or "").strip()
-    supplied = (token_header or token_query or "").strip()
-    if not ei.verify_ingress_token(supplied, expected):
-        # Deliberately identical for "no token", "wrong token" and "no token
-        # configured on the server". Distinguishing them would tell an
-        # anonymous caller which of those is true.
-        raise ei.IngressRejected("unauthorized", status_code=401)
+    header_value = (token_header or "").strip()
+    query_value = (token_query or "").strip()
+    supplied = header_value or query_value
+    if ei.verify_ingress_token(supplied, expected):
+        return
+
+    if header_value:
+        transport = obs.TRANSPORT_HEADER
+    elif query_value:
+        transport = obs.TRANSPORT_QUERY
+    else:
+        transport = obs.TRANSPORT_NONE
+    obs.LEDGER.record(
+        obs.REASON_BAD_CREDENTIAL if supplied else obs.REASON_NO_CREDENTIAL,
+        transport=transport,
+        # A hash of what a STRANGER sent, truncated. Never a hash of ours.
+        fingerprint=obs.credential_fingerprint(supplied))
+    raise ei.IngressRejected("unauthorized", status_code=401)
 
 
 def _check_source_ip(request: Request) -> None:
@@ -168,26 +206,39 @@ async def ingest_external_signal(
 
         raw_body = await request.body()
     except ei.IngressRejected as exc:
-        # Refused before it could become a delivery. Deliberately NOT written
-        # to the database: recording unauthenticated traffic would hand an
-        # anonymous caller a way to fill our tables.
+        # Refused before it could become a delivery. Still NOT one database row
+        # per request — that would hand an anonymous caller a way to fill our
+        # tables. It is folded into ONE throttled counter row instead, so the
+        # evidence outlives both the log buffer and this process while the row
+        # count stays at one no matter how much traffic arrives.
+        if exc.reason != "unauthorized":
+            # `unauthorized` was already recorded, with the classification the
+            # response is not allowed to carry.
+            obs.LEDGER.record(exc.reason)
         logger.info("external ingress refused", extra={"extra_data": {
             "event": "external_signal_refused", "reason": exc.reason}})
+        await obs.flush_refusals(db)
         return _safe_error(exc.status_code, exc.reason)
 
     fingerprint = ei.body_fingerprint(raw_body)
     try:
-        payload_peek = raw_body[:64].decode("utf-8", "replace")
-        source_hint = ("ai_edge" if '"ai_edge"' in payload_peek
-                       else es.SOURCE_TRADINGVIEW)
+        payload_peek = raw_body[:SOURCE_HINT_PEEK_BYTES].decode(
+            "utf-8", "replace")
+        # A HINT, not a decision: it selects a counter, never a normaliser and
+        # never a privilege. The authoritative source is read from the parsed
+        # payload inside `ingest_delivery` and validated against the registry.
+        source_hint = (es.SOURCE_AI_EDGE if f'"{es.SOURCE_AI_EDGE}"'
+                       in payload_peek else es.SOURCE_TRADINGVIEW)
         if not _limiter.allow(source_hint):
             raise ei.IngressRejected("rate_limited", status_code=429)
 
         result = await ei.ingest_delivery(
             db, raw_body, received_at=received_at, max_bytes=max_bytes)
     except ei.IngressRejected as exc:
+        obs.LEDGER.record(exc.reason)
         logger.info("external ingress refused", extra={"extra_data": {
             "event": "external_signal_refused", "reason": exc.reason}})
+        await obs.flush_refusals(db)
         return _safe_error(exc.status_code, exc.reason)
     except Exception:
         # The delivery was authentic and we failed to store it. The sender is
@@ -290,6 +341,18 @@ async def external_ingress_health(db: asyncpg.Connection = Depends(get_db)):
                        exc_info=False)
         database_ready = False
 
+    # An operator reads this endpoint precisely when a source looks silent, so
+    # this is the moment to make the pending refusals durable — a machine that
+    # restarts before the next flush would otherwise lose exactly the evidence
+    # being looked for. `force` because a diagnostic read should not be subject
+    # to the write-rate throttle.
+    if database_ready:
+        await obs.flush_refusals(db, force=True, now=now)
+    refusals: Dict[str, Any] = {"available": False}
+    if database_ready:
+        refusals = await obs.read_refusal_row(db)
+    refusals["this_process"] = obs.LEDGER.snapshot()
+
     ready = database_ready and token_configured
     payload = {
         "status": "ready" if ready else "not_ready",
@@ -298,12 +361,27 @@ async def external_ingress_health(db: asyncpg.Connection = Depends(get_db)):
         # Whether a credential EXISTS — never the credential, and never a hash
         # or prefix of it.
         "ingress_token_configured": token_configured,
+        # Whether that credential can be pasted into a webhook URL unencoded.
+        # A `+`, `&`, `/` or `=` in the secret makes the query-parameter path —
+        # the ONLY path TradingView can use — fail while a header-sending
+        # caller like curl keeps working, which is an outage that looks like
+        # nothing at all. A boolean, so it says the fact without saying
+        # anything about the value.
+        "ingress_token_url_safe": obs.token_is_url_safe(
+            getattr(settings, "EXTERNAL_INGEST_TOKEN", "")),
         "contract_version": es.TRADINGVIEW_CONTRACT_VERSION,
         "max_payload_bytes": int(
             getattr(settings, "EXTERNAL_INGEST_MAX_PAYLOAD_BYTES", 8192)),
         "sources": sources,
+        # WHAT WAS TURNED AWAY. `sources` answers "has anything been accepted";
+        # without this an operator could not tell that apart from "requests are
+        # arriving and being refused", which is the difference between an alert
+        # that was never configured and one configured with the wrong URL or a
+        # stale credential.
+        "ingress_refusals": refusals,
     }
     return payload if ready else JSONResponse(status_code=503, content=payload)
 
 
-__all__ = ["router", "INGRESS_TOKEN_HEADER"]
+__all__ = ["router", "INGRESS_TOKEN_HEADER",
+           "SOURCE_HINT_PEEK_BYTES"]
