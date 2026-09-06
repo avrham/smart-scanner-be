@@ -447,3 +447,50 @@ row exists in staging today.
 Staging queries used for every runtime fact in this document were run read-only
 against the isolated Fly Postgres `warmup` as `flypgadmin` over `flyctl proxy`,
 and are reproducible from the SQL quoted inline above.
+
+---
+
+## Post-repair verification (2026-09-06T13:59:57Z)
+
+Migration 032 applied to staging as `flypgadmin`; worker redeployed at
+`746b1268065600f53cca7442e1617f23978e4b87`; one maturation pass run through the
+deployed runtime path.
+
+**The widened guard is live in staging.** Four rewrites of a measured row were
+refused by `research_scan_outcomes_freeze()` — `benchmark_symbol`,
+`scan_setup_state`, `scan_scanned_at`, `strategy_version` — while
+`revision_detected` on the same measured row and `scan_verdict` on a *pending*
+row both succeeded. All attempts were rolled back.
+
+**Nothing measured moved.** The 13 measured rows fingerprint to
+`18988808d0fa2012f0df84c270d17c4e` (md5 over symbol, horizon, both returns,
+excess, MFE, MAE and `bars_hash`, ordered by id) — identical before and after
+the migration and the redeploy.
+
+| Check | Result |
+|---|---|
+| Ledger | 13 measured / 31 waiting / 76 not-yet-eligible — unchanged |
+| Identity | 120 rows, 120 distinct `(scan_id, horizon)`, 0 revisions |
+| Provenance | 0 scans with ≠ 5 horizons; **0 scans with mixed attribution** |
+| Canonical frozen-25 | pairs 100 / evals 200 / pair_outcomes 75; last touch still `2026-08-26T11:23:50Z` |
+| P0 research | 80 symbols / 24 scans / 9 lifecycle runs — unchanged |
+| Lifecycle schedule | `updated_at 2026-09-05T12:00:19Z` — **not touched by this audit** |
+| Outcome schedule | enabled, `next_run_at 2026-09-10T15:00:00Z` preserved (`seeded_next_run_at: false`) |
+
+The audited pass (`roc:manual:audit0906:20260906T1359`, 2.76 s) planned 0 new
+observations and measured 0 — correct: every eligible observation is blocked on
+a bar that has not arrived, and the atomicity repair changed no result.
+
+### Tests
+
+| Suite | Result |
+|---|---|
+| `tests/test_research_outcomes_unit.py` | 48 passed |
+| `tests/test_research_outcomes_contract.py` | 58 passed |
+| `tests/test_research_outcomes_integration.py` (real Postgres, chain 001→032) | 51 passed |
+| Full repository suite | **3543 passed, 2 skipped** |
+
+Three `git diff`-based boundary tests (`test_no_scheduler_change`,
+`test_the_queue_surface_gains_only_the_research_queue` ×2) reported the
+uncommitted edit to `app/jobs/research_outcomes.py` during the run; they pass at
+the committed tree, re-verified after `746b126`.
